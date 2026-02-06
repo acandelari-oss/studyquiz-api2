@@ -5,7 +5,7 @@ import os
 
 app = FastAPI(title="StudyQuiz API")
 
-# ====== AUTH ======
+# ===== AUTH =====
 API_KEY = os.getenv("QUIZTEST_API_KEY", "")
 
 def require_key(authorization: str | None):
@@ -17,11 +17,11 @@ def require_key(authorization: str | None):
     if token != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
 
-# ====== IN-MEMORY STORES (prototype only) ======
-PROJECT_DOCS = {}   # project_id -> list of documents {doc_id,title,text}
-QUIZZES = {}        # quiz_id -> quiz json (macro_topics + answer_key + questions map)
+# ===== IN-MEMORY (PROTOTYPE) =====
+PROJECT_DOCS = {}   # project_id -> list of docs {doc_id,title,text}
+QUIZZES = {}        # quiz_id -> quiz json
 
-# ====== SCHEMAS ======
+# ===== SCHEMAS =====
 class CreateProjectIn(BaseModel):
     name: str
 
@@ -47,7 +47,7 @@ class ClarifyIn(BaseModel):
     qid: str
     user_question: str
 
-# ====== ENDPOINTS ======
+# ===== ENDPOINTS =====
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -75,28 +75,28 @@ def generate_quiz(project_id: str, payload: GenerateQuizIn, authorization: str |
     if project_id not in PROJECT_DOCS:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Prototype: return a MOCK quiz to validate wiring.
     quiz_id = str(uuid.uuid4())
 
+    # MOCK quiz (for wiring). Cap at 10 questions to keep responses small.
+    n = min(payload.num_questions, 10)
+
     macro_topics = [{
-        "name": "Cell Biology (Mock)",
+        "name": "Mock Macro-Topic",
         "questions": []
     }]
 
     answer_key = []
 
-    # Create mock questions up to num_questions (cap to 10 for sanity in prototype)
-    n = min(payload.num_questions, 10)
     for i in range(1, n + 1):
         qid = f"Q{i}"
         macro_topics[0]["questions"].append({
             "qid": qid,
-            "stem": f"Mock high-level cell biology question #{i} based on ingested material.",
+            "stem": f"Mock {payload.difficulty} question #{i} generated from ingested material.",
             "options": {
-                "A": "Option A (relevant distractor)",
-                "B": "Option B (relevant distractor)",
-                "C": "Option C (relevant distractor)",
-                "D": "Option D (relevant distractor)"
+                "A": "Option A (relevant)",
+                "B": "Option B (relevant)",
+                "C": "Option C (relevant)",
+                "D": "Option D (relevant)"
             }
         })
         answer_key.append({"qid": qid, "correct": "A"})
@@ -115,14 +115,16 @@ def clarify(project_id: str, payload: ClarifyIn, authorization: str | None = Hea
     if not quiz:
         raise HTTPException(status_code=404, detail="Quiz not found")
 
-    # Prototype: return mock evidence extracted from first document (if any)
+    # Return mock evidence from the first ingested doc (if any)
     evidence = []
     docs = PROJECT_DOCS.get(project_id, [])
     if docs:
-        snippet = docs[0]["text"][:400]
-        evidence.append({"doc_title": docs[0]["title"], "snippet": snippet})
+        evidence.append({
+            "doc_title": docs[0]["title"],
+            "snippet": docs[0]["text"][:400]
+        })
 
     return {
-        "answer": "Prototype clarification (mock). This will later be generated using only the ingested evidence.",
+        "answer": "Mock clarification. Next we will generate a real explanation grounded in the evidence snippets only.",
         "evidence": evidence
     }
