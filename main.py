@@ -1,27 +1,24 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-import uuid
-import os
+import uuid, os
+from sqlalchemy import text
+from db import SessionLocal
+from rag import chunk_text, embed
+from openai import OpenAI
 
+client = OpenAI()
 app = FastAPI(title="StudyQuiz API")
 
-# ===== AUTH =====
-API_KEY = os.getenv("QUIZTEST_API_KEY", "")
+API_KEY = os.getenv("QUIZTEST_API_KEY")
 
-def require_key(authorization: str | None):
-    if not API_KEY:
-        return
-    if not authorization or not authorization.startswith("Bearer "):
+def require_key(auth):
+    if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing API key")
-    token = authorization.split("Bearer ", 1)[1].strip()
-    if token != API_KEY:
+    if auth.split("Bearer ")[1] != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
 
-# ===== IN-MEMORY (PROTOTYPE) =====
-PROJECT_DOCS = {}   # project_id -> list of docs {doc_id,title,text}
-QUIZZES = {}        # quiz_id -> quiz json
+# ---------- SCHEMAS ----------
 
-# ===== SCHEMAS =====
 class CreateProjectIn(BaseModel):
     name: str
 
@@ -36,95 +33,85 @@ class IngestIn(BaseModel):
 class GenerateQuizIn(BaseModel):
     language: str
     num_questions: int
-    difficulty: str  # "medium" or "high"
-    include_topics: list[str] | None = None
-    exclude_topics: list[str] | None = None
+    difficulty: str
     group_by_macro_topics: bool
     answers_at_end: bool
 
-class ClarifyIn(BaseModel):
-    quiz_id: str
-    qid: str
-    user_question: str
-
-# ===== ENDPOINTS =====
-@app.get("/health")
-def health():
-    return {"ok": True}
+# ---------- ENDPOINTS ----------
 
 @app.post("/projects")
-def create_project(payload: CreateProjectIn, authorization: str | None = Header(default=None)):
+def create_project(payload: CreateProjectIn, authorization: str = Header(None)):
     require_key(authorization)
-    project_id = str(uuid.uuid4())
-    PROJECT_DOCS[project_id] = []
-    return {"project_id": project_id}
+    pid = uuid.uuid4()
+    db = SessionLocal()
+    db.execute(text("insert into projects (id, name) values (:id, :name)"),
+               {"id": pid, "name": payload.name})
+    db.commit()
+    return {"project_id": str(pid)}
 
 @app.post("/projects/{project_id}/ingest")
-def ingest(project_id: str, payload: IngestIn, authorization: str | None = Header(default=None)):
+def ingest(project_id: str, payload: IngestIn, authorization: str = Header(None)):
     require_key(authorization)
-    if project_id not in PROJECT_DOCS:
-        raise HTTPException(status_code=404, detail="Project not found")
+    db = SessionLocal()
 
     for d in payload.documents:
-        PROJECT_DOCS[project_id].append(d.model_dump())
+        db.execute(text("""
+          insert into documents (id, project_id, title, text)
+          values (:id, :pid, :title, :text)
+        """), {"id": d.doc_id, "pid": project_id, "title": d.title, "text": d.text})
+
+        chunks = chunk_text(d.text)
+        vectors = embed(chunks)
+
+        for c, v in zip(chunks, vectors):
+            db.execute(text("""
+              insert into chunks (project_id, document_id, doc_title, chunk_text, embedding)
+              values (:pid, :did, :title, :text, :emb)
+            """), {
+                "pid": project_id,
+                "did": d.doc_id,
+                "title": d.title,
+                "text": c,
+                "emb": v
+            })
+
+    db.commit()
     return {"ingested": len(payload.documents)}
 
 @app.post("/projects/{project_id}/generate_quiz")
-def generate_quiz(project_id: str, payload: GenerateQuizIn, authorization: str | None = Header(default=None)):
+def generate_quiz(project_id: str, payload: GenerateQuizIn, authorization: str = Header(None)):
     require_key(authorization)
-    if project_id not in PROJECT_DOCS:
-        raise HTTPException(status_code=404, detail="Project not found")
+    db = SessionLocal()
 
-    quiz_id = str(uuid.uuid4())
+    query_embedding = embed(["cell biology advanced quiz"])[0]
 
-    # MOCK quiz (for wiring). Cap at 10 questions to keep responses small.
-    n = min(payload.num_questions, 10)
+    rows = db.execute(text("""
+      select chunk_text from chunks
+      where project_id = :pid
+      order by embedding <=> :emb
+      limit 8
+    """), {"pid": project_id, "emb": query_embedding}).fetchall()
 
-    macro_topics = [{
-        "name": "Mock Macro-Topic",
-        "questions": []
-    }]
+    context = "\n\n".join(r[0] for r in rows)
 
-    answer_key = []
+    prompt = f"""
+Create {payload.num_questions} high-difficulty multiple-choice questions
+about CELL BIOLOGY only, based strictly on the material below.
 
-    for i in range(1, n + 1):
-        qid = f"Q{i}"
-        macro_topics[0]["questions"].append({
-            "qid": qid,
-            "stem": f"Mock {payload.difficulty} question #{i} generated from ingested material.",
-            "options": {
-                "A": "Option A (relevant)",
-                "B": "Option B (relevant)",
-                "C": "Option C (relevant)",
-                "D": "Option D (relevant)"
-            }
-        })
-        answer_key.append({"qid": qid, "correct": "A"})
+Rules:
+- 4 options (A–D), one correct
+- No slide/page references
+- No viruses
+- All options must be plausible
+- Answers at the end
 
-    quiz = {"quiz_id": quiz_id, "macro_topics": macro_topics, "answer_key": answer_key}
-    QUIZZES[quiz_id] = quiz
-    return quiz
+Material:
+{context}
+"""
 
-@app.post("/projects/{project_id}/clarify")
-def clarify(project_id: str, payload: ClarifyIn, authorization: str | None = Header(default=None)):
-    require_key(authorization)
-    if project_id not in PROJECT_DOCS:
-        raise HTTPException(status_code=404, detail="Project not found")
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
 
-    quiz = QUIZZES.get(payload.quiz_id)
-    if not quiz:
-        raise HTTPException(status_code=404, detail="Quiz not found")
-
-    # Return mock evidence from the first ingested doc (if any)
-    evidence = []
-    docs = PROJECT_DOCS.get(project_id, [])
-    if docs:
-        evidence.append({
-            "doc_title": docs[0]["title"],
-            "snippet": docs[0]["text"][:400]
-        })
-
-    return {
-        "answer": "Mock clarification. Next we will generate a real explanation grounded in the evidence snippets only.",
-        "evidence": evidence
-    }
+    return {"quiz_text": resp.choices[0].message.content}
