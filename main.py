@@ -7,10 +7,6 @@ import openai
 import uuid
 import os
 
-# ======================
-# CONFIG
-# ======================
-
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 BACKEND_API_KEY = os.environ["BACKEND_API_KEY"]
@@ -20,29 +16,21 @@ openai.api_key = OPENAI_API_KEY
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=300,
 )
 
 SessionLocal = sessionmaker(bind=engine)
 
 app = FastAPI()
+
 security = HTTPBearer()
 
 
-# ======================
-# AUTH
-# ======================
-
 def require_key(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     if credentials.credentials != BACKEND_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-
-# ======================
-# MODELS
-# ======================
 
 class ProjectCreate(BaseModel):
     name: str
@@ -59,37 +47,22 @@ class IngestRequest(BaseModel):
     documents: list[IngestDoc]
 
 
-class QuizRequest(BaseModel):
-    num_questions: int
-    language: str
-    difficulty: str
-    group_by_macro_topics: bool
-    answers_at_end: bool
-
-
-# ======================
-# HELPERS
-# ======================
-
-def embed(texts: list[str]) -> list[list[float]]:
-    res = openai.embeddings.create(
-        model="text-embedding-3-small",
-        input=texts,
-    )
-    return [d.embedding for d in res.data]
-
-
-# ======================
-# ROUTES
-# ======================
-
 @app.post("/projects")
 def create_project(
     payload: ProjectCreate,
     _: HTTPAuthorizationCredentials = Depends(require_key),
 ):
-    project_id = str(uuid.uuid4())
-    return {"project_id": project_id}
+    return {"project_id": str(uuid.uuid4())}
+
+
+def embed(texts):
+
+    res = openai.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts
+    )
+
+    return [d.embedding for d in res.data]
 
 
 @app.post("/projects/{project_id}/ingest")
@@ -98,94 +71,57 @@ def ingest(
     payload: IngestRequest,
     _: HTTPAuthorizationCredentials = Depends(require_key),
 ):
+
     db = SessionLocal()
 
     try:
-        chunks = []
-        for doc in payload.documents:
-            chunks.append(doc.text)
 
-        vectors = embed(chunks)
+        texts = [doc.text for doc in payload.documents]
 
-        for text_chunk, vec in zip(chunks, vectors):
+        vectors = embed(texts)
+
+        for text_chunk, vec in zip(texts, vectors):
+
             db.execute(
+
                 text("""
-                    insert into chunks (project_id, chunk_text, embedding)
-                    values (:pid, :text, :emb)
+
+                insert into chunks
+                (project_id, chunk_text, embedding)
+
+                values
+
+                (
+                    :pid,
+                    :text,
+                    CAST(:emb AS vector)
+                )
+
                 """),
+
                 {
                     "pid": project_id,
                     "text": text_chunk,
                     "emb": vec,
-                },
+                }
+
             )
 
         db.commit()
+
         return {"status": "ok"}
 
-    finally:
-        db.close()
+    except Exception as e:
 
+        db.rollback()
 
-@app.post("/projects/{project_id}/generate_quiz")
-def generate_quiz(
-    project_id: str,
-    payload: QuizRequest,
-    _: HTTPAuthorizationCredentials = Depends(require_key),
-):
-    db = SessionLocal()
+        print("INGEST ERROR:", str(e))
 
-    try:
-        query_embedding = embed(
-            [f"Generate a {payload.difficulty} quiz"]
-        )[0]
-
-        rows = db.execute(
-            text("""
-                select chunk_text
-                from chunks
-                where project_id = :pid
-                order by embedding <=> (:emb)::vector
-                limit 8
-            """),
-            {
-                "pid": project_id,
-                "emb": query_embedding,
-            },
-        ).fetchall()
-
-        if not rows:
-            raise HTTPException(
-                status_code=400,
-                detail="No content ingested for this project",
-            )
-
-        context = "\n".join(r[0] for r in rows)
-
-        prompt = f"""
-Create a {payload.difficulty} difficulty quiz in {payload.language}.
-Use ONLY the content below.
-
-{context}
-
-Rules:
-- {payload.num_questions} questions
-- 4 options per question
-- One correct answer
-- No references to slides
-- Biology only
-- {"Group by macro topics" if payload.group_by_macro_topics else ""}
-- {"Put answers at the end" if payload.answers_at_end else ""}
-"""
-
-        completion = openai.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role": "user", "content": prompt}],
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
         )
 
-        return {
-            "quiz_text": completion.choices[0].message.content
-        }
-
     finally:
+
         db.close()
