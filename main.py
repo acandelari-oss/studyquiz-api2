@@ -1,127 +1,250 @@
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import os
+import uuid
+from fastapi import FastAPI, Depends, HTTPException, Header
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-import openai
-import uuid
-import os
+from openai import OpenAI
+
+# =========================
+# ENV VARIABLES
+# =========================
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 BACKEND_API_KEY = os.environ["BACKEND_API_KEY"]
 
-openai.api_key = OPENAI_API_KEY
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
-
-SessionLocal = sessionmaker(bind=engine)
+# =========================
+# INIT
+# =========================
 
 app = FastAPI()
 
-security = HTTPBearer()
+client = OpenAI(api_key=OPENAI_API_KEY)
 
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
 
-def require_key(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    if credentials.credentials != BACKEND_API_KEY:
+# =========================
+# AUTH
+# =========================
+
+def verify_api_key(authorization: str = Header(None)):
+    if authorization != f"Bearer {BACKEND_API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+# =========================
+# MODELS
+# =========================
 
 class ProjectCreate(BaseModel):
     name: str
 
-
-class IngestDoc(BaseModel):
-    doc_id: str
-    title: str
-    text: str
-
-
 class IngestRequest(BaseModel):
     project_id: str
-    documents: list[IngestDoc]
+    documents: list
 
+class QuizRequest(BaseModel):
+    project_id: str
+    num_questions: int
+    language: str
+    difficulty: str
+    group_by_macro_topics: bool
+    answers_at_end: bool
+
+
+# =========================
+# HEALTH
+# =========================
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# =========================
+# CREATE PROJECT
+# =========================
 
 @app.post("/projects")
 def create_project(
-    payload: ProjectCreate,
-    _: HTTPAuthorizationCredentials = Depends(require_key),
+    data: ProjectCreate,
+    api_key: str = Depends(verify_api_key)
 ):
-    return {"project_id": str(uuid.uuid4())}
+    db = SessionLocal()
 
+    project_id = str(uuid.uuid4())
+
+    db.execute(text("""
+        insert into projects
+        (id, name)
+        values
+        (:id, :name)
+    """), {
+        "id": project_id,
+        "name": data.name
+    })
+
+    db.commit()
+
+    return {"project_id": project_id}
+
+
+# =========================
+# EMBEDDING FUNCTION
+# =========================
 
 def embed(texts):
 
-    res = openai.embeddings.create(
+    res = client.embeddings.create(
         model="text-embedding-3-small",
         input=texts
     )
 
-    return [d.embedding for d in res.data]
+    return [r.embedding for r in res.data]
 
+
+# =========================
+# INGEST TEXT
+# =========================
 
 @app.post("/projects/{project_id}/ingest")
 def ingest(
     project_id: str,
-    payload: IngestRequest,
-    _: HTTPAuthorizationCredentials = Depends(require_key),
+    data: IngestRequest,
+    api_key: str = Depends(verify_api_key)
 ):
 
     db = SessionLocal()
 
-    try:
+    for doc in data.documents:
 
-        texts = [doc.text for doc in payload.documents]
+        text = doc["text"]
 
-        vectors = embed(texts)
+        chunks = [text]
 
-        for text_chunk, vec in zip(texts, vectors):
+        vectors = embed(chunks)
 
-            db.execute(
+        for chunk, vector in zip(chunks, vectors):
 
-                text("""
+            doc_id = str(uuid.uuid4())
+            doc_title = doc.get("title", "Study Material")
+
+            db.execute(text("""
 
                 insert into chunks
-                (project_id, chunk_text, embedding)
-
-                values
-
                 (
-                    :pid,
-                    :text,
-                    CAST(:emb AS vector)
+                project_id,
+                doc_id,
+                doc_title,
+                chunk_text,
+                embedding
                 )
 
-                """),
+                values
+                (
+                :pid,
+                :doc_id,
+                :doc_title,
+                :text,
+                CAST(:emb AS vector)
+                )
 
-                {
-                    "pid": project_id,
-                    "text": text_chunk,
-                    "emb": vec,
-                }
+            """), {
 
-            )
+                "pid": project_id,
+                "doc_id": doc_id,
+                "doc_title": doc_title,
+                "text": chunk,
+                "emb": vector
 
-        db.commit()
+            })
 
-        return {"status": "ok"}
+    db.commit()
 
-    except Exception as e:
+    return {"status": "ok"}
 
-        db.rollback()
 
-        print("INGEST ERROR:", str(e))
+# =========================
+# GENERATE QUIZ
+# =========================
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+@app.post("/projects/{project_id}/generate_quiz")
+def generate_quiz(
+    project_id: str,
+    req: QuizRequest,
+    api_key: str = Depends(verify_api_key)
+):
 
-    finally:
+    db = SessionLocal()
 
-        db.close()
+    query_embedding = embed(["generate quiz"])[0]
+
+    rows = db.execute(text("""
+
+        select chunk_text from chunks
+        where project_id = :pid
+        order by embedding <=> CAST(:emb AS vector)
+        limit 8
+
+    """), {
+        "pid": project_id,
+        "emb": query_embedding
+    }).fetchall()
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="No material found")
+
+    context = "\n\n".join([r[0] for r in rows])
+
+    prompt = f"""
+
+Create {req.num_questions} multiple choice questions.
+
+Language: {req.language}
+Difficulty: {req.difficulty}
+
+Rules:
+
+• Biology only
+• No virus questions
+• 4 options
+• Only one correct answer
+• High quality medical exam level
+
+Material:
+
+{context}
+
+Return quiz.
+
+"""
+
+    response = client.chat.completions.create(
+
+        model="gpt-4o-mini",
+
+        messages=[
+
+            {
+                "role": "system",
+                "content": "You create medical quizzes."
+            },
+
+            {
+                "role": "user",
+                "content": prompt
+            }
+
+        ],
+
+        temperature=0.7
+
+    )
+
+    quiz = response.choices[0].message.content
+
+    return {
+
+        "quiz": quiz
+
+    }
