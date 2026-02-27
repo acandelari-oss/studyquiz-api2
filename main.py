@@ -301,3 +301,47 @@ Material:
     )
 
     return json.loads(res.choices[0].message.content)
+
+@app.get("/projects/{project_id}/documents")
+
+def list_documents(
+
+    project_id: str,
+
+    api_key: str = Depends(verify_api_key)
+
+):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+
+        sql_text("""
+
+        select distinct doc_title
+
+        from chunks
+
+        where project_id = :pid
+
+        """),
+
+        {"pid": project_id}
+
+    ).fetchall()
+
+    db.close()
+
+    return {
+
+        "documents":
+
+        [
+
+            {"title": r[0]}
+
+            for r in rows
+
+        ]
+
+    }
