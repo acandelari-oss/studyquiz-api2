@@ -133,6 +133,69 @@ def create_project(
 
 
 # =====================
+# LIST DOCUMENTS
+# =====================
+
+@app.get("/projects/{project_id}/documents")
+
+def list_documents(
+
+    project_id: str,
+
+    api_key: str = Depends(verify_api_key)
+
+):
+
+    db = SessionLocal()
+
+    try:
+
+        rows = db.execute(
+
+            sql_text("""
+
+            select distinct doc_title
+
+            from chunks
+
+            where project_id = :project_id
+
+            order by doc_title
+
+            """),
+
+            {
+
+                "project_id": project_id
+
+            }
+
+        ).fetchall()
+
+        documents = [
+
+            {
+
+                "title": r[0]
+
+            }
+
+            for r in rows
+
+        ]
+
+        return {
+
+            "documents": documents
+
+        }
+
+    finally:
+
+        db.close()
+
+
+# =====================
 # EMBEDDINGS
 # =====================
 
@@ -171,157 +234,77 @@ def ingest(
 
         for doc in data.documents:
 
-            document_id = str(uuid.uuid4())
+            vectors = embed_texts([doc.text])
 
-            # SAVE DOCUMENT
+            db.execute(
 
-            db.execute(sql_text("""
+                sql_text("""
 
-                insert into documents
+                insert into chunks
 
-                (id, project_id, filename)
+                (
+
+                project_id,
+
+                doc_id,
+
+                doc_title,
+
+                chunk_text,
+
+                embedding
+
+                )
 
                 values
 
-                (:id, :project_id, :filename)
+                (
 
-            """), {
+                :project_id,
 
-                "id": document_id,
+                :doc_id,
 
-                "project_id": project_id,
+                :doc_title,
 
-                "filename": doc.title
+                :chunk_text,
 
-            })
+                CAST(:embedding AS vector)
 
+                )
 
-            chunks = [doc.text]
+                """),
 
-            vectors = embed_texts(chunks)
-
-
-            for chunk_text, vector in zip(chunks, vectors):
-
-                db.execute(sql_text("""
-
-                    insert into chunks
-
-                    (
-
-                        project_id,
-
-                        doc_id,
-
-                        doc_title,
-
-                        chunk_text,
-
-                        embedding
-
-                    )
-
-                    values
-
-                    (
-
-                        :project_id,
-
-                        :doc_id,
-
-                        :doc_title,
-
-                        :chunk_text,
-
-                        CAST(:embedding AS vector)
-
-                    )
-
-                """), {
+                {
 
                     "project_id": project_id,
 
-                    "doc_id": document_id,
+                    "doc_id": str(uuid.uuid4()),
 
                     "doc_title": doc.title,
 
-                    "chunk_text": chunk_text,
+                    "chunk_text": doc.text,
 
-                    "embedding": vector
+                    "embedding": vectors[0]
 
-                })
+                }
 
+            )
 
         db.commit()
 
         return {"status": "ok"}
 
-
     except Exception as e:
 
         db.rollback()
 
-        raise HTTPException(status_code=500, detail=str(e))
+        print("INGEST ERROR:", e)
 
+        raise HTTPException(status_code=500, detail=str(e))
 
     finally:
 
         db.close()
-
-
-# =====================
-# LIST DOCUMENTS
-# =====================
-
-@app.get("/projects/{project_id}/documents")
-
-def list_documents(
-
-    project_id: str,
-
-    api_key: str = Depends(verify_api_key)
-
-):
-
-    db = SessionLocal()
-
-    rows = db.execute(sql_text("""
-
-        select id, filename, uploaded_at
-
-        from documents
-
-        where project_id = :project_id
-
-        order by uploaded_at desc
-
-    """), {
-
-        "project_id": project_id
-
-    }).fetchall()
-
-    db.close()
-
-    return {
-
-        "documents": [
-
-            {
-
-                "id": r[0],
-
-                "filename": r[1],
-
-                "uploaded_at": str(r[2])
-
-            }
-
-            for r in rows
-
-        ]
-
-    }
 
 
 # =====================
@@ -344,8 +327,6 @@ def generate_quiz(
 
     try:
 
-        query_vector = embed_texts(["quiz"])[0]
-
         rows = db.execute(
 
             sql_text("""
@@ -356,33 +337,34 @@ def generate_quiz(
 
             where project_id = :project_id
 
-            order by embedding <=> CAST(:query_vector AS vector)
-
             limit 8
 
             """),
 
             {
 
-                "project_id": project_id,
-
-                "query_vector": query_vector
+                "project_id": project_id
 
             }
 
         ).fetchall()
 
-
-        context = "\n\n".join([r[0] for r in rows])
+        context = "\n".join([r[0] for r in rows])
 
 
         prompt = f"""
 
 Create {req.num_questions} multiple choice questions.
 
+Language: {req.language}
+
+Difficulty: {req.difficulty}
+
 Material:
 
 {context}
+
+Return JSON.
 
 """
 
@@ -419,81 +401,6 @@ Material:
             "quiz": response.choices[0].message.content
 
         }
-
-
-    except Exception as e:
-
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-    finally:
-
-        db.close()
-# =====================
-# LIST FILES
-# =====================
-
-@app.get("/projects/{project_id}/documents")
-
-def list_documents(
-    project_id: str,
-    api_key: str = Depends(verify_api_key)
-):
-
-    db = SessionLocal()
-
-    try:
-
-        rows = db.execute(
-
-            sql_text("""
-
-            SELECT
-
-                doc_id,
-
-                doc_title
-
-            FROM chunks
-
-            WHERE project_id = :project_id
-
-            GROUP BY doc_id, doc_title
-
-            ORDER BY doc_title
-
-            """),
-
-            {
-
-                "project_id": project_id
-
-            }
-
-        ).fetchall()
-
-
-        documents = [
-
-            {
-
-                "id": r[0],
-
-                "filename": r[1]
-
-            }
-
-            for r in rows
-
-        ]
-
-
-        return {
-
-            "documents": documents
-
-        }
-
 
     finally:
 
