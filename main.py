@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 
 from fastapi import FastAPI, Depends, HTTPException, Header
 from pydantic import BaseModel
@@ -171,11 +172,7 @@ def ingest(
 
         for doc in data.documents:
 
-            document_text = doc.text
-
-            document_title = doc.title
-
-            chunks = [document_text]
+            chunks = [doc.text]
 
             vectors = embed_texts(chunks)
 
@@ -225,7 +222,7 @@ def ingest(
 
                         "doc_id": str(uuid.uuid4()),
 
-                        "doc_title": document_title,
+                        "doc_title": doc.title,
 
                         "chunk_text": chunk_text,
 
@@ -239,15 +236,11 @@ def ingest(
 
         return {"status": "ok"}
 
-
     except Exception as e:
 
         db.rollback()
 
-        print("INGEST ERROR:", e)
-
         raise HTTPException(status_code=500, detail=str(e))
-
 
     finally:
 
@@ -255,7 +248,7 @@ def ingest(
 
 
 # =====================
-# GENERATE QUIZ
+# GENERATE QUIZ (FIXED)
 # =====================
 
 @app.post("/projects/{project_id}/generate_quiz")
@@ -302,6 +295,7 @@ def generate_quiz(
 
         ).fetchall()
 
+
         if not rows:
 
             raise HTTPException(
@@ -318,13 +312,37 @@ def generate_quiz(
 
         prompt = f"""
 
-Create {req.num_questions} multiple choice biology questions.
+Create a multiple choice quiz.
 
-Language: {req.language}
+Return ONLY valid JSON.
+
+Format:
+
+{{
+ "questions":[
+  {{
+   "question":"...",
+   "options":{{
+    "A":"...",
+    "B":"...",
+    "C":"...",
+    "D":"..."
+   }},
+   "correct":"A",
+   "explanation":"..."
+  }}
+ ]
+}}
+
+Rules:
+
+Number of questions: {req.num_questions}
 
 Difficulty: {req.difficulty}
 
-Material:
+Language: {req.language}
+
+Context:
 
 {context}
 
@@ -341,7 +359,7 @@ Material:
 
                     "role": "system",
 
-                    "content": "You create medical quizzes."
+                    "content": "You create professional medical quizzes. Return only JSON."
 
                 },
 
@@ -353,16 +371,21 @@ Material:
 
                 }
 
-            ]
+            ],
+
+            temperature=0.3
 
         )
 
 
-        return {
+        quiz_json = json.loads(
 
-            "quiz": response.choices[0].message.content
+            response.choices[0].message.content
 
-        }
+        )
+
+
+        return quiz_json
 
 
     except Exception as e:
