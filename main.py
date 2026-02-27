@@ -118,16 +118,13 @@ def ingest(
 
     for doc in data.documents:
 
-        text = doc["text"]
+        content = doc.text   # ← RINOMINATO
 
-        chunks = [text]
+        chunks = [content]
 
         vectors = embed(chunks)
 
         for chunk, vector in zip(chunks, vectors):
-
-            doc_id = str(uuid.uuid4())
-            doc_title = doc.get("title", "Study Material")
 
             db.execute(text("""
 
@@ -145,16 +142,20 @@ def ingest(
                 :pid,
                 :doc_id,
                 :doc_title,
-                :text,
+                :chunk,
                 CAST(:emb AS vector)
                 )
 
             """), {
 
                 "pid": project_id,
-                "doc_id": doc_id,
-                "doc_title": doc_title,
-                "text": chunk,
+
+                "doc_id": str(uuid.uuid4()),
+
+                "doc_title": doc.title,
+
+                "chunk": chunk,   # ← RINOMINATO
+
                 "emb": vector
 
             })
