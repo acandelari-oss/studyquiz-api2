@@ -429,3 +429,72 @@ Material:
     finally:
 
         db.close()
+# =====================
+# LIST FILES
+# =====================
+
+@app.get("/projects/{project_id}/documents")
+
+def list_documents(
+    project_id: str,
+    api_key: str = Depends(verify_api_key)
+):
+
+    db = SessionLocal()
+
+    try:
+
+        rows = db.execute(
+
+            sql_text("""
+
+            SELECT
+
+                doc_id,
+
+                doc_title
+
+            FROM chunks
+
+            WHERE project_id = :project_id
+
+            GROUP BY doc_id, doc_title
+
+            ORDER BY doc_title
+
+            """),
+
+            {
+
+                "project_id": project_id
+
+            }
+
+        ).fetchall()
+
+
+        documents = [
+
+            {
+
+                "id": r[0],
+
+                "filename": r[1]
+
+            }
+
+            for r in rows
+
+        ]
+
+
+        return {
+
+            "documents": documents
+
+        }
+
+
+    finally:
+
+        db.close()
