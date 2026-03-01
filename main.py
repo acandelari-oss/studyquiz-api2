@@ -1,101 +1,135 @@
-# ADD these fields in chunks table:
+import os
+import uuid
+import json
 
-# doc_title
-# page_number
+from fastapi import FastAPI, Depends, HTTPException, Header
+
+from pydantic import BaseModel
+
+from sqlalchemy import create_engine, text as sql_text
+from sqlalchemy.orm import sessionmaker
+
+from openai import OpenAI
 
 
-# ======================
-# GENERATE QUIZ UPDATED
-# ======================
+DATABASE_URL=os.environ["DATABASE_URL"]
+OPENAI_API_KEY=os.environ["OPENAI_API_KEY"]
+BACKEND_API_KEY=os.environ["BACKEND_API_KEY"]
+
+
+app=FastAPI()
+
+client=OpenAI(api_key=OPENAI_API_KEY)
+
+engine=create_engine(DATABASE_URL)
+
+SessionLocal=sessionmaker(bind=engine)
+
+
+
+def verify_api_key(authorization:str=Header(None)):
+
+    if authorization!=f"Bearer {BACKEND_API_KEY}":
+
+        raise HTTPException(status_code=401,detail="Invalid API key")
+
+
+
+class QuizRequest(BaseModel):
+
+    num_questions:int
+    language:str
+    difficulty:str
+    group_by_macro_topics:bool
+    answers_at_end:bool
+
+
+
+def embed(text):
+
+    res=client.embeddings.create(
+
+        model="text-embedding-3-small",
+
+        input=text
+
+    )
+
+    return res.data[0].embedding
+
 
 
 @app.post("/projects/{project_id}/generate_quiz")
 
-def generate_quiz(project_id: str, req: QuizRequest, api_key: str = Depends(verify_api_key)):
+def generate_quiz(
 
+    project_id:str,
 
-    db = SessionLocal()
+    req:QuizRequest,
 
+    api_key:str=Depends(verify_api_key)
+
+):
+
+    db=SessionLocal()
 
     try:
 
-
-        query_vector = embed_texts(["quiz"])[0]
-
-
-        rows = db.execute(sql_text("""
-
-        select
-
-            chunk_text,
-            doc_title,
-            page_number
-
-        from chunks
-
-        where project_id = :project_id
-
-        order by embedding <=> CAST(:query_vector AS vector)
-
-        limit 10
-
-        """),
-
-        {
-
-            "project_id": project_id,
-            "query_vector": query_vector
-
-        }).fetchall()
+        query_vector=embed("quiz")
 
 
+        rows=db.execute(
 
-        context = "\n\n".join([
+            sql_text("""
 
-            f"""
+            select chunk_text
 
-SOURCE: {r.doc_title}
+            from chunks
 
-PAGE: {r.page_number}
+            where project_id=:pid
 
-TEXT:
+            limit 8
 
-{r.chunk_text}
+            """),
 
-"""
+            {"pid":project_id}
 
-            for r in rows
-
-        ])
-
+        ).fetchall()
 
 
-        prompt = f"""
+        if not rows:
 
-Create {req.num_questions} questions.
+            raise HTTPException(
+
+                status_code=400,
+
+                detail="No content"
+
+            )
 
 
-STRICT FORMAT JSON:
+        context="\n\n".join([r[0] for r in rows])
+
+
+        prompt=f"""
+
+Create {req.num_questions} quiz questions.
+
+Language: {req.language}
+
+Difficulty: {req.difficulty}
+
+Return ONLY valid JSON in this exact format:
 
 [
-
 {{
-question:
-
-answers:
-
-correct:
-
-explanation:
-
-explanation_extended:
-
-source_file:
-
-page:
-
+"question":"",
+"options":["A","B","C","D"],
+"correct":"",
+"explanation":"",
+"source":"file name",
+"page":1
 }}
-
 ]
 
 Material:
@@ -105,30 +139,15 @@ Material:
 """
 
 
-
-        response = client.chat.completions.create(
+        response=client.chat.completions.create(
 
             model="gpt-4o-mini",
 
             messages=[
 
-                {
+                {"role":"system","content":"Return ONLY JSON."},
 
-                    "role": "system",
-
-                    "content":
-
-                    "You create medical exam questions with full explanations and source."
-
-                },
-
-                {
-
-                    "role": "user",
-
-                    "content": prompt
-
-                }
+                {"role":"user","content":prompt}
 
             ],
 
@@ -137,13 +156,39 @@ Material:
         )
 
 
+        raw=response.choices[0].message.content
 
-        return {
 
-            "quiz": response.choices[0].message.content
+        print("OPENAI RAW:",raw)
 
-        }
 
+        try:
+
+            quiz=json.loads(raw)
+
+        except:
+
+            raise HTTPException(
+
+                status_code=500,
+
+                detail=f"Invalid JSON from OpenAI: {raw}"
+
+            )
+
+
+        if not isinstance(quiz,list):
+
+            raise HTTPException(
+
+                status_code=500,
+
+                detail="Quiz is not list"
+
+            )
+
+
+        return {"quiz":quiz}
 
 
     finally:
