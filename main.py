@@ -271,6 +271,8 @@ def generate_quiz(
 
 ):
 
+    import re
+
     db=SessionLocal()
 
     rows=db.execute(
@@ -333,7 +335,7 @@ Return ONLY JSON array:
 "options":["A","B","C","D"],
 "correct":"",
 "explanation":"",
-"source":"file name",
+"source":"",
 "page":1
 }}
 ]
@@ -363,19 +365,20 @@ Material:
     raw=response.choices[0].message.content
 
 
-    try:
+    match=re.search(r"\[.*\]",raw,re.S)
 
-        quiz=json.loads(raw)
-
-    except:
+    if not match:
 
         raise HTTPException(
 
             status_code=500,
 
-            detail=f"Invalid JSON: {raw}"
+            detail=f"No JSON found: {raw}"
 
         )
+
+
+    quiz=json.loads(match.group())
 
 
     return {"quiz":quiz}
