@@ -378,7 +378,7 @@ you must skip the question and generate another one.
 Every question MUST be supported by the material.
 Every question MUST include the exact source page.
 
-Generate {req.num_questions} high-quality multiple choice questions.
+Generate ONE high-quality multiple choice question.
 Difficulty: {req.difficulty}
 Language: {req.language}
 
@@ -387,38 +387,36 @@ Questions must:
 - avoid trivial questions
 - avoid repeating the same concept
 - cover different parts of the material
-Wrong options must be plausible but incorrect.
-Avoid obviously wrong answers.
-Each question must have EXACTLY 5 options labeled A), B), C), D), E).
 
+Wrong options must be plausible but incorrect.
+
+Each question must have EXACTLY 5 options labeled A), B), C), D), E).
 
 Return STRICT JSON:
 
-[
-  {{
-    "question": "...",
-    "options": ["...", "...", "...", "...", "..."],
-    "correct": "A",
-    "explanation": "Short explanation",
-    "explanation_long": "Detailed explanation",
-    "source_document": "Exact file name used",
-    "source_page": "Page number"
-  }}
-]
+{{
+  "question": "...",
+  "options": ["...", "...", "...", "...", "..."],
+  "correct": "A",
+  "explanation": "Short explanation",
+  "explanation_long": "Detailed explanation",
+  "source_document": "Exact file name used",
+  "source_page": "Page number"
+}}
 
 Material:
 {context}
 """
 
     response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": prompt}],
-    temperature=0.3
-)
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
 
-content = response.choices[0].message.content.strip()
-content = content.replace("```json", "").replace("```", "").strip()
+    content = response.choices[0].message.content.strip()
+    content = content.replace("```json", "").replace("```", "").strip()
 
-quiz_results.append(content)
+    quiz_results.append(content)
 
-   return {"quiz": quiz_results}
+return {"quiz": quiz_results}
