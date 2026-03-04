@@ -339,7 +339,7 @@ rows = db.execute(
         from chunks
         where project_id = :project_id
         order by embedding <-> CAST(:embedding AS vector)
-        limit 15
+        limit 40
     """),
     {
         "project_id": project_id,
