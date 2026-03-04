@@ -326,15 +326,26 @@ def generate_quiz(
         db.close()
         raise HTTPException(status_code=403, detail="Access denied")
 
-    rows = db.execute(
-        text("""
-            select chunk_text, doc_title, page
-            from chunks
-            where project_id = :project_id
-            limit 5
-        """),
-        {"project_id": project_id}
-    ).fetchall()
+    # create embedding for the quiz query
+query_embedding = client.embeddings.create(
+    model="text-embedding-3-small",
+    input="generate quiz questions from the study material"
+).data[0].embedding
+
+
+rows = db.execute(
+    text("""
+        select chunk_text, doc_title, page
+        from chunks
+        where project_id = :project_id
+        order by embedding <-> CAST(:embedding AS vector)
+        limit 8
+    """),
+    {
+        "project_id": project_id,
+        "embedding": query_embedding
+    }
+).fetchall()
 
     db.close()
 
