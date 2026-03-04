@@ -355,6 +355,7 @@ def generate_quiz(
 You MUST use ONLY the material provided below.
 
 Generate {req.num_questions} multiple choice questions.
+Each question must have EXACTLY 5 options labeled A), B), C), D), E).
 Difficulty: {req.difficulty}
 Language: {req.language}
 
@@ -363,7 +364,7 @@ Return STRICT JSON:
 [
   {{
     "question": "...",
-    "options": ["...", "...", "...", "..."],
+    "options": ["...", "...", "...", "...", "..."],
     "correct": "A",
     "explanation": "Short explanation",
     "explanation_long": "Detailed explanation",
