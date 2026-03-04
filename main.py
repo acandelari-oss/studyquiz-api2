@@ -333,31 +333,36 @@ query_embedding = client.embeddings.create(
 ).data[0].embedding
 
 
-rows = db.execute(
-    text("""
-        select chunk_text, doc_title, page
-        from chunks
-        where project_id = :project_id
-        order by embedding <-> CAST(:embedding AS vector)
-        limit 40
-    """),
-    {
-        "project_id": project_id,
-        "embedding": query_embedding
-    }
-).fetchall()
+quiz_results = []
 
-    db.close()
+for i in range(req.num_questions):
+
+    query_embedding = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=f"study question topic {i}"
+    ).data[0].embedding
+
+
+    rows = db.execute(
+        text("""
+            select chunk_text, doc_title, page
+            from chunks
+            where project_id = :project_id
+            order by embedding <-> CAST(:embedding AS vector)
+            limit 5
+        """),
+        {
+            "project_id": project_id,
+            "embedding": query_embedding
+        }
+    ).fetchall()
+
 
     material_blocks = []
 
     for r in rows:
-        chunk_text = r[0]
-        doc_title = r[1]
-        page_number = r[2]
-
         material_blocks.append(
-            f"FILE: {doc_title} | PAGE: {page_number}\nCONTENT:\n{chunk_text}"
+            f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}"
         )
 
     context = "\n\n---\n\n".join(material_blocks)
@@ -406,12 +411,14 @@ Material:
 """
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
-    )
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": prompt}],
+    temperature=0.3
+)
 
-    content = response.choices[0].message.content.strip()
-    content = content.replace("```json", "").replace("```", "").strip()
+content = response.choices[0].message.content.strip()
+content = content.replace("```json", "").replace("```", "").strip()
 
-    return {"quiz": content}
+quiz_results.append(content)
+
+   return {"quiz": quiz_results}
