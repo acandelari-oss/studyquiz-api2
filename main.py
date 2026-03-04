@@ -339,7 +339,7 @@ rows = db.execute(
         from chunks
         where project_id = :project_id
         order by embedding <-> CAST(:embedding AS vector)
-        limit 8
+        limit 15
     """),
     {
         "project_id": project_id,
@@ -365,10 +365,27 @@ rows = db.execute(
     prompt = f"""
 You MUST use ONLY the material provided below.
 
-Generate {req.num_questions} multiple choice questions.
-Each question must have EXACTLY 5 options labeled A), B), C), D), E).
+You are NOT allowed to use external knowledge.
+
+If the answer cannot be found in the material,
+you must skip the question and generate another one.
+
+Every question MUST be supported by the material.
+Every question MUST include the exact source page.
+
+Generate {req.num_questions} high-quality multiple choice questions.
 Difficulty: {req.difficulty}
 Language: {req.language}
+
+Questions must:
+- test understanding of the material
+- avoid trivial questions
+- avoid repeating the same concept
+- cover different parts of the material
+Wrong options must be plausible but incorrect.
+Avoid obviously wrong answers.
+Each question must have EXACTLY 5 options labeled A), B), C), D), E).
+
 
 Return STRICT JSON:
 
