@@ -6,6 +6,7 @@ from typing import List
 
 import requests
 from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -37,6 +38,15 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 # ======================
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
