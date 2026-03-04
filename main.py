@@ -326,48 +326,44 @@ def generate_quiz(
         db.close()
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # create embedding for the quiz query
-query_embedding = client.embeddings.create(
-    model="text-embedding-3-small",
-    input="generate quiz questions from the study material"
-).data[0].embedding
+   
 
 
-quiz_results = []
+    quiz_results = []
 
-for i in range(req.num_questions):
+    for i in range(req.num_questions):
 
-    query_embedding = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=f"study question topic {i}"
-    ).data[0].embedding
-
-
-    rows = db.execute(
-        text("""
-            select chunk_text, doc_title, page
-            from chunks
-            where project_id = :project_id
-            order by embedding <-> CAST(:embedding AS vector)
-            limit 5
-        """),
-        {
-            "project_id": project_id,
-            "embedding": query_embedding
-        }
-    ).fetchall()
+        query_embedding = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=f"study question topic {i}"
+        ).data[0].embedding
 
 
-    material_blocks = []
+        rows = db.execute(
+            text("""
+                select chunk_text, doc_title, page
+                from chunks
+                where project_id = :project_id
+                order by embedding <-> CAST(:embedding AS vector)
+                limit 5
+            """),
+            {
+                "project_id": project_id,
+                "embedding": query_embedding
+            }
+        ).fetchall()
 
-    for r in rows:
-        material_blocks.append(
-            f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}"
-        )
 
-    context = "\n\n---\n\n".join(material_blocks)
+        material_blocks = []
 
-    prompt = f"""
+        for r in rows:
+            material_blocks.append(
+                f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}"
+            )
+
+        context = "\n\n---\n\n".join(material_blocks)
+
+        prompt = f"""
 You MUST use ONLY the material provided below.
 
 You are NOT allowed to use external knowledge.
@@ -408,15 +404,17 @@ Material:
 {context}
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
-    )
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
 
-    content = response.choices[0].message.content.strip()
-    content = content.replace("```json", "").replace("```", "").strip()
+        content = response.choices[0].message.content.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
 
-    quiz_results.append(content)
+        quiz_results.append(content)
 
-return {"quiz": quiz_results}
+    db.close()
+
+    return {"quiz": quiz_results}
