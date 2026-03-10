@@ -3,16 +3,20 @@ import uuid
 import base64
 import io
 from typing import List
-
+import json
 import requests
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from openai import OpenAI
 from dotenv import load_dotenv
 from pypdf import PdfReader
+import asyncio
+
+
 
 
 # ======================
@@ -57,6 +61,8 @@ SessionLocal = sessionmaker(bind=engine)
 # ======================
 
 def verify_user(authorization: str = Header(None)):
+    
+    print("AUTH HEADER:", authorization)
 
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -264,10 +270,12 @@ def ingest(
                 if not page_text or not page_text.strip():
                     continue
 
-                embedding = client.embeddings.create(
+                emb = client.embeddings.create(
                     model="text-embedding-3-small",
                     input=page_text
-                ).data[0].embedding
+                )
+
+                embedding = emb.data[0].embedding
 
                 db.execute(
                     text("""
@@ -326,18 +334,197 @@ def generate_quiz(
         db.close()
         raise HTTPException(status_code=403, detail="Access denied")
 
-   
 
+    # ======================
+    # RETRIEVAL (UNA SOLA VOLTA)
+    # ======================
+
+    print("START EMBEDDING")
+
+    query_embedding = client.embeddings.create(
+        model="text-embedding-3-small",
+        input="generate study quiz questions"
+    ).data[0].embedding
+
+    print("EMBEDDING DONE")
+
+    rows = db.execute(
+        text("""
+            select chunk_text, doc_title, page
+            from chunks
+            where project_id = :project_id
+            order by embedding <-> CAST(:embedding AS vector)
+            limit 25
+        """),
+        {
+            "project_id": project_id,
+            "embedding": query_embedding
+        }
+    ).fetchall()
+
+
+    material_blocks = []
+
+    for r in rows:
+        material_blocks.append(
+            f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}"
+        )
+
+
+    context = "\n\n---\n\n".join(material_blocks)
+    print("CONTEXT LENGTH:", len(context))
+    if len(context) < 100:
+        print("WARNING: context too small")
+
+
+    # ======================
+    # QUIZ GENERATION
+    # ======================
 
     quiz_results = []
+    used_concepts = []
 
-    for i in range(req.num_questions):
+    remaining = req.num_questions
+    batch_size = 20
 
-        query_embedding = client.embeddings.create(
+
+    while remaining > 0:
+
+        n = min(batch_size, remaining)
+        print("CONTEXT LENGTH:", len(context))
+        
+        prompt = f"""
+You MUST use ONLY the material provided below.
+
+You are NOT allowed to use external knowledge.
+
+If the material does NOT contain enough information,
+return an empty JSON array: []
+
+Do NOT guess or invent information.§
+
+If the answer cannot be found in the material, skip the question.
+
+Avoid generating questions similar to these already generated questions:
+{used_concepts}
+
+Material:
+{context}
+
+Generate {n} high-quality multiple choice questions.
+
+Difficulty: {req.difficulty}
+Language: {req.language}
+
+Questions must:
+- test understanding of mechanisms and cause-effect relationships
+- prefer application or reasoning questions over definitions
+- compare processes when possible
+- avoid trivial definition questions
+- cover different concepts from the material
+
+Each question must have EXACTLY 5 options.
+Distractors must be plausible and conceptually related to the topic.
+Avoid obviously wrong answers.
+Incorrect options should represent common misconceptions when possible.
+Avoid generating multiple questions about the same concept.
+
+Return STRICT JSON ARRAY like this:
+
+[
+{{
+"question": "...",
+"options": ["...","...","...","...","..."],
+"correct": "A",
+"topic": "...",
+"explanation": "...",
+"explanation_long": "...",
+"source_document": "...",
+"source_page": "..."
+}}
+]
+
+
+""" 
+        print("PROMPT SAMPLE:", prompt[:500])
+
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.3
+        )
+
+
+        content = response.choices[0].message.content.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
+
+
+        try:
+            parsed = json.loads(content)
+
+            if isinstance(parsed, list):
+                quiz_results.extend(parsed)
+            else:
+                quiz_results.append(parsed)
+
+        except Exception as e:
+            print("JSON parse error:", e)
+            print(content)
+
+        for q in parsed:
+            used_concepts.append(q.get("question","")[:120])
+        used_concepts.append(content[:120])
+
+        remaining -= n
+
+
+    db.close()
+
+    seen = set()
+    unique_questions = []
+
+    for q in quiz_results:
+
+        text_q = q.get("question","").strip().lower()
+
+        if text_q not in seen:
+            seen.add(text_q)
+            unique_questions.append(q)
+
+    db.close()
+
+    return {"quiz": unique_questions}
+
+    
+
+
+
+class AskRequest(BaseModel):
+    project_id: str
+    question: str
+
+@app.post("/projects/{project_id}/generate_quiz_stream")
+async def generate_quiz_stream(
+    project_id: str,
+    req: QuizRequest,
+    user = Depends(verify_user)
+):
+    user_id = user["id"]
+    async def quiz_generator():
+
+        db = SessionLocal()
+
+        remaining = req.num_questions
+        first_batch = True
+
+        # RETRIEVAL UNA SOLA VOLTA
+        emb = client.embeddings.create(
             model="text-embedding-3-small",
-            input=f"study question topic {i}"
-        ).data[0].embedding
+            input=f"study material concepts {req.language} {req.difficulty}"
+        )
 
+        query_embedding = emb.data[0].embedding
 
         rows = db.execute(
             text("""
@@ -345,7 +532,7 @@ def generate_quiz(
                 from chunks
                 where project_id = :project_id
                 order by embedding <-> CAST(:embedding AS vector)
-                limit 5
+                limit 20
             """),
             {
                 "project_id": project_id,
@@ -353,68 +540,672 @@ def generate_quiz(
             }
         ).fetchall()
 
+        db.close()
 
         material_blocks = []
 
         for r in rows:
             material_blocks.append(
-                f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}"
+                f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:500]}"
             )
 
         context = "\n\n---\n\n".join(material_blocks)
 
-        prompt = f"""
-You MUST use ONLY the material provided below.
+        # GENERAZIONE QUIZ
+        batch_size = 3
+        num_batches = (req.num_questions + batch_size - 1) // batch_size
 
-You are NOT allowed to use external knowledge.
 
-If the answer cannot be found in the material,
-you must skip the question and generate another one.
+        async def generate_batch(n):
 
-Every question MUST be supported by the material.
-Every question MUST include the exact source page.
+            prompt = f"""
+        You MUST use ONLY the material provided below.
 
-Generate ONE high-quality multiple choice question.
-Difficulty: {req.difficulty}
-Language: {req.language}
+        You are NOT allowed to use external knowledge.
 
-Questions must:
-- test understanding of the material
-- avoid trivial questions
-- avoid repeating the same concept
-- cover different parts of the material
+        Material:
+        {context}
 
-Wrong options must be plausible but incorrect.
+        Generate {n} high-quality multiple choice study questions.
 
-Each question must have EXACTLY 5 options labeled A), B), C), D), E).
+        Difficulty: {req.difficulty}
+        Language: {req.language}
 
-Return STRICT JSON:
+        Rules:
+        - Questions must test understanding of the material
+        - Avoid trivial definitions
+        - Use different concepts from the material
+        - Each question must have EXACTLY 5 options labeled A,B,C,D,E
+        - You MUST cite the document and page used
+        - Questions MUST cover DIFFERENT topics from the material
+        - Cover as many different topics from the material as possible
+        - Avoid generating questions about the same concept repeatedly
+        - Each question must focus on a different part of the material
+        - Avoid repeating the same question phrasing
 
-{{
-  "question": "...",
-  "options": ["...", "...", "...", "...", "..."],
-  "correct": "A",
-  "explanation": "Short explanation",
-  "explanation_long": "Detailed explanation",
-  "source_document": "Exact file name used",
-  "source_page": "Page number"
-}}
+        Return STRICT JSON ARRAY like this:
+
+        [
+        {{
+        "question": "...",
+        "options": ["...", "...", "...", "...", "..."],
+        "correct": "A",
+        "explanation": "Short explanation",
+        "explanation_long": "2-3 sentences maximum",
+        "source_document": "Exact file name",
+        "source_page": "Page number"
+        }}
+        ]
+        """
+
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model="gpt-4o-mini",
+                messages=[{"role":"user","content":prompt}],
+                temperature=0.3
+            )
+
+            content = response.choices[0].message.content.strip()
+
+            try:
+
+                content = content.replace("```json","").replace("```","").strip()
+
+                questions = json.loads(content)
+
+                if not isinstance(questions, list):
+                    questions = [questions]
+
+                seen = set()
+                unique_questions = []
+
+                for q in questions:
+
+                    text_q = q.get("question","").strip().lower()
+
+                    if text_q not in seen:
+                        seen.add(text_q)
+                        unique_questions.append(q)
+
+                return unique_questions
+
+            except Exception as e:
+
+                print("QUIZ JSON ERROR:", e)
+                print("RAW GPT OUTPUT:", content)
+
+                return []
+
+
+        tasks = []
+
+        for i in range(num_batches):
+
+            n = min(batch_size, req.num_questions - i * batch_size)
+
+            tasks.append(generate_batch(n))
+
+
+        results = await asyncio.gather(*tasks)
+
+        questions = []
+
+        for batch in results:
+            questions.extend(batch)
+
+        return questions
+
+
+    questions = await quiz_generator()
+
+    # ======================
+    # SAVE QUIZ
+    # ======================
+
+    quiz_id = str(uuid.uuid4())
+
+    db = SessionLocal()
+
+    db.execute(
+        text("""
+        insert into quizzes
+        (id, project_id, user_id, num_questions, difficulty, language)
+        values
+        (:id, :project_id, :user_id, :num_questions, :difficulty, :language)
+        """),
+        {
+            "id": quiz_id,
+            "project_id": project_id,
+            "user_id": user_id,
+            "num_questions": req.num_questions,
+            "difficulty": req.difficulty,
+            "language": req.language
+        }
+    )
+
+    for i, q in enumerate(questions):
+
+        db.execute(
+            text("""
+            insert into quiz_questions
+            (quiz_id, question_order, question, options, correct, explanation, explanation_long, source_document, source_page)
+            values
+            (:quiz_id, :order, :question, :options, :correct, :explanation, :explanation_long, :doc, :page)
+            """),
+            {
+                "quiz_id": quiz_id,
+                "order": i,
+                "question": q.get("question"),
+                "options": json.dumps(q.get("options")),
+                "correct": q.get("correct"),
+                "explanation": q.get("explanation"),
+                "explanation_long": q.get("explanation_long"),
+                "doc": q.get("source_document"),
+                "page": q.get("source_page"),
+                "topic": q.get("topic")
+            }
+        )
+
+    db.commit()
+    db.close()
+
+    return {
+        "quiz_id": quiz_id,
+        "questions": questions
+    }
+@app.post("/projects/{project_id}/generate_flashcards")
+async def generate_flashcards(
+    project_id: str,
+    req: dict = None,
+    user = Depends(verify_user)
+):
+
+    num_cards = 10
+    user_id = user["id"]
+    if req and isinstance(req, dict):
+        num_cards = req.get("num_cards", 10)
+
+    # recuperiamo contesto dal vector DB
+    context_chunks = search_project_chunks(project_id, k=20)
+
+    context_text = "\n\n".join([c["text"] for c in context_chunks])
+
+    prompt = f"""
+You are an expert tutor.
+
+Create {num_cards} flashcards from the study material.
+Flashcards must cover DIFFERENT topics from the material.
+Avoid creating multiple flashcards about the same concept.
+
+Each flashcard must have:
+- question
+- answer
+
+Return ONLY valid JSON in this format:
+
+[
+  {{
+    "question": "...",
+    "answer": "..."
+  }}
+]
+
+Study material:
+{context_text}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": "You generate study flashcards."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    gpt_text = response.choices[0].message.content
+
+    try:
+
+        gpt_text = gpt_text.replace("```json", "").replace("```", "").strip()
+        flashcards = json.loads(gpt_text)
+
+        # remove duplicate questions
+
+        seen = set()
+        unique_flashcards = []
+
+        for card in flashcards:
+
+            q = card.get("question","").strip().lower()
+
+            if q not in seen:
+                seen.add(q)
+                unique_flashcards.append(card)
+
+        flashcards = unique_flashcards
+
+        if not isinstance(flashcards, list):
+            flashcards = []
+
+    except Exception as e:
+
+        print("FLASHCARDS JSON ERROR:", e)
+        print("RAW GPT OUTPUT:", gpt_text)
+
+        flashcards = []
+    # ======================
+    # SAVE FLASHCARDS
+    # ======================
+
+    db = SessionLocal()
+
+    for card in flashcards:
+
+        db.execute(
+            text("""
+            insert into flashcards
+            (project_id, user_id, question, answer)
+            values
+            (:project_id, :user_id, :question, :answer)
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user_id,
+                "question": card.get("question"),
+                "answer": card.get("answer")
+            }
+        )
+
+    db.commit()
+    db.close()
+
+    return {"flashcards": flashcards}
+def search_project_chunks(project_id: str, k: int = 20):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select chunk_text, doc_title, page
+            from chunks
+            where project_id = :project_id
+            limit :k
+        """),
+        {
+            "project_id": project_id,
+            "k": k
+        }
+    ).fetchall()
+
+    db.close()
+
+    chunks = []
+
+    for r in rows:
+        chunks.append({
+            "text": r[0],
+            "document": r[1],
+            "page": r[2]
+        })
+
+    return chunks
+@app.get("/projects/{project_id}/topics")
+async def get_project_topics(
+    project_id: str,
+    user = Depends(verify_user)
+):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select chunk_text
+            from chunks
+            where project_id = :project_id
+            limit 80
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    print("ROWS FOUND:", len(rows))
+    db.close()
+
+    text_blocks = [r[0] for r in rows]
+
+    context = "\n\n".join(text_blocks)
+
+    prompt = f"""
+You are analyzing medical study material.
+
+Your task:
+Identify the main study concepts students must learn.
+
+Return JSON in this format:
+
+{{ "topics": ["Apoptosis","Necrosis","Inflammation","Cell injury","Oxidative stress"] }}
 
 Material:
 {context}
 """
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
-        )
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Return ONLY JSON."},
+            {"role": "user", "content": prompt}
+        ]
+    )
 
-        content = response.choices[0].message.content.strip()
-        content = content.replace("```json", "").replace("```", "").strip()
+    content = response.choices[0].message.content.strip()
+    # pulizia markdown restituito da GPT
+    content = content.replace("```json", "").replace("```", "").strip()
 
-        quiz_results.append(content)
+    import json
+
+    try:
+        data = json.loads(content)
+
+        topics = data.get("topics", [])
+
+        if not isinstance(topics, list):
+            topics = []
+
+    except Exception as e:
+        print("TOPIC PARSE ERROR:", e)
+        print("RAW GPT OUTPUT:", content)
+        topics = []
+
+    print("TOPICS GENERATED:", topics)
+
+    # ora aggiungiamo difficulty e suggerimenti
+    import random
+
+    topics_with_stats = []
+
+    for t in topics:
+
+        accuracy_row = db.execute(
+            text("""
+                select avg(
+                    case when qa.is_correct then 1 else 0 end
+                )
+                from quiz_answers qa
+                join quiz_questions qq on qa.question_id = qq.id
+                where qq.topic = :topic
+            """),
+            {"topic": t}
+        ).fetchone()
+
+        accuracy = accuracy_row[0] if accuracy_row and accuracy_row[0] is not None else 0.5
+
+
+        if accuracy > 0.8:
+            difficulty = "easy"
+        elif accuracy > 0.5:
+            difficulty = "medium"
+        else:
+            difficulty = "hard"
+
+        topics_with_stats.append({
+            "topic": t,
+            "difficulty": difficulty,
+            "suggested_page": random.randint(1,300)
+        })
+
+    return {"topics": topics_with_stats}
+@app.get("/projects/{project_id}/quizzes")
+async def list_project_quizzes(
+    project_id: str,
+    user = Depends(verify_user)
+):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select id, created_at, num_questions, difficulty
+            from quizzes
+            where project_id = :project_id
+            order by created_at desc
+        """),
+        {"project_id": project_id}
+    ).fetchall()
 
     db.close()
 
-    return {"quiz": quiz_results}
+    quizzes = []
+
+    for r in rows:
+        quizzes.append({
+            "id": r[0],
+            "created_at": str(r[1]),
+            "num_questions": r[2],
+            "difficulty": r[3]
+        })
+
+    return {"quizzes": quizzes}
+@app.get("/projects/{project_id}/flashcards")
+async def get_flashcards(project_id: str):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select question, answer
+            from flashcards
+            where project_id = :project_id
+            order by created_at desc
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    db.close()
+
+    flashcards = []
+
+    for r in rows:
+        flashcards.append({
+            "question": r[0],
+            "answer": r[1]
+        })
+
+    return {"flashcards": flashcards}
+@app.get("/projects/{project_id}/study_flashcards")
+async def study_flashcards(project_id: str):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select id, question, answer
+            from flashcards
+            where project_id = :project_id
+            and next_review <= now()
+            order by next_review asc
+            limit 20
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    db.close()
+
+    cards = []
+
+    for r in rows:
+        cards.append({
+            "id": r[0],
+            "question": r[1],
+            "answer": r[2]
+        })
+
+    return {"flashcards": cards}
+@app.post("/review_flashcard")
+async def review_flashcard(req: dict):
+
+    db = SessionLocal()
+
+    difficulty = req.get("difficulty", 1)
+    flashcard_id = req.get("flashcard_id")
+
+    if difficulty == 1:
+        interval = "1 day"
+    elif difficulty == 2:
+        interval = "3 days"
+    elif difficulty == 3:
+        interval = "7 days"
+    else:
+        interval = "14 days"
+
+    db.execute(
+        text(f"""
+            update flashcards
+            set
+                difficulty = :difficulty,
+                last_review = now(),
+                next_review = now() + interval '{interval}'
+            where id = :flashcard_id
+        """),
+        {
+            "difficulty": difficulty,
+            "flashcard_id": flashcard_id
+        }
+    )
+
+    db.commit()
+    db.close()
+
+    return {"status": "ok"}
+@app.get("/quizzes/{quiz_id}")
+async def get_quiz(quiz_id: str):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select question, options, correct, explanation, explanation_long,
+                   source_document, source_page
+            from quiz_questions
+            where quiz_id = :quiz_id
+            order by question_order
+        """),
+        {"quiz_id": quiz_id}
+    ).fetchall()
+
+    db.close()
+
+    questions = []
+
+    for r in rows:
+        questions.append({
+            "question": r[0],
+            "options": r[1] if isinstance(r[1], list) else json.loads(r[1]),
+            "correct": r[2],
+            "explanation": r[3],
+            "explanation_long": r[4],
+            "source_document": r[5],
+            "source_page": r[6]
+        })
+
+    return {"questions": questions}
+
+@app.post("/save_quiz_attempt")
+async def save_quiz_attempt(
+    req: dict,
+    user = Depends(verify_user)
+):
+
+    db = SessionLocal()
+
+    db.execute(
+        text("""
+            insert into quiz_attempts
+            (quiz_id, user_id, score, total_questions)
+            values
+            (:quiz_id, :user_id, :score, :total_questions)
+        """),
+        {
+            "quiz_id": req["quiz_id"],
+            "user_id": user["id"],
+            "score": req["score"],
+            "total_questions": req["total_questions"]
+        }
+    )
+
+    db.commit()
+    db.close()
+
+    return {"status": "saved"}
+
+@app.post("/ask")
+async def ask_documents(req: AskRequest):
+
+    # 1️⃣ embedding della domanda
+    emb = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=req.question
+    )
+
+    query_embedding = emb.data[0].embedding
+
+
+    # 2️⃣ vector search sui chunks
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select chunk_text, doc_title, page
+            from chunks
+            where project_id = :project_id
+            order by embedding <-> CAST(:embedding AS vector)
+            limit 8
+        """),
+        {
+            "project_id": req.project_id,
+            "embedding": query_embedding
+        }
+    ).fetchall()
+    print("ROWS FOUND:", len(rows))
+    if rows:
+        print("SAMPLE CHUNK:", rows[0][0][:200])
+
+    db.close()
+
+    context_blocks = []
+    for r in rows:
+        context_blocks.append(f"DOCUMENT: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}")
+
+
+    context = "\n\n---\n\n".join(context_blocks) 
+    # 3️⃣ costruzione contesto
+    
+
+    prompt = f"""
+You MUST answer using ONLY the material provided below.
+If the answer is not in the material, say that the documents do not contain the answer.
+Always cite the document and page when possible.
+
+Context:
+{context}
+
+Question:
+{req.question}
+
+Answer clearly for a student.
+"""
+
+
+    # 4️⃣ GPT
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a helpful study tutor."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    answer = response.choices[0].message.content
+
+    return {
+        "answer": answer
+    }
