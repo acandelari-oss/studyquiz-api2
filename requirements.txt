@@ -7,3 +7,6 @@ pgvector
 openai
 requests
 pypdf
+pytesseract
+pdf2image
+Pillow
