@@ -96,6 +96,7 @@ class QuizRequest(BaseModel):
     num_questions: int
     difficulty: str
     language: str
+    topics: List[str] = []
 
 
 class IngestDocument(BaseModel):
@@ -214,7 +215,7 @@ def delete_project(
         db.close()
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # cancella i dati collegati
+    # cancella dati collegati
     db.execute(
         text("delete from chunks where project_id = :project_id"),
         {"project_id": project_id}
@@ -230,7 +231,6 @@ def delete_project(
         {"project_id": project_id}
     )
 
-    # cancella il progetto
     db.execute(
         text("delete from projects where id = :project_id"),
         {"project_id": project_id}
@@ -240,6 +240,7 @@ def delete_project(
     db.close()
 
     return {"status": "deleted"}
+
 # ======================
 # LIST DOCUMENTS
 # ======================
@@ -395,23 +396,23 @@ def ingest(
                         input=chunk
                     )
 
-            embedding = emb.data[0].embedding
+                    embedding = emb.data[0].embedding
 
-            db.execute(
-                text("""
-                    insert into chunks
-                    (project_id, doc_title, chunk_text, embedding, page)
-                    values
-                    (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
-                """),
-                {
-                    "project_id": project_id,
-                    "doc_title": doc.title,
-                    "chunk_text": chunk,
-                    "embedding": embedding,
-                    "page": page_index + 1
-                }
-            )
+                    db.execute(
+                        text("""
+                            insert into chunks
+                            (project_id, doc_title, chunk_text, embedding, page)
+                            values
+                            (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
+                        """),
+                        {
+                            "project_id": project_id,
+                            "doc_title": doc.title,
+                            "chunk_text": chunk,
+                            "embedding": embedding,
+                            "page": page_index + 1
+                        }
+                    )
 
         db.commit()
 
@@ -505,6 +506,7 @@ def generate_quiz(
     used_concepts = []
 
     remaining = req.num_questions
+    selected_topics = req.topics if req.topics else []
     batch_size = 20
 
 
@@ -528,6 +530,21 @@ If the answer cannot be found in the material, skip the question.
 Avoid generating questions similar to these already generated questions:
 {used_concepts}
 
+topics_instruction = ""
+
+if selected_topics:
+    topics_instruction = f"""
+Focus ONLY on these topics:
+{', '.join(selected_topics)}
+
+Do NOT generate questions outside these topics.
+"""
+
+prompt = f"""
+You MUST use ONLY the material provided below.
+
+{topics_instruction}
+
 Material:
 {context}
 
@@ -536,18 +553,12 @@ Generate {n} high-quality multiple choice questions.
 Difficulty: {req.difficulty}
 Language: {req.language}
 
-Questions must:
-- test understanding of mechanisms and cause-effect relationships
-- prefer application or reasoning questions over definitions
-- compare processes when possible
-- avoid trivial definition questions
-- cover different concepts from the material
+Rules:
+- Questions must test understanding
+- Avoid trivial definitions
+- Cover different concepts
 
 Each question must have EXACTLY 5 options.
-Distractors must be plausible and conceptually related to the topic.
-Avoid obviously wrong answers.
-Incorrect options should represent common misconceptions when possible.
-Avoid generating multiple questions about the same concept.
 
 Return STRICT JSON ARRAY like this:
 
@@ -563,9 +574,7 @@ Return STRICT JSON ARRAY like this:
 "source_page": "..."
 }}
 ]
-
-
-""" 
+"""
         print("PROMPT SAMPLE:", prompt[:500])
 
 
@@ -879,6 +888,7 @@ async def generate_flashcards(
     user_id = user["id"]
     if req and isinstance(req, dict):
         num_cards = req.get("num_cards", 10)
+        selected_topics = req.get("topics",[])
 
     # recuperiamo contesto dal vector DB
     context_chunks = search_project_chunks(project_id, k=20)
@@ -888,21 +898,31 @@ async def generate_flashcards(
     prompt = f"""
 You are an expert tutor.
 
+topics_instruction = ""
+
+if req and req.get("topics"):
+    topics_instruction = f"""
+Focus ONLY on these topics:
+{', '.join(req["topics"])}
+
+Do NOT create flashcards outside these topics.
+"""
+
+prompt = f"""
+You are an expert tutor.
+
+{topics_instruction}
+
 Create {num_cards} flashcards from the study material.
-Flashcards must cover DIFFERENT topics from the material.
-Avoid creating multiple flashcards about the same concept.
 
 Each flashcard must have:
 - question
 - answer
 
-Return ONLY valid JSON in this format:
+Return JSON:
 
 [
-  {{
-    "question": "...",
-    "answer": "..."
-  }}
+{{"question":"...","answer":"..."}}
 ]
 
 Study material:
@@ -1213,249 +1233,21 @@ async def get_flashcards(project_id: str):
         })
 
     return {"flashcards": flashcards}
-# ======================
-# PROJECT SUMMARY
-# ======================
-
-@app.get("/projects/{project_id}/summary")
-async def project_summary(
-    project_id: str,
-    user = Depends(verify_user)
-):
-
-    user_id = user["id"]
-    db = SessionLocal()
-
-    # verifica progetto
-    project = db.execute(
-        text("""
-            select id
-            from projects
-            where id = :project_id
-            and user_id = :user_id
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
-        }
-    ).fetchone()
-
-    if not project:
-        db.close()
-        raise HTTPException(status_code=403, detail="Access denied")
-    # ======================
-# PROJECT RESULTS
-# ======================
-
-@app.get("/projects/{project_id}/results")
-async def project_results(
-    project_id: str,
-    user = Depends(verify_user)
-):
-
-    user_id = user["id"]
-    db = SessionLocal()
-
-    # verifica progetto
-    project = db.execute(
-        text("""
-            select id
-            from projects
-            where id = :project_id
-            and user_id = :user_id
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
-        }
-    ).fetchone()
-
-    if not project:
-        db.close()
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    # ======================
-    # QUIZ HISTORY
-    # ======================
-
-    quiz_rows = db.execute(
-        text("""
-            select qa.created_at,
-                   qa.score,
-                   qa.total_questions,
-                   q.difficulty
-            from quiz_attempts qa
-            join quizzes q on qa.quiz_id = q.id
-            where q.project_id = :project_id
-            and qa.user_id = :user_id
-            order by qa.created_at desc
-            limit 20
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
-        }
-    ).fetchall()
-
-    quiz_history = []
-
-    for r in quiz_rows:
-        quiz_history.append({
-            "date": str(r[0]),
-            "score": r[1],
-            "total": r[2],
-            "difficulty": r[3]
-        })
-
-    # ======================
-    # TOPIC ACCURACY
-    # ======================
-
-    topic_rows = db.execute(
-        text("""
-            select qq.topic,
-                   avg(case when qa.is_correct then 1 else 0 end) as accuracy
-            from quiz_answers qa
-            join quiz_questions qq on qa.question_id = qq.id
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-            group by qq.topic
-        """),
-        {"project_id": project_id}
-    ).fetchall()
-
-    topic_mastery = []
-
-    for r in topic_rows:
-        topic_mastery.append({
-            "topic": r[0],
-            "accuracy": round((r[1] or 0) * 100,1)
-        })
-
-    db.close()
-
-    return {
-        "quiz_history": quiz_history,
-        "topic_mastery": topic_mastery
-    }
-    # ======================
-    # QUIZ ATTEMPTS
-    # ======================
-
-    quiz_attempts = db.execute(
-        text("""
-            select count(*)
-            from quiz_attempts
-            where user_id = :user_id
-            and quiz_id in (
-                select id from quizzes where project_id = :project_id
-            )
-        """),
-        {
-            "user_id": user_id,
-            "project_id": project_id
-        }
-    ).scalar()
-
-    # ======================
-    # AVG SCORE
-    # ======================
-
-    avg_score = db.execute(
-        text("""
-            select avg(
-                (score::float / total_questions) * 100
-            )
-            from quiz_attempts
-            where user_id = :user_id
-            and quiz_id in (
-                select id from quizzes where project_id = :project_id
-            )
-        """),
-        {
-            "user_id": user_id,
-            "project_id": project_id
-        }
-    ).scalar()
-
-    if avg_score is None:
-        avg_score = 0
-
-    # ======================
-    # FLASHCARDS REVIEWED
-    # ======================
-
-    flashcards_reviewed = db.execute(
-        text("""
-            select count(*)
-            from flashcards
-            where project_id = :project_id
-            and last_review is not null
-        """),
-        {
-            "project_id": project_id
-        }
-    ).scalar()
-
-    # ======================
-    # TOPICS COUNT
-    # ======================
-
-    topics_count = db.execute(
-        text("""
-            select count(distinct topic)
-            from quiz_questions qq
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-        """),
-        {
-            "project_id": project_id
-        }
-    ).scalar()
-
-    db.close()
-
-    return {
-        "quiz_attempts": quiz_attempts or 0,
-        "avg_score": round(avg_score, 1),
-        "flashcards_reviewed": flashcards_reviewed or 0,
-        "topics_count": topics_count or 0
-    }
-@app.get("/projects/{project_id}/flashcards_count")
-async def flashcards_count(project_id: str):
-
-    db = SessionLocal()
-
-    row = db.execute(
-        text("""
-            select count(*)
-            from flashcards
-            where project_id = :project_id
-            and next_review <= now()
-        """),
-        {"project_id": project_id}
-    ).fetchone()
-
-    db.close()
-
-    return {"count": row[0]}
 @app.get("/projects/{project_id}/study_flashcards")
-async def study_flashcards(project_id: str, limit: int = 20):
+async def study_flashcards(project_id: str):
 
     db = SessionLocal()
 
     rows = db.execute(
-    text("""
-        select id, question, answer
-        from flashcards
-        where project_id = :project_id
-        order by id desc
-        limit :limit
-    """),
-    {
-        "project_id": project_id,
-        "limit": limit
-    }
+        text("""
+            select id, question, answer
+            from flashcards
+            where project_id = :project_id
+            and next_review <= now()
+            order by next_review asc
+            limit 20
+        """),
+        {"project_id": project_id}
     ).fetchall()
 
     db.close()
@@ -1475,14 +1267,9 @@ async def review_flashcard(req: dict):
 
     db = SessionLocal()
 
-    
     difficulty = req.get("difficulty", 1)
     flashcard_id = req.get("flashcard_id")
-    is_correct = req.get("is_correct", False)
-    
 
-    if not is_correct:
-        interval = "1 day"
     if difficulty == 1:
         interval = "1 day"
     elif difficulty == 2:
@@ -1578,8 +1365,7 @@ async def ask_documents(req: AskRequest):
     # 1️⃣ embedding della domanda
     emb = client.embeddings.create(
         model="text-embedding-3-small",
-        input=f"medical concept explanation {req.question}"
-
+        input=req.question
     )
 
     query_embedding = emb.data[0].embedding
@@ -1594,14 +1380,13 @@ async def ask_documents(req: AskRequest):
             from chunks
             where project_id = :project_id
             order by embedding <-> CAST(:embedding AS vector)
-            limit 20
+            limit 8
         """),
         {
             "project_id": req.project_id,
             "embedding": query_embedding
         }
     ).fetchall()
-    rows = rows[:12]
     print("ROWS FOUND:", len(rows))
     if rows:
         print("SAMPLE CHUNK:", rows[0][0][:200])
@@ -1610,25 +1395,17 @@ async def ask_documents(req: AskRequest):
 
     context_blocks = []
     for r in rows:
-        context_blocks.append(f"DOCUMENT: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:400]}")
+        context_blocks.append(f"DOCUMENT: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}")
 
 
     context = "\n\n---\n\n".join(context_blocks) 
-    print("CONTEXT LENGTH:", len(context))
     # 3️⃣ costruzione contesto
     
 
     prompt = f"""
-You are an expert study tutor.
 You MUST answer using ONLY the material provided below.
-You MUST answer using the provided material.
-
-Rules:
-- If the material contains relevant information, explain it clearly in your own words.
-- If the material contains partial information, use it to build the best possible explanation.
-- Only say that the documents do not contain enough information if the concept is completely absent.
-- Be helpful and explanatory, not overly strict.
-- When possible, mention the document and page.
+If the answer is not in the material, say that the documents do not contain the answer.
+Always cite the document and page when possible.
 
 Context:
 {context}
