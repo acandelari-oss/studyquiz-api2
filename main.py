@@ -620,6 +620,8 @@ Return STRICT JSON ARRAY like this:
 
 
 
+from pydantic import BaseModel
+
 class AskRequest(BaseModel):
     project_id: str
     question: str
