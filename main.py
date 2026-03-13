@@ -19,6 +19,8 @@ import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
 
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
 
 
 
