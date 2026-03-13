@@ -1228,7 +1228,6 @@ async def project_summary(
     user_id = user["id"]
     db = SessionLocal()
 
-    # verifica progetto
     project = db.execute(
         text("""
             select id
@@ -1245,6 +1244,162 @@ async def project_summary(
     if not project:
         db.close()
         raise HTTPException(status_code=403, detail="Access denied")
+
+    quiz_attempts = db.execute(
+        text("""
+            select count(*)
+            from quiz_attempts
+            where user_id = :user_id
+            and quiz_id in (
+                select id from quizzes where project_id = :project_id
+            )
+        """),
+        {
+            "user_id": user_id,
+            "project_id": project_id
+        }
+    ).scalar()
+
+    avg_score = db.execute(
+        text("""
+            select avg(
+                (score::float / total_questions) * 100
+            )
+            from quiz_attempts
+            where user_id = :user_id
+            and quiz_id in (
+                select id from quizzes where project_id = :project_id
+            )
+        """),
+        {
+            "user_id": user_id,
+            "project_id": project_id
+        }
+    ).scalar()
+
+    if avg_score is None:
+        avg_score = 0
+
+    flashcards_reviewed = db.execute(
+        text("""
+            select count(*)
+            from flashcards
+            where project_id = :project_id
+            and last_review is not null
+        """),
+        {
+            "project_id": project_id
+        }
+    ).scalar()
+
+    topics_count = db.execute(
+        text("""
+            select count(distinct topic)
+            from quiz_questions qq
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+        """),
+        {
+            "project_id": project_id
+        }
+    ).scalar()
+
+    db.close()
+
+    return {
+        "quiz_attempts": quiz_attempts or 0,
+        "avg_score": round(avg_score, 1),
+        "flashcards_reviewed": flashcards_reviewed or 0,
+        "topics_count": topics_count or 0
+    }
+
+
+# ======================
+# PROJECT RESULTS
+# ======================
+
+@app.get("/projects/{project_id}/results")
+async def project_results(
+    project_id: str,
+    user = Depends(verify_user)
+):
+
+    user_id = user["id"]
+    db = SessionLocal()
+
+    project = db.execute(
+        text("""
+            select id
+            from projects
+            where id = :project_id
+            and user_id = :user_id
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
+    ).fetchone()
+
+    if not project:
+        db.close()
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    quiz_rows = db.execute(
+        text("""
+            select qa.created_at,
+                   qa.score,
+                   qa.total_questions,
+                   q.difficulty
+            from quiz_attempts qa
+            join quizzes q on qa.quiz_id = q.id
+            where q.project_id = :project_id
+            and qa.user_id = :user_id
+            order by qa.created_at desc
+            limit 20
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
+    ).fetchall()
+
+    quiz_history = []
+
+    for r in quiz_rows:
+        quiz_history.append({
+            "date": str(r[0]),
+            "score": r[1],
+            "total": r[2],
+            "difficulty": r[3]
+        })
+
+    topic_rows = db.execute(
+        text("""
+            select qq.topic,
+                   avg(case when qa.is_correct then 1 else 0 end) as accuracy
+            from quiz_answers qa
+            join quiz_questions qq on qa.question_id = qq.id
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+            group by qq.topic
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    topic_mastery = []
+
+    for r in topic_rows:
+        topic_mastery.append({
+            "topic": r[0],
+            "accuracy": round((r[1] or 0) * 100,1)
+        })
+
+    db.close()
+
+    return {
+        "quiz_history": quiz_history,
+        "topic_mastery": topic_mastery
+    }
     # ======================
 # PROJECT RESULTS
 # ======================
