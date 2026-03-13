@@ -395,23 +395,25 @@ def ingest(
                         input=chunk
                     )
 
-            embedding = emb.data[0].embedding
+                    embedding = emb.data[0].embedding
+                    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
 
-            db.execute(
-                text("""
-                    insert into chunks
-                    (project_id, doc_title, chunk_text, embedding, page)
-                    values
-                    (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
-                """),
-                {
-                    "project_id": project_id,
-                    "doc_title": doc.title,
-                    "chunk_text": chunk,
-                    "embedding": embedding,
-                    "page": page_index + 1
-                }
-            )
+                    db.execute(
+                        text("""
+                            insert into chunks
+                            (project_id, doc_title, chunk_text, embedding, page)
+                            values
+                            (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
+                        """),
+                        {
+                            "project_id": project_id,
+                            "doc_title": doc.title,
+                            "chunk_text": chunk,
+                            "embedding": embedding_str,
+                            "page": page_index + 1
+                        }
+                    )
+                    
 
         db.commit()
 
@@ -521,7 +523,7 @@ You are NOT allowed to use external knowledge.
 If the material does NOT contain enough information,
 return an empty JSON array: []
 
-Do NOT guess or invent information.§
+Do NOT guess or invent information.
 
 If the answer cannot be found in the material, skip the question.
 
@@ -580,6 +582,8 @@ Return STRICT JSON ARRAY like this:
         content = content.replace("```json", "").replace("```", "").strip()
 
 
+        parsed = []
+
         try:
             parsed = json.loads(content)
 
@@ -599,7 +603,7 @@ Return STRICT JSON ARRAY like this:
         remaining -= n
 
 
-    db.close()
+   
 
     seen = set()
     unique_questions = []
@@ -620,7 +624,7 @@ Return STRICT JSON ARRAY like this:
 
 
 
-from pydantic import BaseModel
+
 
 class AskRequest(BaseModel):
     project_id: str
@@ -1315,92 +1319,6 @@ async def project_summary(
 
 
 # ======================
-# PROJECT RESULTS
-# ======================
-
-@app.get("/projects/{project_id}/results")
-async def project_results(
-    project_id: str,
-    user = Depends(verify_user)
-):
-
-    user_id = user["id"]
-    db = SessionLocal()
-
-    project = db.execute(
-        text("""
-            select id
-            from projects
-            where id = :project_id
-            and user_id = :user_id
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
-        }
-    ).fetchone()
-
-    if not project:
-        db.close()
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    quiz_rows = db.execute(
-        text("""
-            select qa.created_at,
-                   qa.score,
-                   qa.total_questions,
-                   q.difficulty
-            from quiz_attempts qa
-            join quizzes q on qa.quiz_id = q.id
-            where q.project_id = :project_id
-            and qa.user_id = :user_id
-            order by qa.created_at desc
-            limit 20
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
-        }
-    ).fetchall()
-
-    quiz_history = []
-
-    for r in quiz_rows:
-        quiz_history.append({
-            "date": str(r[0]),
-            "score": r[1],
-            "total": r[2],
-            "difficulty": r[3]
-        })
-
-    topic_rows = db.execute(
-        text("""
-            select qq.topic,
-                   avg(case when qa.is_correct then 1 else 0 end) as accuracy
-            from quiz_answers qa
-            join quiz_questions qq on qa.question_id = qq.id
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-            group by qq.topic
-        """),
-        {"project_id": project_id}
-    ).fetchall()
-
-    topic_mastery = []
-
-    for r in topic_rows:
-        topic_mastery.append({
-            "topic": r[0],
-            "accuracy": round((r[1] or 0) * 100,1)
-        })
-
-    db.close()
-
-    return {
-        "quiz_history": quiz_history,
-        "topic_mastery": topic_mastery
-    }
-    # ======================
 # PROJECT RESULTS
 # ======================
 
