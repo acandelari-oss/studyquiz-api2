@@ -2,7 +2,7 @@ import os
 import uuid
 import base64
 import io
-from typing import List
+from typing import List, Optional
 import json
 import requests
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
@@ -18,6 +18,7 @@ import asyncio
 import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
+
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
@@ -631,6 +632,11 @@ Return STRICT JSON ARRAY like this:
 class AskRequest(BaseModel):
     project_id: str
     question: str
+
+from typing import Optional
+
+class ActiveRecallRequest(BaseModel):
+    topic: Optional[str] = None
 
 @app.post("/projects/{project_id}/generate_quiz_stream")
 async def generate_quiz_stream(
@@ -1730,4 +1736,289 @@ Answer clearly for a student.
 
     return {
         "answer": answer
+    }
+
+
+
+
+@app.post("/projects/{project_id}/active_recall_question")
+async def active_recall_question(
+    project_id: str,
+    req: ActiveRecallRequest,
+    user = Depends(verify_user)
+):
+
+    # embedding query
+    # ======================
+    # WEAK TOPIC PRIORITY
+    # ======================
+
+    weak_topic = None
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select qq.topic,
+                avg(case when qa.is_correct then 1 else 0 end) as accuracy
+            from quiz_answers qa
+            join quiz_questions qq on qa.question_id = qq.id
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+            group by qq.topic
+            order by accuracy asc
+            limit 1
+        """),
+        {"project_id": project_id}
+    ).fetchone()
+
+    db.close()
+
+    if rows and rows[0]:
+        weak_topic = rows[0]
+
+    query_text = weak_topic if weak_topic else "important study concepts"
+
+    emb = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=query_text
+    )
+
+    query_embedding = emb.data[0].embedding
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select chunk_text, doc_title, page
+            from chunks
+            where project_id = :project_id
+            order by embedding <-> CAST(:embedding AS vector)
+            limit 10
+        """),
+        {
+            "project_id": project_id,
+            "embedding": query_embedding
+        }
+    ).fetchall()
+
+    db.close()
+
+    context_blocks = []
+
+    for r in rows:
+        context_blocks.append(
+            f"DOCUMENT: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:400]}"
+        )
+
+    context = "\n\n---\n\n".join(context_blocks)
+
+    prompt = f"""
+You are a tutor helping a student practice ACTIVE RECALL.
+
+Your task:
+Generate ONE open-ended question that forces the student
+to recall and explain a concept from the material.
+
+Rules:
+- Do NOT ask multiple choice questions
+- Ask a question that requires explanation
+- Focus on mechanisms, processes, cause-effect
+- Avoid trivial definitions
+
+Material:
+{context}
+
+Return ONLY JSON:
+
+{{
+ "question": "...",
+ "source_document": "...",
+ "source_page": "..."
+}}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.4,
+        messages=[
+            {"role": "system", "content": "You generate active recall questions."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    content = response.choices[0].message.content.strip()
+    content = content.replace("```json","").replace("```","").strip()
+
+    try:
+        data = json.loads(content)
+    except:
+        data = {"question": "Explain an important concept from the material."}
+
+    return data
+
+class ActiveRecallEvaluateRequest(BaseModel):
+    question: str
+    student_answer: str
+
+
+@app.post("/active_recall_evaluate")
+async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
+
+    prompt = f"""
+You are a tutor evaluating a student's answer.
+
+Question:
+{req.question}
+
+Student answer:
+{req.student_answer}
+
+Evaluate the answer.
+
+Return ONLY JSON:
+
+{{
+ "correct": true or false,
+ "feedback": "short explanation for the student",
+ "hint": "optional hint if the answer is weak"
+}}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": "You evaluate student answers."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    content = response.choices[0].message.content.strip()
+    content = content.replace("```json","").replace("```","").strip()
+
+    try:
+        data = json.loads(content)
+    except:
+        data = {
+            "correct": False,
+            "feedback": "The answer needs more explanation.",
+            "hint": "Try explaining the concept step by step."
+        }
+
+    return data
+
+    # ======================
+# STUDY SESSION
+# ======================
+
+@app.get("/projects/{project_id}/study_session")
+async def study_session(
+    project_id: str,
+    user = Depends(verify_user)
+):
+
+    db = SessionLocal()
+
+    # ======================
+    # FLASHCARDS (15)
+    # ======================
+
+    flashcard_rows = db.execute(
+        text("""
+            select id, question, answer
+            from flashcards
+            where project_id = :project_id
+            order by next_review asc nulls first
+            limit 15
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    flashcards = []
+
+    for r in flashcard_rows:
+        flashcards.append({
+            "id": r[0],
+            "question": r[1],
+            "answer": r[2]
+        })
+
+
+    # ======================
+    # RECALL TOPICS
+    # ======================
+
+    topic_rows = db.execute(
+        text("""
+            select qq.topic,
+                   avg(case when qa.is_correct then 1 else 0 end) as accuracy
+            from quiz_answers qa
+            join quiz_questions qq on qa.question_id = qq.id
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+            group by qq.topic
+            order by accuracy asc
+            limit 5
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    recall_topics = []
+
+    for r in topic_rows:
+        recall_topics.append(r[0])
+
+
+    # ======================
+    # QUIZ CONFIG
+    # ======================
+
+    # ======================
+    # ADAPTIVE SESSION
+    # ======================
+
+    avg_accuracy_row = db.execute(
+        text("""
+            select avg(
+                case when qa.is_correct then 1 else 0 end
+            )
+            from quiz_answers qa
+            join quiz_questions qq on qa.question_id = qq.id
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+        """),
+        {"project_id": project_id}
+    ).fetchone()
+
+    avg_accuracy = avg_accuracy_row[0] if avg_accuracy_row and avg_accuracy_row[0] else 0.5
+
+
+    if avg_accuracy < 0.5:
+
+        recall_count = 8
+        quiz_questions = 15
+
+    elif avg_accuracy < 0.8:
+
+        recall_count = 5
+        quiz_questions = 20
+
+    else:
+
+        recall_count = 3
+        quiz_questions = 25
+
+
+    quiz_config = {
+        "num_questions": quiz_questions,
+        "difficulty": "medium"
+    }
+
+    db.close()
+
+    return {
+        "flashcards": flashcards,
+        "recall_topics": recall_topics[:recall_count],
+        "quiz": quiz_config
     }
