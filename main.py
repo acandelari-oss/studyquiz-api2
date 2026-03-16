@@ -1928,112 +1928,99 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
     return data
 
     # ======================
-# STUDY SESSION
-# ======================
+    # STUDY SESSION
+    # ======================
 
-@app.get("/projects/{project_id}/study_session")
-async def study_session(
-    project_id: str,
-    user = Depends(verify_user)
-):
+    @app.get("/projects/{project_id}/study_session")
+    async def study_session(
+        project_id: str,
+        user = Depends(verify_user)
+    ):
 
     db = SessionLocal()
-
     # ======================
-    # FLASHCARDS (15)
+    # DETECT WEAK TOPICS
     # ======================
 
-    flashcard_rows = db.execute(
+    weak_topic_rows = db.execute(
         text("""
-            select id, question, answer
-            from flashcards
-            where project_id = :project_id
-            order by next_review asc nulls first
-            limit 15
+            select qq.topic,
+                avg(case when qa.is_correct then 1 else 0 end) as accuracy
+            from quiz_answers qa
+            join quiz_questions qq on qa.question_id = qq.id
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+            group by qq.topic
+            order by accuracy asc
+            limit 5
         """),
         {"project_id": project_id}
     ).fetchall()
 
-    # se non ci sono flashcards, generiamole automaticamente
-    if len(flashcard_rows) == 0:
+    weak_topics = [r[0] for r in weak_topic_rows if r[0]]
 
-        print("NO FLASHCARDS FOUND → GENERATING")
+        # ======================
+        # SESSION FLASHCARDS (15) - GENERATED FRESH
+        # ======================
 
         context_chunks = search_project_chunks(project_id, k=20)
 
         context_text = "\n\n".join([c["text"] for c in context_chunks])
 
+        weak_topics_text = ", ".join(weak_topics) if weak_topics else "important concepts"
+
         prompt = f"""
-    Create 15 flashcards from the study material.
+        Create 15 NEW flashcards for a study session.
 
-    Return JSON:
+        Focus especially on these weak topics:
+        {weak_topics_text}
 
-    [
-    {{"question":"...","answer":"..."}}
-    ]
+        Rules:
+        - Cover different concepts
+        - Avoid duplicates
+        - Make flashcards useful for testing understanding
+        - Prefer mechanisms and cause-effect relationships
 
-    Material:
-    {context_text}
-    """
+        Return ONLY JSON:
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.3,
-        messages=[
-            {"role":"system","content":"Generate study flashcards"},
-            {"role":"user","content":prompt}
+        [
+        {{
+            "question": "...",
+            "answer": "..."
+        }}
         ]
-    )
 
-    content = response.choices[0].message.content
-    content = content.replace("```json","").replace("```","").strip()
+        Material:
+        {context_text}
+        """
 
-    try:
-        cards = json.loads(content)
-    except:
-        cards = []
-
-    for card in cards:
-
-        db.execute(
-            text("""
-            insert into flashcards
-            (project_id, user_id, question, answer)
-            values
-            (:project_id,:user_id,:question,:answer)
-            """),
-            {
-                "project_id": project_id,
-                "user_id": user["id"],
-                "question": card.get("question"),
-                "answer": card.get("answer")
-            }
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": "Generate study session flashcards."},
+                {"role": "user", "content": prompt}
+            ]
         )
 
-    db.commit()
+        content = response.choices[0].message.content.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
 
-    # ricarichiamo le flashcards appena generate
-    flashcard_rows = db.execute(
-        text("""
-            select id, question, answer
-            from flashcards
-            where project_id = :project_id
-            limit 15
-        """),
-        {"project_id": project_id}
-    ).fetchall()
-    
+        try:
+            generated_cards = json.loads(content)
+            if not isinstance(generated_cards, list):
+                generated_cards = []
+        except:
+            generated_cards = []
 
-    flashcards = []
+        flashcards = []
 
-    for r in flashcard_rows:
-        flashcards.append({
-            "id": r[0],
-            "question": r[1],
-            "answer": r[2]
-        })
-
-
+        for i, card in enumerate(generated_cards):
+            flashcards.append({
+                "id": i + 1,
+                "question": card.get("question"),
+                "answer": card.get("answer")
+            })
     # ======================
     # RECALL TOPICS
     # ======================
@@ -2101,7 +2088,8 @@ async def study_session(
 
     quiz_config = {
         "num_questions": quiz_questions,
-        "difficulty": "medium"
+        "difficulty": "medium",
+        "focus_topics": weak_topics
     }
 
     db.close()
