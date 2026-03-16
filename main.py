@@ -1866,24 +1866,35 @@ class ActiveRecallEvaluateRequest(BaseModel):
 async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
 
     prompt = f"""
-You are a tutor evaluating a student's answer.
+    You are a supportive tutor evaluating a student's answer.
 
-Question:
-{req.question}
+    Question:
+    {req.question}
 
-Student answer:
-{req.student_answer}
+    Student answer:
+    {req.student_answer}
 
-Evaluate the answer.
+    Evaluation rules:
 
-Return ONLY JSON:
+    - If the student shows the correct idea but lacks detail → evaluation = "partial"
+    - If the answer is conceptually correct → evaluation = "correct"
+    - If the answer shows misunderstanding → evaluation = "incorrect"
 
-{{
- "correct": true or false,
- "feedback": "short explanation for the student",
- "hint": "optional hint if the answer is weak"
-}}
-"""
+    Do NOT require a perfect explanation.
+    Students may answer briefly but still be correct.
+
+    If the student says they don't know or gives up, explain the concept clearly.
+
+    Return ONLY JSON:
+
+    {{
+    "evaluation": "correct | partial | incorrect",
+    "score": 0-1,
+    "feedback": "short feedback explaining what is right or missing",
+    "hint": "optional hint to help improve the answer",
+    "explanation": "clear explanation of the concept"
+    }}
+    """
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -1901,9 +1912,11 @@ Return ONLY JSON:
         data = json.loads(content)
     except:
         data = {
-            "correct": False,
+            "evaluation": "incorrect",
+            "score": 0,
             "feedback": "The answer needs more explanation.",
-            "hint": "Try explaining the concept step by step."
+            "hint": "Try explaining the concept step by step.",
+            "explanation": "Review the concept and try again."
         }
 
     return data
@@ -1930,6 +1943,75 @@ async def study_session(
             from flashcards
             where project_id = :project_id
             order by next_review asc nulls first
+            limit 15
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    # se non ci sono flashcards, generiamole automaticamente
+if len(flashcard_rows) == 0:
+
+    print("NO FLASHCARDS FOUND → GENERATING")
+
+    context_chunks = search_project_chunks(project_id, k=20)
+
+    context_text = "\n\n".join([c["text"] for c in context_chunks])
+
+    prompt = f"""
+Create 15 flashcards from the study material.
+
+Return JSON:
+
+[
+{{"question":"...","answer":"..."}}
+]
+
+Material:
+{context_text}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.3,
+        messages=[
+            {"role":"system","content":"Generate study flashcards"},
+            {"role":"user","content":prompt}
+        ]
+    )
+
+    content = response.choices[0].message.content
+    content = content.replace("```json","").replace("```","").strip()
+
+    try:
+        cards = json.loads(content)
+    except:
+        cards = []
+
+    for card in cards:
+
+        db.execute(
+            text("""
+            insert into flashcards
+            (project_id, user_id, question, answer)
+            values
+            (:project_id,:user_id,:question,:answer)
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user["id"],
+                "question": card.get("question"),
+                "answer": card.get("answer")
+            }
+        )
+
+    db.commit()
+
+    # ricarichiamo le flashcards appena generate
+    flashcard_rows = db.execute(
+        text("""
+            select id, question, answer
+            from flashcards
+            where project_id = :project_id
             limit 15
         """),
         {"project_id": project_id}
