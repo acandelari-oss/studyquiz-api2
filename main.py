@@ -1857,42 +1857,48 @@ Return ONLY JSON:
 
     return data
 
+from typing import Optional
+
 class ActiveRecallEvaluateRequest(BaseModel):
     question: str
     student_answer: str
+    history: Optional[list[str]] = None
 
 
 @app.post("/active_recall_evaluate")
 async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
 
+    history_text = "\n".join(req.history or [])
+
     prompt = f"""
-    You are a supportive tutor evaluating a student's answer.
+    You are a supportive study tutor evaluating a student's answer.
 
     Question:
     {req.question}
 
-    Student answer:
+    Previous answers:
+    {history_text}
+
+    Latest answer:
     {req.student_answer}
 
     Evaluation rules:
 
-    - If the student shows the correct idea but lacks detail → evaluation = "partial"
-    - If the answer is conceptually correct → evaluation = "correct"
-    - If the answer shows misunderstanding → evaluation = "incorrect"
-
-    Do NOT require a perfect explanation.
-    Students may answer briefly but still be correct.
-
-    If the student says they don't know or gives up, explain the concept clearly.
+    - Evaluate the student's overall understanding across ALL answers.
+    - If the student progressively improves, recognize it.
+    - Accept correct ideas even if the explanation is short.
+    - Do NOT repeat the same feedback.
+    - If the student already explained the main concepts, mark the answer as correct.
+    - If the student gives up, explain the concept clearly.
 
     Return ONLY JSON:
 
     {{
     "evaluation": "correct | partial | incorrect",
     "score": 0-1,
-    "feedback": "short feedback explaining what is right or missing",
-    "hint": "optional hint to help improve the answer",
-    "explanation": "clear explanation of the concept"
+    "feedback": "short supportive feedback",
+    "hint": "optional hint",
+    "explanation": "clear explanation if needed"
     }}
     """
 
