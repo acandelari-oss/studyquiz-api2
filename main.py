@@ -1949,26 +1949,26 @@ async def study_session(
     ).fetchall()
 
     # se non ci sono flashcards, generiamole automaticamente
-if len(flashcard_rows) == 0:
+    if len(flashcard_rows) == 0:
 
-    print("NO FLASHCARDS FOUND → GENERATING")
+        print("NO FLASHCARDS FOUND → GENERATING")
 
-    context_chunks = search_project_chunks(project_id, k=20)
+        context_chunks = search_project_chunks(project_id, k=20)
 
-    context_text = "\n\n".join([c["text"] for c in context_chunks])
+        context_text = "\n\n".join([c["text"] for c in context_chunks])
 
-    prompt = f"""
-Create 15 flashcards from the study material.
+        prompt = f"""
+    Create 15 flashcards from the study material.
 
-Return JSON:
+    Return JSON:
 
-[
-{{"question":"...","answer":"..."}}
-]
+    [
+    {{"question":"...","answer":"..."}}
+    ]
 
-Material:
-{context_text}
-"""
+    Material:
+    {context_text}
+    """
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -2016,6 +2016,7 @@ Material:
         """),
         {"project_id": project_id}
     ).fetchall()
+    
 
     flashcards = []
 
