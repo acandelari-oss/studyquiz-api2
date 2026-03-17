@@ -1937,62 +1937,61 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
         user = Depends(verify_user)
     ):
 
-    db = SessionLocal()
-    # ======================
-    # DETECT WEAK TOPICS
-    # ======================
+        db = SessionLocal()
 
-    weak_topic_rows = db.execute(
-        text("""
-            select qq.topic,
-                avg(case when qa.is_correct then 1 else 0 end) as accuracy
-            from quiz_answers qa
-            join quiz_questions qq on qa.question_id = qq.id
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-            group by qq.topic
-            order by accuracy asc
-            limit 5
-        """),
-        {"project_id": project_id}
-    ).fetchall()
+        # ======================
+        # DETECT WEAK TOPICS
+        # ======================
 
-    weak_topics = [r[0] for r in weak_topic_rows if r[0]]
+        weak_topic_rows = db.execute(
+            text("""
+                select qq.topic,
+                    avg(case when qa.is_correct then 1 else 0 end) as accuracy
+                from quiz_answers qa
+                join quiz_questions qq on qa.question_id = qq.id
+                join quizzes q on qq.quiz_id = q.id
+                where q.project_id = :project_id
+                group by qq.topic
+                order by accuracy asc
+                limit 5
+            """),
+            {"project_id": project_id}
+        ).fetchall()
+
+        weak_topics = [r[0] for r in weak_topic_rows if r[0]]
 
         # ======================
         # SESSION FLASHCARDS (15) - GENERATED FRESH
         # ======================
 
         context_chunks = search_project_chunks(project_id, k=20)
-
         context_text = "\n\n".join([c["text"] for c in context_chunks])
-
         weak_topics_text = ", ".join(weak_topics) if weak_topics else "important concepts"
 
         prompt = f"""
-        Create 15 NEW flashcards for a study session.
+    Create 15 NEW flashcards for a study session.
 
-        Focus especially on these weak topics:
-        {weak_topics_text}
+    Focus especially on these weak topics:
+    {weak_topics_text}
 
-        Rules:
-        - Cover different concepts
-        - Avoid duplicates
-        - Make flashcards useful for testing understanding
-        - Prefer mechanisms and cause-effect relationships
+    Rules:
+    - Cover different concepts
+    - Avoid duplicates
+    - Make flashcards useful for testing understanding
+    - Prefer mechanisms and cause-effect relationships
 
-        Return ONLY JSON:
+    Return ONLY JSON:
 
-        [
-        {{
-            "question": "...",
-            "answer": "..."
-        }}
-        ]
+    [
+    {{
+        "question": "...",
+        "answer": "..."
+    }}
+    ]
 
-        Material:
-        {context_text}
-        """
+    Material:
+    {context_text}
+    """
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -2021,81 +2020,67 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
                 "question": card.get("question"),
                 "answer": card.get("answer")
             })
-    # ======================
-    # RECALL TOPICS
-    # ======================
 
-    topic_rows = db.execute(
-        text("""
-            select qq.topic,
-                   avg(case when qa.is_correct then 1 else 0 end) as accuracy
-            from quiz_answers qa
-            join quiz_questions qq on qa.question_id = qq.id
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-            group by qq.topic
-            order by accuracy asc
-            limit 5
-        """),
-        {"project_id": project_id}
-    ).fetchall()
+        # ======================
+        # RECALL TOPICS
+        # ======================
 
-    recall_topics = []
+        topic_rows = db.execute(
+            text("""
+                select qq.topic,
+                    avg(case when qa.is_correct then 1 else 0 end) as accuracy
+                from quiz_answers qa
+                join quiz_questions qq on qa.question_id = qq.id
+                join quizzes q on qq.quiz_id = q.id
+                where q.project_id = :project_id
+                group by qq.topic
+                order by accuracy asc
+                limit 5
+            """),
+            {"project_id": project_id}
+        ).fetchall()
 
-    for r in topic_rows:
-        recall_topics.append(r[0])
+        recall_topics = [r[0] for r in topic_rows]
 
+        # ======================
+        # ADAPTIVE SESSION
+        # ======================
 
-    # ======================
-    # QUIZ CONFIG
-    # ======================
+        avg_accuracy_row = db.execute(
+            text("""
+                select avg(
+                    case when qa.is_correct then 1 else 0 end
+                )
+                from quiz_answers qa
+                join quiz_questions qq on qa.question_id = qq.id
+                join quizzes q on qq.quiz_id = q.id
+                where q.project_id = :project_id
+            """),
+            {"project_id": project_id}
+        ).fetchone()
 
-    # ======================
-    # ADAPTIVE SESSION
-    # ======================
+        avg_accuracy = avg_accuracy_row[0] if avg_accuracy_row and avg_accuracy_row[0] else 0.5
 
-    avg_accuracy_row = db.execute(
-        text("""
-            select avg(
-                case when qa.is_correct then 1 else 0 end
-            )
-            from quiz_answers qa
-            join quiz_questions qq on qa.question_id = qq.id
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-        """),
-        {"project_id": project_id}
-    ).fetchone()
+        if avg_accuracy < 0.5:
+            recall_count = 8
+            quiz_questions = 15
+        elif avg_accuracy < 0.8:
+            recall_count = 5
+            quiz_questions = 20
+        else:
+            recall_count = 3
+            quiz_questions = 25
 
-    avg_accuracy = avg_accuracy_row[0] if avg_accuracy_row and avg_accuracy_row[0] else 0.5
+        quiz_config = {
+            "num_questions": quiz_questions,
+            "difficulty": "medium",
+            "focus_topics": weak_topics
+        }
 
+        db.close()
 
-    if avg_accuracy < 0.5:
-
-        recall_count = 8
-        quiz_questions = 15
-
-    elif avg_accuracy < 0.8:
-
-        recall_count = 5
-        quiz_questions = 20
-
-    else:
-
-        recall_count = 3
-        quiz_questions = 25
-
-
-    quiz_config = {
-        "num_questions": quiz_questions,
-        "difficulty": "medium",
-        "focus_topics": weak_topics
-    }
-
-    db.close()
-
-    return {
-        "flashcards": flashcards,
-        "recall_topics": recall_topics[:recall_count],
-        "quiz": quiz_config
-    }
+        return {
+            "flashcards": flashcards,
+            "recall_topics": recall_topics[:recall_count],
+            "quiz": quiz_config
+        }
