@@ -284,8 +284,11 @@ def list_documents(
     db.close()
 
     return {
-        "documents": [{"title": r[0]} for r in rows]
-    }
+    "documents": [
+        {"id": r[0], "title": r[0]}
+        for r in rows
+    ]
+}
 # ======================
 # OCR FALLBACK
 # ======================
@@ -999,6 +1002,7 @@ def search_project_chunks(project_id: str, k: int = 20):
             select chunk_text, doc_title, page
             from chunks
             where project_id = :project_id
+            order by random()
             limit :k
         """),
         {
@@ -1554,19 +1558,20 @@ async def study_flashcards(project_id: str, limit: int = 20):
 
     return {"flashcards": cards}
 @app.post("/review_flashcard")
-async def review_flashcard(req: dict):
+async def review_flashcard(
+    req: dict,
+    user = Depends(verify_user)
+):
 
     db = SessionLocal()
 
-    
     difficulty = req.get("difficulty", 1)
     flashcard_id = req.get("flashcard_id")
     is_correct = req.get("is_correct", False)
-    
 
     if not is_correct:
         interval = "1 day"
-    if difficulty == 1:
+    elif difficulty == 1:
         interval = "1 day"
     elif difficulty == 2:
         interval = "3 days"
@@ -1590,10 +1595,92 @@ async def review_flashcard(req: dict):
         }
     )
 
+    flashcard_row = db.execute(
+        text("""
+            select project_id, user_id
+            from flashcards
+            where id = :flashcard_id
+        """),
+        {
+            "flashcard_id": flashcard_id
+        }
+    ).fetchone()
+
+    if flashcard_row:
+        db.execute(
+            text("""
+                insert into flashcard_reviews
+                (flashcard_id, project_id, user_id, is_correct, difficulty, elapsed_seconds)
+                values
+                (:flashcard_id, :project_id, :user_id, :is_correct, :difficulty, :elapsed_seconds)
+            """),
+            {
+                "flashcard_id": flashcard_id,
+                "project_id": flashcard_row[0],
+                "user_id": user["id"],
+                "is_correct": is_correct,
+                "difficulty": difficulty,
+                "elapsed_seconds": req.get("elapsed_seconds", 0)
+            }
+        )
+
     db.commit()
     db.close()
 
     return {"status": "ok"}
+    
+
+@app.get("/projects/{project_id}/flashcard_results")
+async def flashcard_results(
+    project_id: str,
+    user = Depends(verify_user)
+):
+    db = SessionLocal()
+
+    total_reviews = db.execute(
+        text("""
+            select count(*)
+            from flashcard_reviews
+            where project_id = :project_id
+            and user_id = :user_id
+        """),
+        {"project_id": project_id, "user_id": user["id"]}
+    ).scalar()
+
+    correct_reviews = db.execute(
+        text("""
+            select count(*)
+            from flashcard_reviews
+            where project_id = :project_id
+            and user_id = :user_id
+            and is_correct = true
+        """),
+        {"project_id": project_id, "user_id": user["id"]}
+    ).scalar()
+
+    avg_time = db.execute(
+        text("""
+            select avg(elapsed_seconds)
+            from flashcard_reviews
+            where project_id = :project_id
+            and user_id = :user_id
+        """),
+        {"project_id": project_id, "user_id": user["id"]}
+    ).scalar()
+
+    db.close()
+
+    accuracy = 0
+    if total_reviews and total_reviews > 0:
+        accuracy = round((correct_reviews / total_reviews) * 100, 1)
+
+    return {
+        "total_reviews": total_reviews or 0,
+        "correct_reviews": correct_reviews or 0,
+        "accuracy": accuracy,
+        "avg_time": round(avg_time or 0, 1)
+    }
+
 @app.get("/quizzes/{quiz_id}")
 async def get_quiz(quiz_id: str):
 
@@ -1926,161 +2013,183 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
         }
 
     return data
+# ======================
+# STUDY SESSION
+# ======================
+
+@app.get("/projects/{project_id}/study_session")
+async def study_session(
+    project_id: str,
+    user = Depends(verify_user)
+):
+    db = SessionLocal()
 
     # ======================
-    # STUDY SESSION
+    # DETECT WEAK TOPICS
     # ======================
 
-    @app.get("/projects/{project_id}/study_session")
-    async def study_session(
+    weak_topic_rows = db.execute(
+        text("""
+            select qq.topic,
+                avg(case when qa.is_correct then 1 else 0 end) as accuracy
+            from quiz_answers qa
+            join quiz_questions qq on qa.question_id = qq.id
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+            group by qq.topic
+            order by accuracy asc
+            limit 5
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    weak_topics = [r[0] for r in weak_topic_rows if r[0]]
+
+    # ======================
+    # GENERATE FLASHCARDS
+    # ======================
+
+    context_chunks = search_project_chunks(project_id, k=20)
+    context_text = "\n\n".join([c["text"] for c in context_chunks])
+    weak_topics_text = ", ".join(weak_topics) if weak_topics else "important concepts"
+
+    prompt = f"""
+Create 15 NEW flashcards for a study session.
+
+Focus especially on these weak topics:
+{weak_topics_text}
+
+Rules:
+- Cover different concepts
+- Do NOT repeat flashcards from previous session
+- Avoid duplicates
+- Each flashcard must cover a DIFFERENT concept
+- Avoid similar questions
+- Prefer mechanisms and cause-effect
+
+Return ONLY JSON:
+
+[
+  {{
+    "question": "...",
+    "answer": "..."
+  }}
+]
+
+Material:
+{context_text}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": "Generate study session flashcards."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    content = response.choices[0].message.content.strip()
+    content = content.replace("```json", "").replace("```", "").strip()
+
+    try:
+        generated_cards = json.loads(content)
+        if not isinstance(generated_cards, list):
+            generated_cards = []
+    except:
+        generated_cards = []
+    
+    if not isinstance(generated_cards, list):
+        generated_cards = []
+
+    flashcards = []
+
+    for c in generated_cards:
+
+        flashcard_id = str(uuid.uuid4())
+
+        db.execute(
+            text("""
+                insert into flashcards
+                (id, project_id, user_id, question, answer)
+                values
+                (:id, :project_id, :user_id, :question, :answer)
+            """),
+            {
+                "id": flashcard_id,
+                "project_id": project_id,
+                "user_id": user["id"],
+                "question": c.get("question"),
+                "answer": c.get("answer")
+            }
+        )
+
+        flashcards.append({
+            "id": flashcard_id,
+            "question": c.get("question"),
+            "answer": c.get("answer")
+        })
+    db.commit()
+
+    # ======================
+    # ADAPTIVE QUIZ CONFIG
+    # ======================
+
+    avg_accuracy_row = db.execute(
+        text("""
+            select avg(
+                case when qa.is_correct then 1 else 0 end
+            )
+            from quiz_answers qa
+            join quiz_questions qq on qa.question_id = qq.id
+            join quizzes q on qq.quiz_id = q.id
+            where q.project_id = :project_id
+        """),
+        {"project_id": project_id}
+    ).fetchone()
+
+    avg_accuracy = avg_accuracy_row[0] if avg_accuracy_row and avg_accuracy_row[0] else 0.5
+
+    if avg_accuracy < 0.5:
+        quiz_questions = 15
+    elif avg_accuracy < 0.8:
+        quiz_questions = 20
+    else:
+        quiz_questions = 25
+
+    db.close()
+
+    return {
+        "flashcards": flashcards,
+        "recall_topics": weak_topics,
+        "quiz": {
+            "num_questions": quiz_questions,
+            "difficulty": "medium",
+            "focus_topics": weak_topics
+        }
+    }
+    @app.delete("/projects/{project_id}/documents/{doc_title}")
+    async def delete_document(
         project_id: str,
+        doc_title: str,
         user = Depends(verify_user)
     ):
 
         db = SessionLocal()
 
-        # ======================
-        # DETECT WEAK TOPICS
-        # ======================
-
-        weak_topic_rows = db.execute(
+        db.execute(
             text("""
-                select qq.topic,
-                    avg(case when qa.is_correct then 1 else 0 end) as accuracy
-                from quiz_answers qa
-                join quiz_questions qq on qa.question_id = qq.id
-                join quizzes q on qq.quiz_id = q.id
-                where q.project_id = :project_id
-                group by qq.topic
-                order by accuracy asc
-                limit 5
+                delete from chunks
+                where project_id = :project_id
+                and doc_title = :doc_title
             """),
-            {"project_id": project_id}
-        ).fetchall()
-
-        weak_topics = [r[0] for r in weak_topic_rows if r[0]]
-
-        # ======================
-        # SESSION FLASHCARDS (15) - GENERATED FRESH
-        # ======================
-
-        context_chunks = search_project_chunks(project_id, k=20)
-        context_text = "\n\n".join([c["text"] for c in context_chunks])
-        weak_topics_text = ", ".join(weak_topics) if weak_topics else "important concepts"
-
-        prompt = f"""
-    Create 15 NEW flashcards for a study session.
-
-    Focus especially on these weak topics:
-    {weak_topics_text}
-
-    Rules:
-    - Cover different concepts
-    - Avoid duplicates
-    - Make flashcards useful for testing understanding
-    - Prefer mechanisms and cause-effect relationships
-
-    Return ONLY JSON:
-
-    [
-    {{
-        "question": "...",
-        "answer": "..."
-    }}
-    ]
-
-    Material:
-    {context_text}
-    """
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": "Generate study session flashcards."},
-                {"role": "user", "content": prompt}
-            ]
+            {
+                "project_id": project_id,
+                "doc_title": doc_title
+            }
         )
 
-        content = response.choices[0].message.content.strip()
-        content = content.replace("```json", "").replace("```", "").strip()
-
-        try:
-            generated_cards = json.loads(content)
-            if not isinstance(generated_cards, list):
-                generated_cards = []
-        except:
-            generated_cards = []
-
-        flashcards = []
-
-        for i, card in enumerate(generated_cards):
-            flashcards.append({
-                "id": i + 1,
-                "question": card.get("question"),
-                "answer": card.get("answer")
-            })
-
-        # ======================
-        # RECALL TOPICS
-        # ======================
-
-        topic_rows = db.execute(
-            text("""
-                select qq.topic,
-                    avg(case when qa.is_correct then 1 else 0 end) as accuracy
-                from quiz_answers qa
-                join quiz_questions qq on qa.question_id = qq.id
-                join quizzes q on qq.quiz_id = q.id
-                where q.project_id = :project_id
-                group by qq.topic
-                order by accuracy asc
-                limit 5
-            """),
-            {"project_id": project_id}
-        ).fetchall()
-
-        recall_topics = [r[0] for r in topic_rows]
-
-        # ======================
-        # ADAPTIVE SESSION
-        # ======================
-
-        avg_accuracy_row = db.execute(
-            text("""
-                select avg(
-                    case when qa.is_correct then 1 else 0 end
-                )
-                from quiz_answers qa
-                join quiz_questions qq on qa.question_id = qq.id
-                join quizzes q on qq.quiz_id = q.id
-                where q.project_id = :project_id
-            """),
-            {"project_id": project_id}
-        ).fetchone()
-
-        avg_accuracy = avg_accuracy_row[0] if avg_accuracy_row and avg_accuracy_row[0] else 0.5
-
-        if avg_accuracy < 0.5:
-            recall_count = 8
-            quiz_questions = 15
-        elif avg_accuracy < 0.8:
-            recall_count = 5
-            quiz_questions = 20
-        else:
-            recall_count = 3
-            quiz_questions = 25
-
-        quiz_config = {
-            "num_questions": quiz_questions,
-            "difficulty": "medium",
-            "focus_topics": weak_topics
-        }
-
+        db.commit()
         db.close()
 
-        return {
-            "flashcards": flashcards,
-            "recall_topics": recall_topics[:recall_count],
-            "quiz": quiz_config
-        }
+        return {"status": "deleted"}
