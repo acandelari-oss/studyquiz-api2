@@ -18,9 +18,11 @@ import asyncio
 import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
+from urllib.parse import unquote
 
 
-pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
+pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
 
 
 
@@ -322,22 +324,42 @@ def ocr_pdf_page(pdf_bytes, page_index):
 # TEXT CHUNKING
 # ======================
 
-def chunk_text(text, chunk_size=800, overlap=150):
+def chunk_text(text, max_chars=1000, overlap=200):
+
+    import re
+
+    paragraphs = re.split(r'\n\s*\n', text)
 
     chunks = []
+    current_chunk = ""
 
-    start = 0
-    length = len(text)
+    for p in paragraphs:
 
-    while start < length:
+        p = p.strip()
 
-        end = start + chunk_size
+        if not p:
+            continue
 
-        chunk = text[start:end]
+        if len(p) > max_chars:
 
-        chunks.append(chunk)
+            for i in range(0, len(p), max_chars):
+                sub = p[i:i+max_chars]
+                chunks.append(sub)
 
-        start += chunk_size - overlap
+            continue
+
+        if len(current_chunk) + len(p) < max_chars:
+
+            current_chunk += "\n\n" + p
+
+        else:
+
+            chunks.append(current_chunk.strip())
+
+            current_chunk = current_chunk[-overlap:] + "\n\n" + p
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
 
     return chunks
 
@@ -381,11 +403,15 @@ def ingest(
 
             for page_index, page in enumerate(reader.pages):
 
+                if page_index > 30:
+                    print("PAGE LIMIT REACHED → STOP")
+                    break
+                print(f"PAGE {page_index+1}")
                 page_text = page.extract_text()
 
                 if not page_text or not page_text.strip():
 
-                    print("EMPTY PAGE → OCR FALLBACK")
+                    print(f"OCR PAGE {page_index+1}")
 
                     page_text = ocr_pdf_page(pdf_bytes, page_index)
 
@@ -393,8 +419,92 @@ def ingest(
                         continue
 
                 chunks = chunk_text(page_text)
+                chunks = [c for c in chunks if len(c) > 100]
+                print("CHUNKS CREATED:", len(chunks))
 
                 for chunk in chunks:
+
+                    emb = client.embeddings.create(
+                        model="text-embedding-3-small",
+                        input=chunk
+                    )
+                    print("EMBEDDING CHUNK...")
+                    embedding = emb.data[0].embedding
+                    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+
+                    db.execute(
+                        text("""
+                            insert into chunks
+                            (project_id, doc_title, chunk_text, embedding, page)
+                            values
+                            (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
+                        """),
+                        {
+                            "project_id": project_id,
+                            "doc_title": doc.title,
+                            "chunk_text": chunk,
+                            "embedding": embedding_str,
+                            "page": page_index + 1
+                        }
+                    )
+                    
+        print("START DOCUMENT:", doc.title)
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        db.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db.close()
+    return {"status": "ok"}
+@app.post("/projects/{project_id}/ingest_stream")
+async def ingest_stream(
+    project_id: str,
+    data: IngestRequest,
+    user = Depends(verify_user)
+):
+
+    async def generate():
+
+        yield "Starting upload...\n"
+
+        db = SessionLocal()
+
+        for doc in data.documents:
+
+            yield f"Processing document: {doc.title}\n"
+
+            pdf_bytes = base64.b64decode(doc.file_bytes)
+            pdf_stream = io.BytesIO(pdf_bytes)
+
+            reader = PdfReader(pdf_stream)
+
+            for page_index, page in enumerate(reader.pages):
+
+                if page_index > 30:
+                    yield "Page limit reached → stopping\n"
+                    break
+
+                yield f"Page {page_index+1}\n"
+
+                page_text = page.extract_text()
+
+                if not page_text or not page_text.strip():
+                    yield f"OCR page {page_index+1}\n"
+                    page_text = ocr_pdf_page(pdf_bytes, page_index)
+
+                    if not page_text:
+                        continue
+
+                chunks = chunk_text(page_text)
+                chunks = [c for c in chunks if len(c) > 100]
+
+                yield f"{len(chunks)} chunks created\n"
+
+                for i, chunk in enumerate(chunks):
+
+                    yield f"Embedding chunk {i+1}/{len(chunks)}\n"
 
                     emb = client.embeddings.create(
                         model="text-embedding-3-small",
@@ -419,18 +529,13 @@ def ingest(
                             "page": page_index + 1
                         }
                     )
-                    
 
         db.commit()
-
-    except Exception as e:
-        db.rollback()
         db.close()
-        raise HTTPException(status_code=500, detail=str(e))
 
-    db.close()
-    return {"status": "ok"}
+        yield "Upload complete ✅\n"
 
+    return StreamingResponse(generate(), media_type="text/plain")
 
 # ======================
 # GENERATE QUIZ
@@ -903,28 +1008,36 @@ async def generate_flashcards(
     context_text = "\n\n".join([c["text"] for c in context_chunks])
 
     prompt = f"""
-You are an expert tutor.
+    You are a strict study tutor.
 
-Create {num_cards} flashcards from the study material.
-Flashcards must cover DIFFERENT topics from the material.
-Avoid creating multiple flashcards about the same concept.
+    You MUST follow these rules:
 
-Each flashcard must have:
-- question
-- answer
+    - Use ONLY the provided material
+    - DO NOT use external knowledge
+    - If information is missing → SKIP the card
+    - Each flashcard must test ONE clear concept
+    - Avoid generic or vague questions
+    - Avoid repeating similar questions
+    - Avoid simple definition-only questions when possible
+    - Prefer cause-effect, mechanisms, reasoning
 
-Return ONLY valid JSON in this format:
+    IMPORTANT:
+    Each flashcard must be DIFFERENT in concept.
 
-[
-  {{
-    "question": "...",
-    "answer": "..."
-  }}
-]
+    Return ONLY JSON:
 
-Study material:
-{context_text}
-"""
+    [
+    {{
+        "question": "...",
+        "answer": "...",
+        "concept": "...",
+        "difficulty": "easy | medium | hard"
+    }}
+    ]
+
+    Study material:
+    {context_text}
+    """
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -942,7 +1055,7 @@ Study material:
         gpt_text = gpt_text.replace("```json", "").replace("```", "").strip()
         flashcards = json.loads(gpt_text)
 
-        # remove duplicate questions
+        # remove duplicate + low quality flashcards
 
         seen = set()
         unique_flashcards = []
@@ -950,6 +1063,14 @@ Study material:
         for card in flashcards:
 
             q = card.get("question","").strip().lower()
+            a = card.get("answer","").strip()
+
+            # filtri qualità base
+            if len(q) < 10 or len(a) < 5:
+                continue
+
+            if "what is" in q and len(a.split()) < 5:
+                continue
 
             if q not in seen:
                 seen.add(q)
@@ -997,17 +1118,37 @@ def search_project_chunks(project_id: str, k: int = 20):
 
     db = SessionLocal()
 
+    emb = client.embeddings.create(
+        model="text-embedding-3-small",
+        input="important study concepts"
+    )
+
+    query_embedding = emb.data[0].embedding
+
     rows = db.execute(
         text("""
-            select chunk_text, doc_title, page
-            from chunks
-            where project_id = :project_id
-            order by random()
-            limit :k
+            (
+                select chunk_text, doc_title, page
+                from chunks
+                where project_id = :project_id
+                order by embedding <-> CAST(:embedding AS vector)
+                limit :k
+            )
+
+            union
+
+            (
+                select chunk_text, doc_title, page
+                from chunks
+                where project_id = :project_id
+                order by random()
+                limit :k
+            )
         """),
         {
             "project_id": project_id,
-            "k": k
+            "k": k,
+            "embedding": query_embedding
         }
     ).fetchall()
 
@@ -1877,17 +2018,32 @@ async def active_recall_question(
 
     rows = db.execute(
         text("""
-            select chunk_text, doc_title, page
-            from chunks
-            where project_id = :project_id
-            order by embedding <-> CAST(:embedding AS vector)
-            limit 10
+            (
+                select chunk_text, doc_title, page
+                from chunks
+                where project_id = :project_id
+                order by embedding <-> CAST(:embedding AS vector)
+                limit 6
+            )
+
+            union
+
+            (
+                select chunk_text, doc_title, page
+                from chunks
+                where project_id = :project_id
+                order by random()
+                limit 6
+            )
         """),
         {
             "project_id": project_id,
             "embedding": query_embedding
         }
     ).fetchall()
+
+    import random
+    random.shuffle(rows)
 
     db.close()
 
@@ -1901,29 +2057,41 @@ async def active_recall_question(
     context = "\n\n---\n\n".join(context_blocks)
 
     prompt = f"""
-You are a tutor helping a student practice ACTIVE RECALL.
+    You are a strict study tutor generating ACTIVE RECALL questions.
 
-Your task:
-Generate ONE open-ended question that forces the student
-to recall and explain a concept from the material.
+    You MUST follow these rules:
 
-Rules:
-- Do NOT ask multiple choice questions
-- Ask a question that requires explanation
-- Focus on mechanisms, processes, cause-effect
-- Avoid trivial definitions
+    - Use ONLY the provided material
+    - DO NOT use external knowledge
+    - If the material is unclear → ask a simpler question
+    - Ask ONLY ONE question
+    - The question must focus on ONE clear concept
+    - Avoid vague or generic questions
+    - Avoid simple definitions when possible
+    - Prefer "why", "how", "what happens if"
 
-Material:
-{context}
+    GOOD examples:
+    - Why does X lead to Y?
+    - How does X affect Y?
+    - What happens if X is disrupted?
 
-Return ONLY JSON:
+    BAD examples:
+    - What is X?
+    - Explain everything about X
 
-{{
- "question": "...",
- "source_document": "...",
- "source_page": "..."
-}}
-"""
+    Material:
+    {context}
+
+    Return ONLY JSON:
+
+    {{
+    "question": "...",
+    "concept": "...",
+    "difficulty": "easy | medium | hard",
+    "source_document": "...",
+    "source_page": "..."
+    }}
+    """
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -1958,7 +2126,7 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
     history_text = "\n".join(req.history or [])
 
     prompt = f"""
-    You are a supportive study tutor evaluating a student's answer.
+    You are a strict but supportive study tutor evaluating a student's answer.
 
     Question:
     {req.question}
@@ -1971,21 +2139,36 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
 
     Evaluation rules:
 
-    - Evaluate the student's overall understanding across ALL answers.
-    - If the student progressively improves, recognize it.
-    - Accept correct ideas even if the explanation is short.
-    - Do NOT repeat the same feedback.
-    - If the student already explained the main concepts, mark the answer as correct.
-    - If the student gives up, explain the concept clearly.
+    - Determine if the student truly understood the concept
+    - Do NOT be overly permissive
+    - A vague or generic answer is NOT correct
+    - The answer must include the key idea of the concept
+    - Partial answers should be marked as "partial"
+    - Only mark "correct" if the core concept is clearly expressed
+
+    Scoring:
+
+    - correct → clear understanding, key concept present
+    - partial → some correct ideas but incomplete or unclear
+    - incorrect → wrong or missing core idea
+
+    Also:
+
+    - Identify if important parts are missing
+    - Detect incorrect claims if present
+    - Provide a short helpful feedback
+    - Provide a hint ONLY if the answer is not fully correct
 
     Return ONLY JSON:
 
     {{
     "evaluation": "correct | partial | incorrect",
     "score": 0-1,
-    "feedback": "short supportive feedback",
-    "hint": "optional hint",
-    "explanation": "clear explanation if needed"
+    "feedback": "...",
+    "missing": ["..."],
+    "wrong_claims": ["..."],
+    "hint": "...",
+    "explanation": "clear explanation of the concept"
     }}
     """
 
@@ -2168,15 +2351,37 @@ Material:
             "focus_topics": weak_topics
         }
     }
-    @app.delete("/projects/{project_id}/documents/{doc_title}")
-    async def delete_document(
+@app.delete("/projects/{project_id}/documents/{doc_title}")
+def delete_document(
         project_id: str,
         doc_title: str,
         user = Depends(verify_user)
     ):
 
+        doc_title = unquote(doc_title)  # 🔥 FIX URL encoding
+
+        user_id = user["id"]
         db = SessionLocal()
 
+        # verifica ownership
+        project = db.execute(
+            text("""
+                select id
+                from projects
+                where id = :project_id
+                and user_id = :user_id
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user_id
+            }
+        ).fetchone()
+
+        if not project:
+            db.close()
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        # 🔥 DELETE REAL (tutti i chunk del documento)
         db.execute(
             text("""
                 delete from chunks
@@ -2192,4 +2397,4 @@ Material:
         db.commit()
         db.close()
 
-        return {"status": "deleted"}
+        return {"status": "deleted"}   
