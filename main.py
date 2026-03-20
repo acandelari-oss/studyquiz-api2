@@ -1003,7 +1003,11 @@ async def generate_flashcards(
         num_cards = req.get("num_cards", 10)
 
     # recuperiamo contesto dal vector DB
-    context_chunks = search_project_chunks(project_id, k=20)
+    context_chunks = search_project_chunks(
+        project_id,
+        query=" ".join(weak_topics) if weak_topics else "important concepts",
+        k=12
+    )
 
     context_text = "\n\n".join([c["text"] for c in context_chunks])
 
@@ -1708,18 +1712,47 @@ async def review_flashcard(
 
     difficulty = req.get("difficulty", 1)
     flashcard_id = req.get("flashcard_id")
+    row = db.execute(
+        text("""
+            select next_review, last_review
+            from flashcards
+            where id = :flashcard_id
+        """),
+        {"flashcard_id": flashcard_id}
+    ).fetchone()
     is_correct = req.get("is_correct", False)
 
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+
+    # fallback
+    current_interval_days = 1
+
+    if row and row[0] and row[1]:
+        delta = row[0] - row[1]
+        current_interval_days = max(1, delta.days)
+
+    # ======================
+    # SPACED REPETITION LOGIC
+    # ======================
+
     if not is_correct:
-        interval = "1 day"
+        new_interval_days = 1
+
     elif difficulty == 1:
-        interval = "1 day"
+        new_interval_days = max(1, current_interval_days // 2)
+
     elif difficulty == 2:
-        interval = "3 days"
+        new_interval_days = current_interval_days + 1
+
     elif difficulty == 3:
-        interval = "7 days"
+        new_interval_days = current_interval_days * 2
+
     else:
-        interval = "14 days"
+        new_interval_days = current_interval_days + 3
+
+    next_review = now + timedelta(days=new_interval_days)
 
     db.execute(
         text(f"""
@@ -2023,7 +2056,7 @@ async def active_recall_question(
                 from chunks
                 where project_id = :project_id
                 order by embedding <-> CAST(:embedding AS vector)
-                limit 6
+                limit 4
             )
 
             union
@@ -2033,7 +2066,7 @@ async def active_recall_question(
                 from chunks
                 where project_id = :project_id
                 order by random()
-                limit 6
+                limit 8
             )
         """),
         {
@@ -2043,7 +2076,12 @@ async def active_recall_question(
     ).fetchall()
 
     import random
+
+    rows = list(rows)
     random.shuffle(rows)
+
+    # 🔥 PRENDI SOLO 5 CHUNK (invece di tutti)
+    rows = rows[:5]
 
     db.close()
 
@@ -2082,6 +2120,17 @@ async def active_recall_question(
     Material:
     {context}
 
+    IMPORTANT:
+    - Use ONLY the information explicitly written above
+    - Do NOT infer missing details
+    - Do NOT add knowledge not present in the text
+    - If unsure, ask a simpler question based strictly on the text
+
+    Difficulty rules:
+    - easy → direct recall from text
+    - medium → requires explanation or connection
+    - hard → requires reasoning or implications
+
     Return ONLY JSON:
 
     {{
@@ -2119,6 +2168,66 @@ class ActiveRecallEvaluateRequest(BaseModel):
     student_answer: str
     history: Optional[list[str]] = None
 
+@app.post("/generate_recovery_flashcards")
+async def generate_recovery_flashcards(req: dict):
+
+    project_id = req.get("project_id")
+
+    db = SessionLocal()
+
+    # prendi chunk random ma piccoli (focus)
+    rows = db.execute(
+        text("""
+            select chunk_text
+            from chunks
+            where project_id = :project_id
+            order by random()
+            limit 5
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    db.close()
+
+    context = "\n\n".join([r[0][:300] for r in rows])
+
+    prompt = f"""
+Generate 3 recovery flashcards.
+
+Rules:
+- Focus on reinforcing misunderstood concepts
+- Keep them simple and clear
+- No duplicates
+- Use ONLY provided material
+
+Return JSON:
+
+[
+  {{
+    "question": "...",
+    "answer": "..."
+  }}
+]
+
+Material:
+{context}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.5,
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    content = response.choices[0].message.content
+    content = content.replace("```json","").replace("```","").strip()
+
+    try:
+        return {"flashcards": json.loads(content)}
+    except:
+        return {"flashcards": []}
 
 @app.post("/active_recall_evaluate")
 async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
@@ -2233,35 +2342,41 @@ async def study_session(
     # ======================
 
     context_chunks = search_project_chunks(project_id, k=20)
-    context_text = "\n\n".join([c["text"] for c in context_chunks])
+    context_text = "\n\n".join([c["text"][:400] for c in context_chunks])
     weak_topics_text = ", ".join(weak_topics) if weak_topics else "important concepts"
 
     prompt = f"""
-Create 15 NEW flashcards for a study session.
+    You are a strict study tutor generating flashcards for a focused study session.
+    Generate EXACTLY 15 flashcards.
+    Focus especially on these weak topics:
+    {weak_topics_text}
 
-Focus especially on these weak topics:
-{weak_topics_text}
+    Rules:
+    - Use ONLY the provided material
+    - Do NOT use external knowledge
+    - Do NOT invent information
+    - Each flashcard must cover a DIFFERENT concept
+    - Avoid similar or repeated questions
+    - Prefer "why", "how", "what happens if"
+    - Avoid simple definitions unless necessary
 
-Rules:
-- Cover different concepts
-- Do NOT repeat flashcards from previous session
-- Avoid duplicates
-- Each flashcard must cover a DIFFERENT concept
-- Avoid similar questions
-- Prefer mechanisms and cause-effect
+    Difficulty:
+    - easy → direct recall
+    - medium → explanation or relation
+    - hard → reasoning or consequences
 
-Return ONLY JSON:
+    Return ONLY JSON:
 
-[
-  {{
-    "question": "...",
-    "answer": "..."
-  }}
-]
+    [
+    {{
+        "question": "...",
+        "answer": "..."
+    }}
+    ]
 
-Material:
-{context_text}
-"""
+    Material:
+    {context_text}
+    """
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -2360,6 +2475,7 @@ def delete_document(
 
         doc_title = unquote(doc_title)  # 🔥 FIX URL encoding
 
+        print("DELETE DOCUMENT:", project_id, doc_title)
         user_id = user["id"]
         db = SessionLocal()
 
@@ -2393,6 +2509,7 @@ def delete_document(
                 "doc_title": doc_title
             }
         )
+        print("ROWS DELETED")
 
         db.commit()
         db.close()
