@@ -1,16 +1,14 @@
-# Updated main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-# Fixing undefined 'attempt' variable and ensuring CORS includes new origin
+app = FastAPI()
 
-# ... [previous code] ...
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this as necessary
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
-
-def generate_flashcards():
-    attempt = 0  # Define 'attempt' variable
-    while condition:  # assuming there is a condition to check
-        # ... [rest of the function code] ...
-        pass
-
-# CORS configuration
-CORS(app, origins=['https://quiz-ui-ruddy.vercel.app'])
-# ... [rest of the file] ...
+# Your other FastAPI routes here
