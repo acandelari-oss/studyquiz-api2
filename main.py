@@ -5,6 +5,7 @@ import io
 from typing import List, Optional
 import json
 import requests
+import datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -473,7 +474,12 @@ async def ingest_stream(
     async def generate():
         db = SessionLocal()
 
+        total_chunks = 0
+        total_embeddings = 0
+
         try:
+            start_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            print(f"[{start_ts}] INGEST_STREAM START project_id={project_id} docs={len(docs)}")
             yield "Starting upload...\n"
 
             # ======================
@@ -506,10 +512,13 @@ async def ingest_stream(
                     chunks = chunk_text(page_text)
                     chunks = [c for c in chunks if len(c) > 100]
 
-                    yield f"{len(chunks)} chunks created\n"
+                    page_chunk_count = len(chunks)
+                    total_chunks += page_chunk_count
+                    print(f"  page {page_index+1}: {page_chunk_count} chunks (running total={total_chunks})")
+                    yield f"{page_chunk_count} chunks created\n"
 
                     for i, chunk in enumerate(chunks):
-                        yield f"Embedding chunk {i+1}/{len(chunks)}\n"
+                        yield f"Embedding chunk {i+1}/{page_chunk_count}\n"
                         await asyncio.sleep(0)
 
                         emb = await asyncio.to_thread(
@@ -520,6 +529,7 @@ async def ingest_stream(
 
                         embedding = emb.data[0].embedding
                         embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+                        total_embeddings += 1
 
                         db.execute(
                             text("""
@@ -537,15 +547,23 @@ async def ingest_stream(
                             }
                         )
 
+            pre_commit_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            print(f"[{pre_commit_ts}] PRE-COMMIT: total_chunks={total_chunks} total_embeddings={total_embeddings}")
+
             db.commit()
 
-
+            post_commit_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            db_count = db.execute(
+                text("SELECT COUNT(*) FROM chunks WHERE project_id = :project_id"),
+                {"project_id": project_id}
+            ).scalar()
+            print(f"[{post_commit_ts}] POST-COMMIT: db_chunk_count={db_count} for project_id={project_id}")
 
             yield "Upload complete ✅\n"
 
         except Exception as e:
             db.rollback()
-            print("INGEST_STREAM ERROR:", e)
+            print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] INGEST_STREAM ERROR project_id={project_id}: {e}")
             yield f"Upload failed: {str(e)}\n"
 
         finally:
@@ -1418,7 +1436,8 @@ def generate_topics(
         db = SessionLocal()
 
         try:
-            print("START TOPICS GENERATION:", project_id)
+            start_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            print(f"[{start_ts}] START TOPICS GENERATION project_id={project_id}")
 
             rows = db.execute(
                 text("""
@@ -1430,9 +1449,17 @@ def generate_topics(
                 {"project_id": project_id}
             ).fetchall()
 
-            full_text = "\n\n".join([r[0] for r in rows if r[0]])
+            chunk_count = len(rows)
+            print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] CHUNK VALIDATION: count={chunk_count} project_id={project_id}")
 
-            print("TEXT LENGTH:", len(full_text))
+            if chunk_count == 0:
+                print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] ❌ Topics generation failed: NO CHUNKS FOUND for project_id={project_id}")
+                raise HTTPException(status_code=400, detail="NO CHUNKS FOUND")
+
+            full_text = "\n\n".join([r[0] for r in rows if r[0]])
+            text_length = len(full_text)
+            truncated_length = min(text_length, 12000)
+            print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] TEXT LENGTH: total={text_length} truncated_to={truncated_length}")
 
             if not full_text.strip():
                 raise HTTPException(status_code=400, detail="No content")
@@ -1453,7 +1480,8 @@ def generate_topics(
     {full_text[:12000]}
     """
 
-            print("CALLING GPT...")
+            gpt_call_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            print(f"[{gpt_call_ts}] CALLING GPT model=gpt-4o-mini chunks={chunk_count} text_chars={truncated_length}")
 
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -1466,12 +1494,13 @@ def generate_topics(
             content = response.choices[0].message.content.strip()
             content = content.replace("```json", "").replace("```", "").strip()
 
-            print("RAW GPT:", content[:500])
+            gpt_resp_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            print(f"[{gpt_resp_ts}] GPT RESPONSE received: {content[:500]}")
 
             data_json = json.loads(content)
             topics = data_json.get("topics", [])
 
-            print("TOPICS FOUND:", len(topics))
+            print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] TOPICS FOUND: {len(topics)}")
 
             db.execute(
                 text("DELETE FROM topics WHERE project_id = :project_id"),
@@ -1505,7 +1534,8 @@ def generate_topics(
 
             db.commit()
 
-            print("TOPICS SAVED")
+            saved_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            print(f"[{saved_ts}] ✅ Topics saved: {len(seen)} topics from {chunk_count} chunks for project_id={project_id}")
 
             return {
                 "status": "ok",
@@ -1514,7 +1544,7 @@ def generate_topics(
 
         except Exception as e:
             db.rollback()
-            print("TOPICS ERROR:", e)
+            print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] TOPICS ERROR project_id={project_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
         finally:
