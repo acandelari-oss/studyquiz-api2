@@ -1,23 +1,16 @@
-# main.py
+# Updated main.py
 
-# This is an example of main.py content restored from commit f39a31fca001ea51ee123dd931b120e9d1ff300e
+# Fixing undefined 'attempt' variable and ensuring CORS includes new origin
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+# ... [previous code] ...
 
-app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://quiz-ui-ruddy.vercel.app",
-        "http://localhost:3000"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+def generate_flashcards():
+    attempt = 0  # Define 'attempt' variable
+    while condition:  # assuming there is a condition to check
+        # ... [rest of the function code] ...
+        pass
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+# CORS configuration
+CORS(app, origins=['https://quiz-ui-ruddy.vercel.app'])
+# ... [rest of the file] ...
