@@ -9,6 +9,7 @@ from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import text as sql_text
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from openai import OpenAI
@@ -19,6 +20,8 @@ import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
 from urllib.parse import unquote
+from fastapi import HTTPException
+from fastapi import Body
 
 
 
@@ -50,10 +53,11 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 # ======================
 
 app = FastAPI()
+from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -464,76 +468,88 @@ async def ingest_stream(
     data: IngestRequest,
     user = Depends(verify_user)
 ):
+    docs = data.documents
 
     async def generate():
-
-        yield "Starting upload...\n"
-
         db = SessionLocal()
 
-        for doc in data.documents:
+        try:
+            yield "Starting upload...\n"
 
-            yield f"Processing document: {doc.title}\n"
+            # ======================
+            # SAVE CHUNKS
+            # ======================
+            for doc in docs:
+                yield f"Processing document: {doc.title}\n"
 
-            pdf_bytes = base64.b64decode(doc.file_bytes)
-            pdf_stream = io.BytesIO(pdf_bytes)
+                pdf_bytes = base64.b64decode(doc.file_bytes)
+                pdf_stream = io.BytesIO(pdf_bytes)
 
-            reader = PdfReader(pdf_stream)
+                reader = PdfReader(pdf_stream)
 
-            for page_index, page in enumerate(reader.pages):
+                for page_index, page in enumerate(reader.pages):
+                    if page_index > 30:
+                        yield "Page limit reached → stopping\n"
+                        break
 
-                if page_index > 30:
-                    yield "Page limit reached → stopping\n"
-                    break
+                    yield f"Page {page_index+1}\n"
 
-                yield f"Page {page_index+1}\n"
+                    page_text = page.extract_text()
 
-                page_text = page.extract_text()
+                    if not page_text or not page_text.strip():
+                        yield f"OCR page {page_index+1}\n"
+                        page_text = ocr_pdf_page(pdf_bytes, page_index)
 
-                if not page_text or not page_text.strip():
-                    yield f"OCR page {page_index+1}\n"
-                    page_text = ocr_pdf_page(pdf_bytes, page_index)
+                        if not page_text:
+                            continue
 
-                    if not page_text:
-                        continue
+                    chunks = chunk_text(page_text)
+                    chunks = [c for c in chunks if len(c) > 100]
 
-                chunks = chunk_text(page_text)
-                chunks = [c for c in chunks if len(c) > 100]
+                    yield f"{len(chunks)} chunks created\n"
 
-                yield f"{len(chunks)} chunks created\n"
+                    for i, chunk in enumerate(chunks):
+                        yield f"Embedding chunk {i+1}/{len(chunks)}\n"
+                        await asyncio.sleep(0)
 
-                for i, chunk in enumerate(chunks):
+                        emb = await asyncio.to_thread(
+                            client.embeddings.create,
+                            model="text-embedding-3-small",
+                            input=chunk
+                        )
 
-                    yield f"Embedding chunk {i+1}/{len(chunks)}\n"
+                        embedding = emb.data[0].embedding
+                        embedding_str = "[" + ",".join(map(str, embedding)) + "]"
 
-                    emb = client.embeddings.create(
-                        model="text-embedding-3-small",
-                        input=chunk
-                    )
+                        db.execute(
+                            text("""
+                                insert into chunks
+                                (project_id, doc_title, chunk_text, embedding, page)
+                                values
+                                (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
+                            """),
+                            {
+                                "project_id": project_id,
+                                "doc_title": doc.title,
+                                "chunk_text": chunk,
+                                "embedding": embedding_str,
+                                "page": page_index + 1
+                            }
+                        )
 
-                    embedding = emb.data[0].embedding
-                    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+            db.commit()
 
-                    db.execute(
-                        text("""
-                            insert into chunks
-                            (project_id, doc_title, chunk_text, embedding, page)
-                            values
-                            (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
-                        """),
-                        {
-                            "project_id": project_id,
-                            "doc_title": doc.title,
-                            "chunk_text": chunk,
-                            "embedding": embedding_str,
-                            "page": page_index + 1
-                        }
-                    )
 
-        db.commit()
-        db.close()
 
-        yield "Upload complete ✅\n"
+            yield "Upload complete ✅\n"
+
+        except Exception as e:
+            db.rollback()
+            print("INGEST_STREAM ERROR:", e)
+            yield f"Upload failed: {str(e)}\n"
+
+        finally:
+            db.close()
 
     return StreamingResponse(generate(), media_type="text/plain")
 
@@ -740,6 +756,7 @@ Return STRICT JSON ARRAY like this:
 class AskRequest(BaseModel):
     project_id: str
     question: str
+    topics: Optional[List[str]] = []
 
 from typing import Optional
 
@@ -758,6 +775,7 @@ async def generate_quiz_stream(
         db = SessionLocal()
 
         remaining = req.num_questions
+        topics = req.topics if hasattr(req, "topics") else []
         first_batch = True
         seen_questions = set()
 
@@ -800,9 +818,23 @@ async def generate_quiz_stream(
         material_blocks = []
 
         for r in rows:
+
+            text_chunk = r[0].lower()
+
+            if topics:
+                if not any(topic.lower() in text_chunk for topic in topics):
+                    continue   # 🔥 SCARTA CHUNK NON RILEVANTI
+
             material_blocks.append(
                 f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:500]}"
             )
+        if len(material_blocks) == 0:
+            print("⚠️ No topic match, fallback to full material")
+
+            for r in rows:
+                material_blocks.append(
+                    f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:500]}"
+                )
 
         context = "\n\n---\n\n".join(material_blocks)
 
@@ -824,7 +856,13 @@ async def generate_quiz_stream(
         Generate {n} high-quality multiple choice study questions.
 
         IMPORTANT:
-        Each question MUST focus on a DIFFERENT concept from the material.
+        Each question MUST focus on a COMPLETELY DIFFERENT concept.
+
+        CRITICAL:
+        - Do NOT generate questions about the same topic even if phrased differently
+        - Avoid paraphrasing the same concept
+        - Each question must test a UNIQUE concept
+        - If you cannot find enough different concepts, generate fewer questions instead
 
         The quiz must cover as many different topics from the material as possible.
 
@@ -924,11 +962,36 @@ async def generate_quiz_stream(
 
             text_q = q.get("question","").strip().lower()
 
-            if text_q in seen_questions:
+            # filtro più intelligente (prime parole)
+            key = " ".join(text_q.split()[:8])
+
+            if key in seen_questions:
                 continue
 
-            seen_questions.add(text_q)
+            seen_questions.add(key)
             unique_questions.append(q)
+
+        # FILL MISSING QUESTIONS
+        if len(unique_questions) < req.num_questions:
+
+            missing = req.num_questions - len(unique_questions)
+            print(f"Filling {missing} missing questions...")
+
+            extra = await generate_batch(missing)
+
+            for q in extra:
+
+                text_q = q.get("question","").strip().lower()
+                key = " ".join(text_q.split()[:8])
+
+                if key in seen_questions:
+                    continue
+
+                seen_questions.add(key)
+                unique_questions.append(q)
+
+                if len(unique_questions) >= req.num_questions:
+                    break
 
         return unique_questions[:req.num_questions]
 
@@ -999,19 +1062,62 @@ async def generate_flashcards(
 
     num_cards = 10
     user_id = user["id"]
+    topics = []
+
     if req and isinstance(req, dict):
         num_cards = req.get("num_cards", 10)
+        topics = req.get("topics", [])
 
     # recuperiamo contesto dal vector DB
-    context_chunks = search_project_chunks(
-        project_id,
-        query=" ".join(weak_topics) if weak_topics else "important concepts",
-        k=12
+    query_text = " ".join(topics) if topics else "important concepts"
+
+    # 🔥 COSTRUIAMO QUERY FORTE BASATA SUI TOPICS
+    if topics:
+        topic_query = " ".join(topics)
+        query_text = f"study material about {topic_query}"
+    else:
+        query_text = "important study concepts"
+
+    # 🔥 RETRIEVAL PIÙ PRECISO (NO RANDOM)
+    db = SessionLocal()
+
+    emb = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=query_text
     )
+
+    query_embedding = emb.data[0].embedding
+
+    rows = db.execute(
+        text("""
+            select chunk_text, doc_title, page
+            from chunks
+            where project_id = :project_id
+            order by embedding <-> CAST(:embedding AS vector)
+            limit 12
+        """),
+        {
+            "project_id": project_id,
+            "embedding": query_embedding
+        }
+    ).fetchall()
+
+    db.close()
+
+    context_chunks = [
+        {
+            "text": r[0],
+            "document": r[1],
+            "page": r[2]
+        }
+        for r in rows
+    ]
+    
 
     context_text = "\n\n".join([c["text"] for c in context_chunks])
 
     prompt = f"""
+    You MUST generate EXACTLY {num_cards} flashcards.
     You are a strict study tutor.
 
     You MUST follow these rules:
@@ -1020,10 +1126,15 @@ async def generate_flashcards(
     - DO NOT use external knowledge
     - If information is missing → SKIP the card
     - Each flashcard must test ONE clear concept
+    - Each flashcard MUST include a "topic"
+    - The topic must be a specific concept explicitly present in the material
+    - Avoid generic or vague topics
     - Avoid generic or vague questions
     - Avoid repeating similar questions
     - Avoid simple definition-only questions when possible
     - Prefer cause-effect, mechanisms, reasoning
+
+    Return EXACTLY {num_cards} items.
 
     IMPORTANT:
     Each flashcard must be DIFFERENT in concept.
@@ -1035,6 +1146,7 @@ async def generate_flashcards(
         "question": "...",
         "answer": "...",
         "concept": "...",
+        "topic": "...",
         "difficulty": "easy | medium | hard"
     }}
     ]
@@ -1081,9 +1193,63 @@ async def generate_flashcards(
                 unique_flashcards.append(card)
 
         flashcards = unique_flashcards
+        flashcards = flashcards[:num_cards]
 
         if not isinstance(flashcards, list):
             flashcards = []
+
+        # 🔥 FORCE EXACT NUMBER
+        flashcards = flashcards[:num_cards]
+
+        # 🔥 SE MANCANO → GENERA FINO A COMPLETARE
+        while len(flashcards) < num_cards:
+
+            missing = num_cards - len(flashcards)
+
+            print(f"⚠️ Filling missing flashcards: {missing}")
+
+            extra_prompt = f"""
+        Generate {missing} NEW flashcards.
+
+        Rules:
+        - Do NOT repeat previous concepts
+        - Avoid similar questions
+        - Be specific and concrete
+        - Use ONLY the material
+
+        Study material:
+        {context_text}
+        """
+
+            extra_response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.7,
+                messages=[
+                    {"role": "system", "content": "You generate study flashcards."},
+                    {"role": "user", "content": extra_prompt}
+                ]
+            )
+
+            extra_text = extra_response.choices[0].message.content
+            extra_text = extra_text.replace("```json", "").replace("```", "").strip()
+
+            try:
+                extra_cards = json.loads(extra_text)
+            except:
+                break
+
+            for card in extra_cards:
+
+                if len(flashcards) >= num_cards:
+                    break
+
+                q = card.get("question","").strip().lower()
+
+                if q not in seen:
+                    seen.add(q)
+                    flashcards.append(card)
+
+            attempt += 1
 
     except Exception as e:
 
@@ -1099,35 +1265,64 @@ async def generate_flashcards(
 
     for card in flashcards:
 
-        db.execute(
+        result = db.execute(
             text("""
             insert into flashcards
-            (project_id, user_id, question, answer)
+            (project_id, user_id, question, answer, topic)
             values
-            (:project_id, :user_id, :question, :answer)
+            (:project_id, :user_id, :question, :answer, :topic)
+            returning id
             """),
             {
                 "project_id": project_id,
                 "user_id": user_id,
                 "question": card.get("question"),
-                "answer": card.get("answer")
+                "answer": card.get("answer"),
+                "topic": card.get("topic") or card.get("concept")
             }
         )
+
+        new_id = result.fetchone()[0]
+        card["id"] = new_id
 
     db.commit()
     db.close()
 
     return {"flashcards": flashcards}
-def search_project_chunks(project_id: str, k: int = 20):
+def search_project_chunks(
+    project_id: str,
+    query: str = None,
+    topics: list[str] = None,
+    k: int = 20
+):
 
     db = SessionLocal()
 
+    # ======================
+    # BUILD QUERY INTELLIGENTE
+    # ======================
+
+    if query and topics:
+        full_query = f"{query} {' '.join(topics)}"
+    elif topics:
+        full_query = " ".join(topics)
+    else:
+        full_query = query or "important study concepts"
+
+    # DEBUG
+    print("🔍 RETRIEVAL QUERY:", full_query)
+    print("🎯 TOPICS:", topics)
+
     emb = client.embeddings.create(
         model="text-embedding-3-small",
-        input="important study concepts"
+        input=full_query
     )
 
     query_embedding = emb.data[0].embedding
+
+    # ======================
+    # VECTOR SEARCH + RANDOM MIX
+    # ======================
 
     rows = db.execute(
         text("""
@@ -1158,6 +1353,10 @@ def search_project_chunks(project_id: str, k: int = 20):
 
     db.close()
 
+    # ======================
+    # COSTRUZIONE CHUNKS
+    # ======================
+
     chunks = []
 
     for r in rows:
@@ -1167,158 +1366,163 @@ def search_project_chunks(project_id: str, k: int = 20):
             "page": r[2]
         })
 
-    return chunks
+    print("📦 CHUNKS RETRIEVED:", len(chunks))
+
+    return chunks[:k]
+from sqlalchemy import text as sql_text
+
 @app.get("/projects/{project_id}/topics")
-async def get_project_topics(
-    project_id: str,
-    user = Depends(verify_user)
-):
+async def get_topics(project_id: str):
 
     db = SessionLocal()
 
-    rows = db.execute(
-        text("""
-            select chunk_text
-            from chunks
-            where project_id = :project_id
-            limit 80
-        """),
-        {"project_id": project_id}
-    ).fetchall()
-
-    print("ROWS FOUND:", len(rows))
-    if not rows:
-        db.close()
-        return {"topics": []}
-        
-
-    text_blocks = [r[0] for r in rows]
-
-    context = "\n\n".join(text_blocks)
-
-    prompt = f"""
-You are analyzing medical study material.
-
-Your task:
-Identify the main study concepts students must learn.
-
-Return JSON in this format:
-
-{{ "topics": ["Apoptosis","Necrosis","Inflammation","Cell injury","Oxidative stress"] }}
-
-Material:
-{context}
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Return ONLY JSON."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-
-    content = response.choices[0].message.content.strip()
-    # pulizia markdown restituito da GPT
-    content = content.replace("```json", "").replace("```", "").strip()
-
-    import json
-
     try:
-        data = json.loads(content)
 
-        topics = data.get("topics", [])
+        result = db.execute(
+            sql_text("""
+                SELECT DISTINCT topic
+                FROM topics
+                WHERE project_id = :project_id
+                AND topic IS NOT NULL
+            """),
+            {"project_id": project_id}
+        )
 
-        if not isinstance(topics, list):
-            topics = []
+        rows = result.fetchall()
 
-        # ======================
-        # CLEAN AND MERGE SIMILAR TOPICS
-        # ======================
-
-        cleaned = []
-        seen = set()
-
-        for t in topics:
-
-            base = t.lower()
-
-            # normalizzazione semplice
-            base = base.replace("pathway","")
-            base = base.replace("process","")
-            base = base.replace("mechanism","")
-            base = base.replace("regulation","")
-
-            base = base.strip()
-
-            if base not in seen:
-                seen.add(base)
-                cleaned.append(t)
-
-        topics = cleaned
-
-        # ======================
-        # COUNT TOPIC OCCURRENCES IN MATERIAL
-        # ======================
-
-        topic_counts = {}
-
-        full_text = context.lower()
-
-        for t in topics:
-
-            key = t.lower()
-
-            count = full_text.count(key)
-
-            topic_counts[key] = max(count,1)
-
-    except Exception as e:
-        print("TOPIC PARSE ERROR:", e)
-        print("RAW GPT OUTPUT:", content)
         topics = []
 
-    print("TOPICS GENERATED:", topics)
+        for r in rows:
+            topic_name = (r[0] or "").strip()
 
-    # ora aggiungiamo difficulty e suggerimenti
-    import random
+            if not topic_name:
+                continue
 
-    topics_with_stats = []
+            topics.append({
+                "topic": topic_name,
+                "difficulty": "medium",
+                "accuracy": 50,
+                "suggested_page": None
+            })
 
-    for t in topics:
+        return {"topics": topics}
 
-        accuracy_row = db.execute(
-            text("""
-                select avg(
-                    case when qa.is_correct then 1 else 0 end
+    finally:
+        db.close()
+
+@app.post("/projects/{project_id}/generate_topics")
+def generate_topics(
+        project_id: str,
+        user = Depends(verify_user)
+    ):
+        db = SessionLocal()
+
+        try:
+            print("START TOPICS GENERATION:", project_id)
+
+            rows = db.execute(
+                text("""
+                    SELECT chunk_text
+                    FROM chunks
+                    WHERE project_id = :project_id
+                    LIMIT 500
+                """),
+                {"project_id": project_id}
+            ).fetchall()
+
+            full_text = "\n\n".join([r[0] for r in rows if r[0]])
+
+            print("TEXT LENGTH:", len(full_text))
+
+            if not full_text.strip():
+                raise HTTPException(status_code=400, detail="No content")
+
+            prompt = f"""
+    Extract the MAIN academic topics.
+
+    RULES:
+    - Max 40 topics
+    - Academic names
+    - No duplicates
+    - Use ONLY topics explicitly present in the text
+
+    Return JSON:
+    {{ "topics": ["topic1","topic2"] }}
+
+    TEXT:
+    {full_text[:12000]}
+    """
+
+            print("CALLING GPT...")
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Return ONLY JSON."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+
+            content = response.choices[0].message.content.strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+
+            print("RAW GPT:", content[:500])
+
+            data_json = json.loads(content)
+            topics = data_json.get("topics", [])
+
+            print("TOPICS FOUND:", len(topics))
+
+            db.execute(
+                text("DELETE FROM topics WHERE project_id = :project_id"),
+                {"project_id": project_id}
+            )
+
+            seen = set()
+
+            for t in topics:
+                topic_name = (t or "").strip()
+
+                if not topic_name:
+                    continue
+
+                key = topic_name.lower()
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                db.execute(
+                    text("""
+                        INSERT INTO topics (project_id, topic)
+                        VALUES (:project_id, :topic)
+                    """),
+                    {
+                        "project_id": project_id,
+                        "topic": topic_name
+                    }
                 )
-                from quiz_answers qa
-                join quiz_questions qq on qa.question_id = qq.id
-                where qq.topic = :topic
-            """),
-            {"topic": t}
-        ).fetchone()
 
-        accuracy = accuracy_row[0] if accuracy_row and accuracy_row[0] is not None else 0.5
+            db.commit()
+
+            print("TOPICS SAVED")
+
+            return {
+                "status": "ok",
+                "topics_count": len(seen)
+            }
+
+        except Exception as e:
+            db.rollback()
+            print("TOPICS ERROR:", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+        finally:
+            db.close()        
+       
+        
 
 
-        if accuracy > 0.8:
-            difficulty = "easy"
-        elif accuracy > 0.5:
-            difficulty = "medium"
-        else:
-            difficulty = "hard"
-
-        base = t.lower().replace("pathway","").replace("process","").replace("mechanism","").replace("regulation","").strip()
-
-        topics_with_stats.append({
-            "topic": t,
-            "difficulty": difficulty,
-            "suggested_page": random.randint(1,300),
-            
-        })
-    db.close()
-    return {"topics": topics_with_stats}
 @app.get("/projects/{project_id}/quizzes")
 async def list_project_quizzes(
     project_id: str,
@@ -1474,6 +1678,44 @@ async def project_summary(
         "topics_count": topics_count or 0
     }
 
+@app.get("/projects/{project_id}/flashcards_detailed_stats")
+async def flashcards_detailed_stats(
+    project_id: str,
+    user = Depends(verify_user)
+):
+
+    db = SessionLocal()
+
+    rows = db.execute(
+        text("""
+            select
+                count(*) as total,
+                sum(case when is_correct = false then 1 else 0 end) as wrong,
+                sum(case when difficulty = 1 then 1 else 0 end) as hard,
+                sum(case when difficulty = 2 then 1 else 0 end) as correct,
+                sum(case when difficulty = 3 then 1 else 0 end) as easy
+            from flashcard_reviews
+            where project_id = :project_id
+            and user_id = :user_id
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user["id"]
+        }
+    ).fetchone()
+
+    db.close()
+
+    total = rows[0] or 1
+
+    return {
+        "total": total,
+        "wrong": rows[1] or 0,
+        "hard": rows[2] or 0,
+        "correct": rows[3] or 0,
+        "easy": rows[4] or 0,
+        "accuracy": round(((rows[3] + rows[4]) / total) * 100, 1)
+    }
 
 # ======================
 # PROJECT RESULTS
@@ -1703,105 +1945,133 @@ async def study_flashcards(project_id: str, limit: int = 20):
 
     return {"flashcards": cards}
 @app.post("/review_flashcard")
+
+
 async def review_flashcard(
-    req: dict,
+    req: dict = Body(...),
     user = Depends(verify_user)
 ):
 
     db = SessionLocal()
+    print("REVIEW_FLASHCARD req:", req)
+    print("REVIEW_FLASHCARD flashcard_id:", req.get("flashcard_id"))
+    print("REVIEW_FLASHCARD type:", type(req.get("flashcard_id")))
+    try:
 
-    difficulty = req.get("difficulty", 1)
-    flashcard_id = req.get("flashcard_id")
-    row = db.execute(
-        text("""
-            select next_review, last_review
-            from flashcards
-            where id = :flashcard_id
-        """),
-        {"flashcard_id": flashcard_id}
-    ).fetchone()
-    is_correct = req.get("is_correct", False)
+        difficulty = req.get("difficulty", 1)
+        try:
+            difficulty = int(difficulty)
+        except:
+            difficulty = 1
+        flashcard_id = req.get("flashcard_id")
+        if not flashcard_id:
+            raise HTTPException(status_code=400, detail="flashcard_id missing")
+        row = db.execute(
+            text("""
+                select next_review, last_review
+                from flashcards
+                where id = :flashcard_id
+            """),
+            {"flashcard_id": flashcard_id}
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Flashcard not found")
+        is_correct = req.get("is_correct", False)
 
-    from datetime import datetime, timedelta
+        from datetime import datetime, timedelta
 
-    now = datetime.utcnow()
+        now = datetime.utcnow()
 
-    # fallback
-    current_interval_days = 1
+        # fallback
+        current_interval_days = 1
 
-    if row and row[0] and row[1]:
-        delta = row[0] - row[1]
-        current_interval_days = max(1, delta.days)
+        if row and row[0] and row[1]:
+            delta = row[0] - row[1]
+            current_interval_days = max(1, delta.days)
 
-    # ======================
-    # SPACED REPETITION LOGIC
-    # ======================
+        # ======================
+        # SPACED REPETITION LOGIC
+        # ======================
 
-    if not is_correct:
-        new_interval_days = 1
+        if not is_correct:
+            new_interval_days = 1
 
-    elif difficulty == 1:
-        new_interval_days = max(1, current_interval_days // 2)
+        elif difficulty == 1:
+            new_interval_days = max(1, current_interval_days // 2)
 
-    elif difficulty == 2:
-        new_interval_days = current_interval_days + 1
+        elif difficulty == 2:
+            new_interval_days = current_interval_days + 1
 
-    elif difficulty == 3:
-        new_interval_days = current_interval_days * 2
+        elif difficulty == 3:
+            new_interval_days = current_interval_days * 2
 
-    else:
-        new_interval_days = current_interval_days + 3
+        else:
+            new_interval_days = current_interval_days + 3
 
-    next_review = now + timedelta(days=new_interval_days)
+        next_review = now + timedelta(days=new_interval_days)
 
-    db.execute(
-        text(f"""
-            update flashcards
-            set
-                difficulty = :difficulty,
-                last_review = now(),
-                next_review = now() + interval '{interval}'
-            where id = :flashcard_id
-        """),
-        {
-            "difficulty": difficulty,
-            "flashcard_id": flashcard_id
-        }
-    )
-
-    flashcard_row = db.execute(
-        text("""
-            select project_id, user_id
-            from flashcards
-            where id = :flashcard_id
-        """),
-        {
-            "flashcard_id": flashcard_id
-        }
-    ).fetchone()
-
-    if flashcard_row:
         db.execute(
             text("""
-                insert into flashcard_reviews
-                (flashcard_id, project_id, user_id, is_correct, difficulty, elapsed_seconds)
-                values
-                (:flashcard_id, :project_id, :user_id, :is_correct, :difficulty, :elapsed_seconds)
+                update flashcards
+                set
+                    difficulty = :difficulty,
+                    last_review = now(),
+                    next_review = now() + (:days || ' days')::interval
+                where id = :flashcard_id
             """),
             {
-                "flashcard_id": flashcard_id,
-                "project_id": flashcard_row[0],
-                "user_id": user["id"],
-                "is_correct": is_correct,
                 "difficulty": difficulty,
-                "elapsed_seconds": req.get("elapsed_seconds", 0)
+                "flashcard_id": flashcard_id,
+                "days": new_interval_days
             }
         )
 
-    db.commit()
-    db.close()
+        flashcard_row = db.execute(
+            text("""
+                select project_id, user_id
+                from flashcards
+                where id = :flashcard_id
+            """),
+            {
+                "flashcard_id": flashcard_id
+            }
+        ).fetchone()
 
-    return {"status": "ok"}
+        if flashcard_row:
+            db.execute(
+                text("""
+                    insert into flashcard_reviews
+                    (flashcard_id, project_id, user_id, is_correct, difficulty, elapsed_seconds)
+                    values
+                    (:flashcard_id, :project_id, :user_id, :is_correct, :difficulty, :elapsed_seconds)
+                """),
+                {
+                    "flashcard_id": flashcard_id,
+                    "project_id": flashcard_row[0],
+                    "user_id": user["id"],
+                    "is_correct": is_correct,
+                    "difficulty": difficulty,
+                    "elapsed_seconds": req.get("elapsed_seconds", 0)
+                }
+            )
+
+        db.commit()
+    
+
+        return {"status": "ok"}
+
+    
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        db.rollback()
+        print("ERROR review_flashcard:", e)
+        raise HTTPException(status_code=500, detail="Internal error")
+
+    finally:
+        db.close()
     
 
 @app.get("/projects/{project_id}/flashcard_results")
@@ -1916,45 +2186,74 @@ async def save_quiz_attempt(
 
     return {"status": "saved"}
 
+@app.get("/projects/{project_id}/quiz_attempts_summary")
+    
+async def quiz_attempts_summary(
+        project_id: str,
+        user = Depends(verify_user)
+    ):
+        print("QUIZ STATS CALLED", project_id)
+        db = SessionLocal()
+
+        rows = db.execute(
+            text("""
+                select 
+                    qa.quiz_id,
+                    count(*) as attempts,
+                    max(qa.score) as best_score,
+                    (
+                        select qa2.score
+                        from quiz_attempts qa2
+                        where qa2.quiz_id = qa.quiz_id
+                        and qa2.user_id = :user_id
+                        order by qa2.id desc
+                        limit 1
+                    ) as last_score
+                from quiz_attempts qa
+                join quizzes q on qa.quiz_id = q.id
+                where q.project_id = :project_id
+                and qa.user_id = :user_id
+                group by qa.quiz_id
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user["id"]
+            }
+        ).fetchall()
+
+        db.close()
+
+        result = {}
+
+        for r in rows:
+            result[r[0]] = {
+                "attempts": r[1],
+                "best_score": r[2],
+                "last_score": r[3]
+            }
+
+        return {"data": result}    
+
 @app.post("/ask")
 async def ask_documents(req: AskRequest):
+    chunks = search_project_chunks(
+        project_id=req.project_id,
+        query=req.question,
+        topics=req.topics,
+        k=12
+    )    
+    print("CHUNKS FOUND:", len(chunks))
+    if chunks:
+        print("SAMPLE CHUNK:", chunks[0]["text"][:200])
 
-    # 1️⃣ embedding della domanda
-    emb = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=f"medical concept explanation {req.question}"
-
-    )
-
-    query_embedding = emb.data[0].embedding
-
-
-    # 2️⃣ vector search sui chunks
-    db = SessionLocal()
-
-    rows = db.execute(
-        text("""
-            select chunk_text, doc_title, page
-            from chunks
-            where project_id = :project_id
-            order by embedding <-> CAST(:embedding AS vector)
-            limit 20
-        """),
-        {
-            "project_id": req.project_id,
-            "embedding": query_embedding
-        }
-    ).fetchall()
-    rows = rows[:12]
-    print("ROWS FOUND:", len(rows))
-    if rows:
-        print("SAMPLE CHUNK:", rows[0][0][:200])
-
-    db.close()
+    
 
     context_blocks = []
-    for r in rows:
-        context_blocks.append(f"DOCUMENT: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:400]}")
+
+    for c in chunks:
+        context_blocks.append(
+            f"DOCUMENT: {c['document']} | PAGE: {c['page']}\nCONTENT:\n{c['text'][:400]}"
+        )
 
 
     context = "\n\n---\n\n".join(context_blocks) 
@@ -1973,6 +2272,10 @@ Rules:
 - Only say that the documents do not contain enough information if the concept is completely absent.
 - Be helpful and explanatory, not overly strict.
 - When possible, mention the document and page.
+- Be concise
+- Avoid repeating the same concept
+- Use clear paragraphs
+- Use bullet points when useful
 
 Context:
 {context}
