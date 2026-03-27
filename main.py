@@ -1,1 +1,8 @@
-from fastapi import FastAPI\nfrom fastapi.middleware.cors import CORSMiddleware\n\napp = FastAPI()\n\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=[\n        "http://localhost:3000",\n        "https://quiz-ui-ruddy.vercel.app"\n    ],\n    allow_credentials=True,\n    allow_methods=["*"],\n    allow_headers=["*"]\n)\n\n# Rest of your code...\n
+# Other content of the main.py file above these lines
+# ...
+
+# CORS configuration
+allow_origins = ["http://localhost:3000", "https://quiz-ui-ruddy.vercel.app"]
+
+# Other content of the main.py file below these lines
+# ...
