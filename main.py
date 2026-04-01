@@ -2995,4 +2995,4 @@ def delete_document(
         db.close()
 
         return {"status": "deleted"}   
->>>>>>> dd10a9c (feat: add voice input + topic selector improvements)
+ 
