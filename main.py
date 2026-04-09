@@ -16,6 +16,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from pypdf import PdfReader
 import asyncio
+import time
 import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -1598,7 +1599,20 @@ def generate_topics(
         db = SessionLocal()
 
         try:
+            # Allow DB sync after ingest_stream completes
+            time.sleep(0.5)
+
             print("START TOPICS GENERATION:", project_id)
+
+            chunk_count = db.execute(
+                text("SELECT COUNT(*) FROM chunks WHERE project_id = :project_id"),
+                {"project_id": project_id}
+            ).scalar()
+
+            print("CHUNK COUNT:", chunk_count)
+
+            if not chunk_count:
+                raise HTTPException(status_code=400, detail="No chunks found for this project. Content may still be processing — please try again in a moment.")
 
             rows = db.execute(
                 text("""
@@ -1615,7 +1629,7 @@ def generate_topics(
             print("TEXT LENGTH:", len(full_text))
 
             if not full_text.strip():
-                raise HTTPException(status_code=400, detail="No content")
+                raise HTTPException(status_code=400, detail="No content found in chunks")
 
             prompt = f"""
     Extract the MAIN academic topics.
