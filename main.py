@@ -107,7 +107,7 @@ class QuizRequest(BaseModel):
     num_questions: int
     difficulty: str
     language: str
-
+    topics: Optional[List[str]] = []
 
 class IngestDocument(BaseModel):
     title: str
@@ -467,137 +467,111 @@ def ingest(
 
 def process_topics_task(project_id: str):
     db = SessionLocal()
-
     try:
         print("BACKGROUND TOPICS START:", project_id)
-
-        db.execute(
-            text("""
-                update projects
-                set topic_status = 'processing'
-                where id = :project_id
-            """),
-            {"project_id": project_id}
-        )
+        # 1. Update status and clear old topics
+        db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
+        db.execute(text("delete from topics where project_id = :project_id"), {"project_id": project_id})
         db.commit()
 
+        # Fetch chunks to analyze (up to 120 chunks)
         rows = db.execute(
-            text("""
-                select chunk_text
-                from chunks
-                where project_id = :project_id
-                limit 500
-            """),
+            text("select chunk_text from chunks where project_id = :project_id order by page asc limit 120"),
             {"project_id": project_id}
         ).fetchall()
 
-        full_text = "\n\n".join([r[0] for r in rows if r[0]])
+        all_text_chunks = [r[0] for r in rows if r[0]]
+        # Group chunks into batches of 20
+        chunk_groups = [all_text_chunks[i:i+20] for i in range(0, len(all_text_chunks), 20)]
+        
+        seen_titles = set()
 
-        print("BACKGROUND TEXT LENGTH:", len(full_text))
+        for group in chunk_groups:
+            group_text = "\n\n".join(group)
+            prompt = f"""
+            Analyze the following text and extract core concepts grouped by Category.
+            For each topic, provide a one-sentence definition.
 
-        if not full_text.strip():
-            db.execute(
-                text("""
-                    update projects
-                    set topic_status = 'error'
-                    where id = :project_id
-                """),
-                {"project_id": project_id}
-            )
-            db.commit()
-            print("BACKGROUND TOPICS ERROR: no content")
-            return
+            FORMAT RULES:
+            - Categories: Broad areas (e.g., 'Combat', 'Movement').
+            - Topics: Specific rules/entities (1-4 words).
+            - Description: A clear, concise one-sentence explanation.
+            - Format: Return ONLY valid JSON.
 
-        prompt = f"""
-Extract the MAIN academic topics.
+            JSON STRUCTURE:
+            {{
+              "categories": [
+                {{
+                  "name": "Category Name",
+                  "topics": [
+                    {{ "title": "Topic Name", "description": "Definition" }}
+                  ]
+                }}
+              ]
+            }}
 
-RULES:
-- Max 40 topics
-- Academic names
-- No duplicates
-- Use ONLY topics explicitly present in the text
+            CONTENT:
+            {group_text}
+            """
 
-Return JSON:
-{{ "topics": ["topic1","topic2"] }}
-
-TEXT:
-{full_text[:12000]}
-"""
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Return ONLY JSON."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        content = response.choices[0].message.content.strip()
-        content = content.replace("```json", "").replace("```", "").strip()
-
-        print("BACKGROUND RAW GPT:", content[:500])
-
-        data_json = json.loads(content)
-        topics = data_json.get("topics", [])
-
-        db.execute(
-            text("delete from topics where project_id = :project_id"),
-            {"project_id": project_id}
-        )
-
-        seen = set()
-
-        for t in topics:
-            topic_name = (t or "").strip()
-            if not topic_name:
-                continue
-
-            key = topic_name.lower()
-            if key in seen:
-                continue
-
-            seen.add(key)
-
-            db.execute(
-                text("""
-                    insert into topics (project_id, topic)
-                    values (:project_id, :topic)
-                """),
-                {
-                    "project_id": project_id,
-                    "topic": topic_name
-                }
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}]
             )
 
-        db.execute(
-            text("""
-                update projects
-                set topic_status = 'completed'
-                where id = :project_id
-            """),
-            {"project_id": project_id}
-        )
+            try:
+                # Clean and parse the JSON response
+                raw_content = response.choices[0].message.content
+                raw_content = raw_content.replace("```json", "").replace("```", "").strip()
+                data = json.loads(raw_content)
 
+                # Loop through categories and nested topics
+                for cat in data.get("categories", []):
+                    category_name = (cat.get("name") or "General").strip().title()
+                    
+                    for t_obj in cat.get("topics", []):
+                        topic_title = (t_obj.get("title") or "").strip()
+                        description = (t_obj.get("description") or "").strip()
+
+                        if not topic_title:
+                            continue
+
+                        # Clean CamelCase (e.g., TackleZones -> Tackle Zones)
+                        import re
+                        topic_title = re.sub(r'(?<!^)(?=[A-Z])', ' ', topic_title).title()
+
+                        if topic_title.lower() in seen_titles:
+                            continue
+                        seen_titles.add(topic_title.lower())
+
+                        db.execute(
+                            text("""
+                                insert into topics (project_id, category, topic, description)
+                                values (:project_id, :category, :topic, :description)
+                            """),
+                            {
+                                "project_id": project_id, 
+                                "category": category_name, 
+                                "topic": topic_title, 
+                                "description": description
+                            }
+                        )
+                db.commit() 
+
+            except Exception as e:
+                print(f"Error parsing JSON in chunk: {e}")
+                continue 
+
+        # 2. Final status update
+        db.execute(text("update projects set topic_status = 'completed' where id = :project_id"), {"project_id": project_id})
         db.commit()
-        print("BACKGROUND TOPICS SAVED:", len(seen))
+        print("TOPIC GENERATION COMPLETE")
 
     except Exception as e:
         db.rollback()
         print("BACKGROUND TOPICS ERROR:", e)
-
-        try:
-            db.execute(
-                text("""
-                    update projects
-                    set topic_status = 'error'
-                    where id = :project_id
-                """),
-                {"project_id": project_id}
-            )
-            db.commit()
-        except Exception as inner_e:
-            print("BACKGROUND STATUS UPDATE ERROR:", inner_e)
-
+        db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
+        db.commit()
     finally:
         db.close()
 
@@ -756,7 +730,7 @@ def generate_quiz(
             from chunks
             where project_id = :project_id
             order by embedding <-> CAST(:embedding AS vector)
-            limit 25
+            limit 40
         """),
         {
             "project_id": project_id,
@@ -910,6 +884,8 @@ class AskRequest(BaseModel):
     project_id: str
     question: str
     topics: Optional[List[str]] = []
+    history: list = []
+    expand_search: bool = False
 
 from typing import Optional
 
@@ -923,7 +899,34 @@ async def generate_quiz_stream(
     user = Depends(verify_user)
 ):
     user_id = user["id"]
+    db = SessionLocal()
+    
+    # 1. Create the Quiz ID and Database Record FIRST
+    quiz_id = str(uuid.uuid4())
+    try:
+        db.execute(
+            text("""
+                insert into quizzes (id, project_id, user_id, title, created_at)
+                values (:id, :project_id, :user_id, :title, now())
+            """),
+            {
+                "id": quiz_id,
+                "project_id": project_id,
+                "user_id": user_id,
+                "title": f"Quiz on {', '.join(req.topics) if req.topics else 'Study Material'}"
+            }
+        )
+        db.commit()
+    except Exception as e:
+        print(f"Database Error: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
     async def quiz_generator():
+        # 2. Yield the ID to the frontend first
+        yield f"ID:{quiz_id}\n"
+    
 
         db = SessionLocal()
 
@@ -1011,6 +1014,13 @@ async def generate_quiz_stream(
         IMPORTANT:
         Each question MUST focus on a COMPLETELY DIFFERENT concept.
 
+        CRITICAL INSTRUCTIONS FOR QUESTION VARIETY:
+        - NEVER start a question with "What is", "What are", or "Define".
+        - Focus on APPLICATION: Create scenarios where the user must apply a rule or concept.
+        - Focus on MECHANISMS: Ask "How does [X] affect [Y]?" or "In what sequence does [X] occur?"
+        - Focus on COMPARISON: "Which feature distinguishes [X] from [Y]?"
+        - Avoid trivial definitions; test for deep understanding and cause-effect relationships.
+
         CRITICAL:
         - Do NOT generate questions about the same topic even if phrased differently
         - Avoid paraphrasing the same concept
@@ -1035,6 +1045,9 @@ async def generate_quiz_stream(
         - Avoid generating questions about the same concept repeatedly
         - Each question must focus on a different part of the material
         - Avoid repeating the same question phrasing
+        - Return STRICT JSON ARRAY format.
+
+        
 
         Return STRICT JSON ARRAY like this:
 
@@ -1146,7 +1159,11 @@ async def generate_quiz_stream(
                 if len(unique_questions) >= req.num_questions:
                     break
 
-        return unique_questions[:req.num_questions]
+        for q in unique_questions[:req.num_questions]:
+            # Trasforma il dizionario in stringa JSON + a capo
+            yield json.dumps(q) + "\n"
+
+    return StreamingResponse(quiz_generator(), media_type="text/event-stream")
 
 
     questions = await quiz_generator()
@@ -1203,7 +1220,7 @@ async def generate_quiz_stream(
     db.close()
 
     return {
-        "quiz_id": quiz_id,
+        "quiz_id": str(uuid.uuid4()),
         "questions": questions
     }
 @app.post("/projects/{project_id}/generate_flashcards")
@@ -1526,40 +1543,31 @@ from sqlalchemy import text as sql_text
 
 @app.get("/projects/{project_id}/topics")
 async def get_topics(project_id: str):
-
     db = SessionLocal()
-
     try:
-
+        # We now select category, topic, and description
         result = db.execute(
             sql_text("""
-                SELECT DISTINCT topic
-                FROM topics
+                SELECT category, topic, description 
+                FROM topics 
                 WHERE project_id = :project_id
-                AND topic IS NOT NULL
-            """),
+                AND topic IS NOT NULL 
+                ORDER BY category ASC, topic ASC
+            """), 
             {"project_id": project_id}
         )
-
         rows = result.fetchall()
-
-        topics = []
-
-        for r in rows:
-            topic_name = (r[0] or "").strip()
-
-            if not topic_name:
-                continue
-
-            topics.append({
-                "topic": topic_name,
+        
+        # We format them into the structured object your UI needs
+        return {"topics": [
+            {
+                "category": r[0] or "General",
+                "topic": r[1],
+                "description": r[2] or "",
                 "difficulty": "medium",
-                "accuracy": 50,
-                "suggested_page": None
-            })
-
-        return {"topics": topics}
-
+                "accuracy": 50
+            } for r in rows
+        ]}
     finally:
         db.close()
 
@@ -1590,115 +1598,7 @@ def get_topic_status(
     finally:
         db.close()
 
-@app.post("/projects/{project_id}/generate_topics")
-def generate_topics(
-        project_id: str,
-        user = Depends(verify_user)
-    ):
-        db = SessionLocal()
-
-        try:
-            print("START TOPICS GENERATION:", project_id)
-
-            rows = db.execute(
-                text("""
-                    SELECT chunk_text
-                    FROM chunks
-                    WHERE project_id = :project_id
-                    LIMIT 500
-                """),
-                {"project_id": project_id}
-            ).fetchall()
-
-            full_text = "\n\n".join([r[0] for r in rows if r[0]])
-
-            print("TEXT LENGTH:", len(full_text))
-
-            if not full_text.strip():
-                raise HTTPException(status_code=400, detail="No content")
-
-            prompt = f"""
-    Extract the MAIN academic topics.
-
-    RULES:
-    - Max 40 topics
-    - Academic names
-    - No duplicates
-    - Use ONLY topics explicitly present in the text
-
-    Return JSON:
-    {{ "topics": ["topic1","topic2"] }}
-
-    TEXT:
-    {full_text[:12000]}
-    """
-
-            print("CALLING GPT...")
-
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Return ONLY JSON."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-
-            content = response.choices[0].message.content.strip()
-            content = content.replace("```json", "").replace("```", "").strip()
-
-            print("RAW GPT:", content[:500])
-
-            data_json = json.loads(content)
-            topics = data_json.get("topics", [])
-
-            print("TOPICS FOUND:", len(topics))
-
-            db.execute(
-                text("DELETE FROM topics WHERE project_id = :project_id"),
-                {"project_id": project_id}
-            )
-
-            seen = set()
-
-            for t in topics:
-                topic_name = (t or "").strip()
-
-                if not topic_name:
-                    continue
-
-                key = topic_name.lower()
-                if key in seen:
-                    continue
-
-                seen.add(key)
-
-                db.execute(
-                    text("""
-                        INSERT INTO topics (project_id, topic)
-                        VALUES (:project_id, :topic)
-                    """),
-                    {
-                        "project_id": project_id,
-                        "topic": topic_name
-                    }
-                )
-
-            db.commit()
-
-            print("TOPICS SAVED")
-
-            return {
-                "status": "ok",
-                "topics_count": len(seen)
-            }
-
-        except Exception as e:
-            db.rollback()
-            print("TOPICS ERROR:", e)
-            raise HTTPException(status_code=500, detail=str(e))
-
-        finally:
-            db.close()        
+      
        
         
 
@@ -2339,42 +2239,49 @@ async def get_quiz(quiz_id: str):
     return {"questions": questions}
 
 @app.post("/save_quiz_attempt")
-async def save_quiz_attempt(
-    req: dict,
-    user = Depends(verify_user)
-):
+async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
+    # --- FIX: Controllo validità quiz_id ---
+    quiz_id = req.get("quiz_id")
+    if not quiz_id or quiz_id == "":
+        # Se non c'è l'ID, non salviamo ma non facciamo crashare il server
+        return {"status": "error", "message": "quiz_id missing"}
 
     db = SessionLocal()
-
-    db.execute(
-        text("""
-            insert into quiz_attempts
-            (quiz_id, user_id, score, total_questions)
-            values
-            (:quiz_id, :user_id, :score, :total_questions)
-        """),
-        {
-            "quiz_id": req["quiz_id"],
-            "user_id": user["id"],
-            "score": req["score"],
-            "total_questions": req["total_questions"]
-        }
-    )
-
-    db.commit()
-    db.close()
+    try:
+        db.execute(
+            text("""
+                insert into quiz_attempts
+                (quiz_id, user_id, score, total_questions)
+                values
+                (:quiz_id, :user_id, :score, :total_questions)
+            """),
+            {
+                "quiz_id": quiz_id,
+                "user_id": user["id"],
+                "score": req.get("score", 0),
+                "total_questions": req.get("total_questions", 0)
+            }
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"Database Error: {e}")
+        return {"status": "error", "detail": str(e)}
+    finally:
+        db.close()
 
     return {"status": "saved"}
 
 @app.get("/projects/{project_id}/quiz_attempts_summary")
-    
-async def quiz_attempts_summary(
-        project_id: str,
-        user = Depends(verify_user)
-    ):
-        print("QUIZ STATS CALLED", project_id)
-        db = SessionLocal()
+async def quiz_attempts_summary(project_id: str, user = Depends(verify_user)):
+    # --- AGGIUNGI SOLO QUESTO CONTROLLO ---
+    if not project_id or project_id == "" or project_id == "undefined":
+        return {"data": {}}
+    # ---------------------------------------
 
+    db = SessionLocal()
+    try:
+        # Il resto del tuo codice rimane identico
         rows = db.execute(
             text("""
                 select 
@@ -2401,24 +2308,43 @@ async def quiz_attempts_summary(
             }
         ).fetchall()
 
-        db.close()
-
         result = {}
-
         for r in rows:
-            result[r[0]] = {
+            result[str(r[0])] = {
                 "attempts": r[1],
                 "best_score": r[2],
                 "last_score": r[3]
             }
-
-        return {"data": result}    
+        return {"data": result}
+    except Exception as e:
+        print(f"Errore stats: {e}")
+        return {"data": {}} # Protezione extra: se c'è un errore, ritorna dati vuoti
+    finally:
+        db.close()
 
 @app.post("/ask")
 async def ask_documents(req: AskRequest):
+    print("HISTORY RECEIVED:", req.history)
+
+    # 🔥 STEP 1 — COSTRUISCI SEARCH QUERY CON HISTORY
+    search_query = req.question
+
+    if req.history:
+        last_user_messages = [
+            m.get("content")
+            for m in req.history
+            if m.get("role") == "user"
+        ][-2:]
+
+        if last_user_messages:
+            search_query = " ".join(last_user_messages)
+
+    print("SEARCH QUERY:", search_query)
+
+    # 🔥 STEP 2 — USA search_query (NON req.question)
     chunks = search_project_chunks(
         project_id=req.project_id,
-        query=req.question,
+        query=search_query,   # 👈 QUESTA È LA MODIFICA CHIAVE
         topics=req.topics,
         k=12
     )    
@@ -2432,7 +2358,7 @@ async def ask_documents(req: AskRequest):
 
     for c in chunks:
         context_blocks.append(
-            f"DOCUMENT: {c['document']} | PAGE: {c['page']}\nCONTENT:\n{c['text'][:400]}"
+            f"DOCUMENT: {c['document']} | PAGE: {c['page']}\nCONTENT:\n{c['text'][:600]}"
         )
 
 
@@ -2440,31 +2366,66 @@ async def ask_documents(req: AskRequest):
     print("CONTEXT LENGTH:", len(context))
     # 3️⃣ costruzione contesto
     
+    history_text = ""
+
+    if req.history:
+        for msg in req.history:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if not content:
+                continue
+
+            if role == "user":
+                history_text += f"Student: {content}\n"
+            elif role == "assistant":
+                history_text += f"Tutor: {content}\n"
+
+    if getattr(req, 'expand_search', False):
+        instruction_mode = """
+        - You are in 'GLOBAL KNOWLEDGE' mode.
+        - Start from the provided Context, but if it's not enough or you can explain better, 
+          use your full AI knowledge base.
+        - Provide a rich, detailed, and helpful explanation.
+        """
+        current_temp = 0.6 # Più creativo
+    else:
+        instruction_mode = """
+        - You are in 'STRICT MODE'.
+        - Use ONLY the material provided in the Context.
+        - If the answer is not in the material, say: 'I'm sorry, I can't find this in your documents.'
+        - DO NOT use external knowledge.
+        """
+        current_temp = 0.1 # Più preciso e fedele al testo
 
     prompt = f"""
-You are an expert study tutor.
-You MUST answer using ONLY the material provided below.
-You MUST answer using the provided material.
+    You are an expert study tutor helping a student understand material deeply.
 
-Rules:
-- If the material contains relevant information, explain it clearly in your own words.
-- If the material contains partial information, use it to build the best possible explanation.
-- Only say that the documents do not contain enough information if the concept is completely absent.
-- Be helpful and explanatory, not overly strict.
-- When possible, mention the document and page.
-- Be concise
-- Avoid repeating the same concept
-- Use clear paragraphs
-- Use bullet points when useful
+    IMPORTANT:
+    - This is an ongoing conversation.
+    - The student may ask follow-up questions.
+    - You MUST use previous conversation context to refine and expand your answers.
+    - Do NOT restart explanations from scratch if the question is a follow-up.
+    - Stay focused on the SAME concept unless the student changes topic.
 
-Context:
-{context}
+    Rules:
+    - If relevant info exists, explain it clearly
+    - If partial, expand logically using the context
+    - Be precise and avoid generic answers
+    - When needed, connect the answer to previous messages
+    - Use clear paragraphs or bullet points
 
-Question:
-{req.question}
+    Context:
+    {context}
 
-Answer clearly for a student.
-"""
+    Conversation so far:
+    {history_text}
+
+    Current question:
+    {req.question}
+
+    Answer as a tutor helping the student progressively understand the topic.
+    """
 
 
     # 4️⃣ GPT
@@ -2476,11 +2437,7 @@ Answer clearly for a student.
         ]
     )
 
-    answer = response.choices[0].message.content
-
-    return {
-        "answer": answer
-    }
+    return {"answer": response.choices[0].message.content}
 
 
 
@@ -2659,16 +2616,46 @@ async def generate_recovery_flashcards(req: dict):
     db = SessionLocal()
 
     # prendi chunk random ma piccoli (focus)
-    rows = db.execute(
-        text("""
-            select chunk_text
-            from chunks
-            where project_id = :project_id
-            order by random()
-            limit 5
-        """),
-        {"project_id": project_id}
-    ).fetchall()
+    if topics and len(topics) > 0:
+        rows = db.execute(
+            text("""
+                select chunk_text
+                from chunks
+                where project_id = :project_id
+                and topic = :topic
+                order by random()
+                limit 5
+            """),
+            {
+                "project_id": project_id,
+                "topic": topics[0]
+            }
+        ).fetchall()
+
+        # fallback se non trova chunk con quel topic
+        if not rows:
+            rows = db.execute(
+                text("""
+                    select chunk_text
+                    from chunks
+                    where project_id = :project_id
+                    order by random()
+                    limit 5
+                """),
+                {"project_id": project_id}
+            ).fetchall()
+
+    else:
+        rows = db.execute(
+            text("""
+                select chunk_text
+                from chunks
+                where project_id = :project_id
+                order by random()
+                limit 5
+            """),
+            {"project_id": project_id}
+        ).fetchall()
 
     db.close()
 
@@ -2718,7 +2705,7 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
     history_text = "\n".join(req.history or [])
 
     prompt = f"""
-    You are a strict but supportive study tutor evaluating a student's answer.
+    You are a supportive study tutor evaluating a student's answer using semantic reasoning.
 
     Question:
     {req.question}
@@ -2730,37 +2717,25 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
     {req.student_answer}
 
     Evaluation rules:
-
-    - Determine if the student truly understood the concept
-    - Do NOT be overly permissive
-    - A vague or generic answer is NOT correct
-    - The answer must include the key idea of the concept
-    - Partial answers should be marked as "partial"
-    - Only mark "correct" if the core concept is clearly expressed
+    - CONCEPTUAL FOCUS: Identify the core concepts of a correct answer. If the student mentions a concept using synonyms or shorthand (e.g., "no more movement" instead of "cannot move anymore"), consider it PRESENT.
+    - MEANING OVER WORDING: Do not penalize the student for using different vocabulary. If the "Main Idea" is there, it is CORRECT.
+    - NO REDUNDANCY: Do NOT list a concept in the "missing" array if the student has already expressed it, even partially or briefly.
+    
 
     Scoring:
-
-    - correct → clear understanding, key concept present
-    - partial → some correct ideas but incomplete or unclear
-    - incorrect → wrong or missing core idea
-
-    Also:
-
-    - Identify if important parts are missing
-    - Detect incorrect claims if present
-    - Provide a short helpful feedback
-    - Provide a hint ONLY if the answer is not fully correct
+    - correct: Core concepts are present (even if brief or using synonyms).
+    - partial: Concept is understood but a CRITICAL, non-implied consequence is missing.
+    - incorrect: The core concept is missing or fundamentally wrong.
 
     Return ONLY JSON:
-
     {{
     "evaluation": "correct | partial | incorrect",
     "score": 0-1,
-    "feedback": "...",
-    "missing": ["..."],
+    "feedback": "Concise, supportive feedback. If they are right, tell them!",
+    "missing": ["Only list things truly not mentioned or implied"],
     "wrong_claims": ["..."],
     "hint": "...",
-    "explanation": "clear explanation of the concept"
+    "explanation": "Clear explanation of the concept"
     }}
     """
 
