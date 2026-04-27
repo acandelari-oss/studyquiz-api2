@@ -5,6 +5,7 @@ import io
 from typing import List, Optional
 import json
 import requests
+import random
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -22,6 +23,22 @@ from PIL import Image
 from urllib.parse import unquote
 from fastapi import HTTPException
 from fastapi import Body
+from typing import Optional, List
+import time
+import re
+
+def normalize_string(s: str) -> str:
+    if not s: return ""
+    # Sostituisce \xa0 (non-breaking space) con spazio normale
+    s = str(s).replace('\xa0', ' ')
+    # Riduce spazi multipli a uno solo
+    return re.sub(r'\s+', ' ', s).strip()
+
+class ActiveRecallRequest(BaseModel):
+    topics: Optional[List[str]] = None
+    index: int = 0
+
+print("✅ ActiveRecallRequest model loaded with topics")
 
 
 
@@ -35,6 +52,8 @@ pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
 # ======================
 
 load_dotenv()
+
+topic_index = 0
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
@@ -57,10 +76,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://quiz-ui-ruddy.vercel.app"
-    ],
+    allow_origins=["*"],  # in dev
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -108,6 +124,7 @@ class QuizRequest(BaseModel):
     difficulty: str
     language: str
     topics: Optional[List[str]] = []
+    topic: Optional[str] = None 
 
 class IngestDocument(BaseModel):
     title: str
@@ -429,6 +446,7 @@ def ingest(
                 print("CHUNKS CREATED:", len(chunks))
 
                 for chunk in chunks:
+                    clean_topic = normalize_string(doc.title) if doc.title else "General"
 
                     emb = client.embeddings.create(
                         model="text-embedding-3-small",
@@ -450,7 +468,8 @@ def ingest(
                             "doc_title": doc.title,
                             "chunk_text": chunk,
                             "embedding": embedding_str,
-                            "page": page_index + 1
+                            "page": page_index + 1,
+                            "topic": clean_topic
                         }
                     )
                     
@@ -536,24 +555,49 @@ def process_topics_task(project_id: str):
                         if not topic_title:
                             continue
 
-                        # Clean CamelCase (e.g., TackleZones -> Tackle Zones)
                         import re
                         topic_title = re.sub(r'(?<!^)(?=[A-Z])', ' ', topic_title).title()
+                        topic_title = normalize_string(topic_title)
 
-                        if topic_title.lower() in seen_titles:
+                        key = topic_title.lower().strip()
+                        if key in seen_titles:
                             continue
-                        seen_titles.add(topic_title.lower())
+                        seen_titles.add(key)
 
+                        print("➡️ TOPIC:", topic_title)
+
+                        # 🔥 EMBEDDING (QUI DEVE GIRARE)
+                        try:
+                            print("🔥 CREO EMBEDDING...")
+
+                            emb = client.embeddings.create(
+                                model="text-embedding-3-small",
+                                input=f"{topic_title}: {description}"
+                            )
+
+                            embedding = emb.data[0].embedding
+                            print("✅ EMBEDDING OK:", len(embedding))
+
+                            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+
+                        except Exception as e:
+                            print("❌ EMBEDDING ERROR:", e)
+                            continue
+
+                        # 🔥 INSERT
                         db.execute(
                             text("""
-                                insert into topics (project_id, category, topic, description)
-                                values (:project_id, :category, :topic, :description)
+                                insert into topics 
+                                (project_id, category, topic, description, embedding)
+                                values 
+                                (:project_id, :category, :topic, :description, CAST(:embedding AS vector))
                             """),
                             {
                                 "project_id": project_id, 
                                 "category": category_name, 
                                 "topic": topic_title, 
-                                "description": description
+                                "description": description,
+                                "embedding": embedding_str
                             }
                         )
                 db.commit() 
@@ -561,6 +605,8 @@ def process_topics_task(project_id: str):
             except Exception as e:
                 print(f"Error parsing JSON in chunk: {e}")
                 continue 
+                
+        assign_topics_to_chunks(project_id)
 
         # 2. Final status update
         db.execute(text("update projects set topic_status = 'completed' where id = :project_id"), {"project_id": project_id})
@@ -572,6 +618,42 @@ def process_topics_task(project_id: str):
         print("BACKGROUND TOPICS ERROR:", e)
         db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
         db.commit()
+    finally:
+        db.close()
+
+def assign_topics_to_chunks(project_id: str):
+    db = SessionLocal()
+
+    try:
+        print("🔗 START TOPIC ASSIGNMENT")
+
+        db.execute(text("""
+            update chunks c
+            set topic = sub.topic
+            from (
+                select
+                    c.id as chunk_id,
+                    t.topic,
+                    row_number() over (
+                        partition by c.id
+                        order by c.embedding <-> t.embedding
+                    ) as rn
+                from chunks c
+                join topics t
+                    on c.project_id = t.project_id
+                where c.project_id = :project_id
+            ) sub
+            where c.id = sub.chunk_id
+              and sub.rn = 1
+        """), {"project_id": project_id})
+
+        db.commit()
+        print("✅ TOPIC ASSIGNMENT DONE")
+
+    except Exception as e:
+        db.rollback()
+        print("❌ TOPIC ASSIGNMENT ERROR:", e)
+
     finally:
         db.close()
 
@@ -599,7 +681,27 @@ async def ingest_stream(
             db.commit()
 
             yield "Starting upload...\n"
+            
+            import re
 
+            def clean_text(text):
+                if not text:
+                    return ""
+
+                # separa parole attaccate tipo "TEAMBefore"
+                text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+
+                # separa numeri e lettere
+                text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
+                text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
+
+                # aggiunge spazio dopo punto
+                text = re.sub(r'\.(\w)', r'. \1', text)
+
+                # normalizza spazi
+                text = re.sub(r'\s+', ' ', text)
+
+                return text.strip()
             # ======================
             # SAVE CHUNKS
             # ======================
@@ -620,6 +722,8 @@ async def ingest_stream(
 
                     page_text = page.extract_text()
 
+                    page_text = clean_text(page_text)
+
                     if not page_text or not page_text.strip():
                         yield f"OCR page {page_index+1}\n"
                         page_text = ocr_pdf_page(pdf_bytes, page_index)
@@ -628,6 +732,7 @@ async def ingest_stream(
                             continue
 
                     chunks = chunk_text(page_text)
+                    chunks = [clean_text(c) for c in chunks]
                     chunks = [c for c in chunks if len(c) > 100]
 
                     yield f"{len(chunks)} chunks created\n"
@@ -645,23 +750,30 @@ async def ingest_stream(
                         embedding = emb.data[0].embedding
                         embedding_str = "[" + ",".join(map(str, embedding)) + "]"
 
+                        # --- AGGIUNGI QUI IL LOG DI DEBUG ---
+                        print(f"DEBUG: Processando chunk {i} per il documento: {doc.title}")
+                        if not doc.title:
+                            print("ATTENZIONE: doc.title è vuoto o None!")
+    # ------------------------------------
+
                         db.execute(
                             text("""
                                 insert into chunks
-                                (project_id, doc_title, chunk_text, embedding, page)
+                                (project_id, doc_title, chunk_text, embedding, page, topic)
                                 values
-                                (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
+                                (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page, :topic)
                             """),
                             {
                                 "project_id": project_id,
                                 "doc_title": doc.title,
                                 "chunk_text": chunk,
                                 "embedding": embedding_str,
-                                "page": page_index + 1
+                                "page": page_index + 1,      
+                                "topic": normalize_string(doc.title) if doc.title else "General"
                             }
                         )
-
-            db.commit()
+                        db.commit()
+                        print(f"CHUNK {i} SALVATO CON TOPIC: {doc.title}")
 
             
 
@@ -680,6 +792,48 @@ async def ingest_stream(
         media_type="text/plain"
     )
 
+def expand_topics_with_db(project_id, topics, db):
+    if not topics:
+        return []
+
+    expanded = []
+
+    try:
+        rows = db.execute(
+            text("""
+                select topic
+                from chunks
+                where project_id = :project_id
+                and topic is not null
+                group by topic
+                limit 50
+            """),
+            {
+                "project_id": project_id
+            }
+        ).fetchall()
+
+        all_topics = [normalize_string(row[0]) for row in rows]
+
+        for t in topics:
+            t_norm = normalize_string(t)
+
+            matches = [
+                topic for topic in all_topics
+                if t_norm.lower().replace("actions", "action") == topic.lower()
+            ]
+
+            print(f"🔎 AUTO-MATCH for '{t}' (norm: '{t_norm}'):", matches)
+
+            expanded.extend(matches)
+    except Exception as e:
+        print("❌ ERROR IN expand_topics_with_db:", e)
+        return topics
+
+    if not expanded:
+        return topics
+
+    return list(set(expanded))
 # ======================
 # GENERATE QUIZ
 # ======================
@@ -690,9 +844,23 @@ def generate_quiz(
     req: QuizRequest,
     user = Depends(verify_user)
 ):
+    # 🔥 PRINT 1 — INIZIO FUNZIONE
+    print("🔥 ENTER generate_quiz")
 
     user_id = user["id"]
     db = SessionLocal()
+
+    existing_questions = db.execute(
+        text("""
+            select question
+            from quiz_questions q
+            join quizzes z on q.quiz_id = z.id
+            where z.project_id = :project_id
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    existing_texts = set(q[0].strip().lower() for q in existing_questions)
 
     project = db.execute(
         text("""
@@ -715,167 +883,327 @@ def generate_quiz(
     # RETRIEVAL (UNA SOLA VOLTA)
     # ======================
 
-    print("START EMBEDDING")
+    print(f"DEBUG: Avvio generazione quiz per progetto {project_id}")
+    print("📥 TOPICS:", req.topics)
+    
+    # 1. RETRIEVAL POTENZIATO (120 chunk)
+    query_text = " ".join(req.topics) if req.topics else "General overview of the provided documents"
+    emb_res = client.embeddings.create(model="text-embedding-3-small", input=query_text)
+    query_embedding = emb_res.data[0].embedding
 
-    query_embedding = client.embeddings.create(
-        model="text-embedding-3-small",
-        input="generate study quiz questions"
-    ).data[0].embedding
+    rows = []
 
-    print("EMBEDDING DONE")
-
-    rows = db.execute(
+    # 🔥 prendiamo tutti i chunk una volta sola
+    all_rows = db.execute(
         text("""
-            select chunk_text, doc_title, page
-            from chunks
-            where project_id = :project_id
-            order by embedding <-> CAST(:embedding AS vector)
-            limit 40
+            SELECT id, chunk_text, doc_title, page, topic
+            FROM chunks
+            WHERE project_id = :project_id
         """),
-        {
-            "project_id": project_id,
-            "embedding": query_embedding
-        }
+        {"project_id": project_id}
     ).fetchall()
 
+    if req.topics:
+        normalized_targets = [normalize_string(t) for t in req.topics]
 
-    material_blocks = []
+        for r in all_rows:
+            topic_db = normalize_string(r[4])
 
-    for r in rows:
-        material_blocks.append(
-            f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0]}"
-        )
+            for target in normalized_targets:
+                if (
+                    topic_db == target
+                    or topic_db.startswith(target)
+                    or target.startswith(topic_db)
+                ):
+                    rows.append(r)
+                    break
 
+        # 🔥 rimuovi duplicati
+        rows = list({r[0]: r for r in rows}.values())
 
-    context = "\n\n---\n\n".join(material_blocks)
-    print("CONTEXT LENGTH:", len(context))
-    if len(context) < 100:
-        print("WARNING: context too small")
+        print("🎯 FILTERED QUIZ ROWS:", len(rows))
 
+        rows = rows[:30]
 
-    # ======================
-    # QUIZ GENERATION
-    # ======================
+    else:
+        print("🌍 GLOBAL QUIZ MODE (SAFE)")
 
-    quiz_results = []
-    used_concepts = []
+    if req.topics is None:
+        # 👉 SOLO per quiz da sidebar
+        rows = db.execute(
+            text("""
+                SELECT id, chunk_text, doc_title, page, topic
+                FROM chunks
+                WHERE project_id = :project_id
+                ORDER BY embedding <-> CAST(:embedding AS vector)
+                LIMIT 30
+            """),
+            {
+                "project_id": project_id,
+                "embedding": str(query_embedding)
+            }
+        ).fetchall()
+    else:
+        # 👉 fallback sicurezza (non dovrebbe mai succedere)
+        rows = all_rows[:30]
 
-    remaining = req.num_questions
-    batch_size = 20
+    # 🔍 DEBUG CHUNKS
+    for r in rows[:3]:
+        print("📄 SAMPLE CHUNK:", r[1][:200])
 
+    chunk_topic_map = {
+        str(r[0]): " ".join(str(r[4]).split()) 
+        for r in rows if r[4]
+    }
 
-    while remaining > 0:
+    if req.topics:
+        active_topics = [normalize_string(t) for t in req.topics]
+    else:
+        active_topics = list(set(
+            normalize_string(r[4]) for r in rows if r[4]
+        )) or ["General"]
 
-        n = min(batch_size, remaining)
-        print("CONTEXT LENGTH:", len(context))
-        
-        prompt = f"""
-You MUST use ONLY the material provided below.
+    # 4. Fallback se non ci sono topic
+    if not active_topics:
+        active_topics = ["General"]
 
-You are NOT allowed to use external knowledge.
-
-If the material does NOT contain enough information,
-return an empty JSON array: []
-
-Do NOT guess or invent information.
-
-If the answer cannot be found in the material, skip the question.
-
-Avoid generating questions similar to these already generated questions:
-{used_concepts}
-
-Material:
-{context}
-
-Generate {n} high-quality multiple choice questions.
-
-Difficulty: {req.difficulty}
-Language: {req.language}
-
-Questions must:
-- test understanding of mechanisms and cause-effect relationships
-- prefer application or reasoning questions over definitions
-- compare processes when possible
-- avoid trivial definition questions
-- cover different concepts from the material
-
-Each question must have EXACTLY 5 options.
-Distractors must be plausible and conceptually related to the topic.
-Avoid obviously wrong answers.
-Incorrect options should represent common misconceptions when possible.
-Avoid generating multiple questions about the same concept.
-
-Return STRICT JSON ARRAY like this:
-
-[
-{{
-"question": "...",
-"options": ["...","...","...","...","..."],
-"correct": "A",
-"topic": "...",
-"explanation": "...",
-"explanation_long": "...",
-"source_document": "...",
-"source_page": "..."
-}}
-]
-
-
-""" 
-        print("PROMPT SAMPLE:", prompt[:500])
-
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.3
-        )
-
-
-        content = response.choices[0].message.content.strip()
-        content = content.replace("```json", "").replace("```", "").strip()
-
-
-        parsed = []
-
-        try:
-            parsed = json.loads(content)
-
-            if isinstance(parsed, list):
-                quiz_results.extend(parsed)
-            else:
-                quiz_results.append(parsed)
-
-        except Exception as e:
-            print("JSON parse error:", e)
-            print(content)
-
-        for q in parsed:
-            used_concepts.append(q.get("question","")[:120])
-        used_concepts.append(content[:120])
-
-        remaining -= n
-
-
-   
-
-    seen = set()
-    unique_questions = []
-
-    for q in quiz_results:
-
-        text_q = q.get("question","").strip().lower()[:80]
-
-        if text_q not in seen:
-            seen.add(text_q)
-            unique_questions.append(q)
-
-    db.close()
-
-    return {"quiz": unique_questions}
-
+    print("🎯 ACTIVE TOPICS (CLEANED):", active_topics)
     
 
+    if not rows:
+        db.close()
+        return {"quiz": []}
+
+    context = "\n\n".join([
+        f"### CHUNK_ID: {r[0]} | TOPIC: {r[4]}\n{r[1]}"
+        for r in rows
+        if r[1] and r[4] and normalize_string(r[4]) in active_topics
+    ])
+
+    # 2. GENERAZIONE A BATCH (Garantisce 30 domande e qualità)
+    all_questions = []
+    seen_texts = set()
+    max_attempts = 6
+    target_count = req.num_questions if req.num_questions else 30
+
+    while len(all_questions) < target_count and max_attempts > 0:
+        max_attempts -= 1  # Decrementiamo qui una volta sola
+        remaining = target_count - len(all_questions)
+        batch_size = min(15, remaining) 
+        
+        print(f"DEBUG: Tentativo {6 - max_attempts}, domande rimanenti: {remaining}")
+
+        topics_str = ", ".join(active_topics)
+        avoid_str = ", ".join(list(existing_texts)[:20])
+
+        system_prompt = f"""
+        You are an academic researcher. Generate {batch_size} high-quality questions in {req.language}.
+        Available Topics: {topics_str}
+        Avoid these topics: {avoid_str}
+
+        STRICT RULES:
+        1. Use ONLY the provided material.
+        2. Professional tone.
+        3. Return ONLY valid JSON.
+        """
+
+        user_prompt = f"""
+        Material:
+        {context[:15000]}
+
+        Return EXACTLY this JSON structure:
+        {{
+          "questions": [
+            {{
+              "question": "The question text",
+              "options": ["A", "B", "C", "D", "E"],
+              "correct_answer": 0,
+              "topic": "Topic name",
+              "explanation": "Short explanation",
+              "chunk_id": "Must match the CHUNK_ID from the text"
+            }}
+          ]
+        }}
+        """
+
+        try:
+            # Rimuovi qualsiasi riga che faccia prompt = prompt.replace(...)
+            
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt}, # Usiamo system_prompt
+                    {"role": "user", "content": user_prompt}     # Usiamo user_prompt
+                ],
+                response_format={ "type": "json_object" }
+            )
+            
+            content = response.choices[0].message.content
+            print("🧠 GPT RAW:", content[:500])
+            
+            data = json.loads(content)
+            current_batch = data.get("questions", [])
+            
+            if isinstance(current_batch, list):
+                for q in current_batch:
+                    if len(all_questions) >= target_count:
+                        break
+
+                    txt = q.get("question", "").strip().lower()
+                    chunk_id = str(q.get("chunk_id", ""))
+
+                    if txt and txt not in seen_texts and txt not in existing_texts:
+                        seen_texts.add(txt)
+
+                        correct_val = q.get("correct_answer", q.get("correct", 0))
+                        
+                        # 2. Inseriamo ENTRAMBI i nomi campo per compatibilità totale
+                        q["correct_answer"] = correct_val
+                        q["correct"] = correct_val
+
+                        print("🧩 CHUNK ID:", chunk_id)
+                        print("🧩 TOPIC FROM MAP:", chunk_topic_map.get(chunk_id))
+                        print("🧠 TOPIC FROM GPT:", q.get("topic"))
+
+                        # 🔥 SINCRONIZZAZIONE TOPIC E CAMPI
+                        topic_from_db = chunk_topic_map.get(chunk_id)
+                        if topic_from_db:
+                            q["topic"] = topic_from_db
+                        else:
+                             # ❗ niente macro-topic → fallback neutro
+                            print("⚠️ FALLBACK USATO per chunk_id:", chunk_id)
+                            q["topic"] = "General"
+
+                        # Assicuriamoci che il campo per QuizView sia corretto
+                        # Se GPT ha generato 'correct', lo rinominiamo per il frontend
+                        if "correct" in q and "correct_answer" not in q:
+                            q["correct_answer"] = q["correct"]
+                        
+                        print("✅ FINAL TOPIC USATO:", q["topic"])
+                        all_questions.append(q)
+                        
+
+        except Exception as e:
+            print(f"❌ Errore nel batch: {e}")
+            continue
+
+    db.close()
+    quiz_id = str(uuid.uuid4())
+
+    db_save = SessionLocal()
+    try:
+        print("🔥 STO PER FARE INSERT QUIZ")
+
+        # ✅ INSERT QUIZ (UNA SOLA VOLTA)
+        db_save.execute(
+            text("""
+                insert into quizzes (id, project_id, user_id, created_at, num_questions, difficulty)
+                values (:id, :project_id, :user_id, now(), :num_questions, :difficulty)
+            """),
+            {
+                "id": quiz_id,
+                "project_id": project_id,
+                "user_id": user_id,
+                "num_questions": len(all_questions),
+                "difficulty": req.difficulty or "medium"
+            }
+        )
+
+        print("🔥 INSERT QUIZ ESEGUITO")
+
+        # ✅ ORA SALVI LE DOMANDE (CORRETTO)
+        print("🔥 INIZIO SALVATAGGIO DOMANDE")
+
+        for i, q in enumerate(all_questions):
+            print("👉 SALVO DOMANDA:", q["question"])
+
+            result = db_save.execute(
+                text("""
+                    insert into quiz_questions (
+                        quiz_id,
+                        question,
+                        correct_answer,
+                        options,
+                        topic,
+                        question_order
+                    )
+                    values (
+                        :quiz_id,
+                        :question,
+                        :correct_answer,
+                        :options,
+                        :topic,
+                        :question_order
+                    )
+                    returning id
+                """),
+                {
+                    "quiz_id": quiz_id,
+                    "question": q["question"],
+                    "correct_answer": q["correct_answer"],
+                    "options": json.dumps(q["options"]),
+                    "topic": q.get("topic"),
+                    "question_order": i
+                }
+            )
+
+            new_id = result.fetchone()[0]
+            q["id"] = str(new_id)   # 👈 QUESTO È IL FIX CRITICO
+        db_save.commit()
+        print("✅ COMMIT FATTO")
+
+    except Exception as e:
+        db_save.rollback()
+        print("❌ ERRORE SALVATAGGIO QUIZ:", e)
+
+    finally:
+        db_save.close()
+
+    return {
+        "quiz_id": quiz_id,
+        "questions": all_questions
+    }
+
+    
+@app.get("/projects/{project_id}/quiz_stats")
+def get_quiz_stats(project_id: str):
+
+    db = SessionLocal()
+
+    try:
+        result = db.execute(text("""
+            select 
+                quiz_id,
+                count(*) as attempts,
+                max(score) as best_score,
+                avg(score) as avg_score,
+                (
+                    select score 
+                    from quiz_attempts qa2
+                    where qa2.quiz_id = qa.quiz_id
+                    order by created_at desc
+                    limit 1
+                ) as last_score
+            from quiz_attempts qa
+            where project_id = :project_id
+            group by quiz_id
+        """), {"project_id": project_id})
+
+        rows = result.fetchall()
+
+        return [
+            {
+                "quiz_id": r.quiz_id,
+                "attempts": r.attempts,
+                "best_score": r.best_score,
+                "avg_score": r.avg_score,
+                "last_score": r.last_score
+            }
+            for r in rows
+        ]
+
+    finally:
+        db.close()
 
 
 
@@ -889,8 +1217,7 @@ class AskRequest(BaseModel):
 
 from typing import Optional
 
-class ActiveRecallRequest(BaseModel):
-    topic: Optional[str] = None
+
 
 @app.post("/projects/{project_id}/generate_quiz_stream")
 async def generate_quiz_stream(
@@ -969,6 +1296,10 @@ async def generate_quiz_stream(
             }
         ).fetchall()
 
+        chunk_topic_map = {r[0]: r[4] for r in rows if r[4]}
+
+        random.shuffle(rows)
+
         db.close()
 
         material_blocks = []
@@ -976,13 +1307,14 @@ async def generate_quiz_stream(
         for r in rows:
 
             text_chunk = r[0].lower()
+            chunk_topic = r[3] if (len(r) > 3 and r[3]) else r[1]
 
             if topics:
                 if not any(topic.lower() in text_chunk for topic in topics):
                     continue   # 🔥 SCARTA CHUNK NON RILEVANTI
 
             material_blocks.append(
-                f"FILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:500]}"
+                f"### TOPIC: {chunk_topic}\nFILE: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:500]}"
             )
         if len(material_blocks) == 0:
             print("⚠️ No topic match, fallback to full material")
@@ -1003,6 +1335,7 @@ async def generate_quiz_stream(
 
             prompt = f"""
         You MUST use ONLY the material provided below.
+        Each section starts with '### TOPIC: [Name]'.
 
         You are NOT allowed to use external knowledge.
 
@@ -1026,6 +1359,8 @@ async def generate_quiz_stream(
         - Avoid paraphrasing the same concept
         - Each question must test a UNIQUE concept
         - If you cannot find enough different concepts, generate fewer questions instead
+        Each question MUST include the CHUNK_ID it was generated from.
+        Use the CHUNK_ID from the chunk you used to generate the question.
 
         The quiz must cover as many different topics from the material as possible.
 
@@ -1049,29 +1384,35 @@ async def generate_quiz_stream(
 
         
 
-        Return STRICT JSON ARRAY like this:
+        Return a valid JSON object with this structure:
 
-        [
-        {{
-        "question": "...",
-        "options": ["...", "...", "...", "...", "..."],
-        "correct": "A",
-        "explanation": "Short explanation",
-        "explanation_long": "2-3 sentences maximum",
-        "source_document": "Exact file name",
-        "source_page": "Page number"
-        }}
+        {
+        "questions": [
+            {
+            "question": "...",
+            "options": ["...", "...", "...", "...", "..."],
+            "correct": 0,
+            "topic": "...",
+            "explanation": "Short explanation",
+            "explanation_long": "2-3 sentences maximum",
+            "source_document": "Exact file name",
+            "source_page": "Page number"
+            }
         ]
+        }
         """
 
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="gpt-4o-mini",
                 messages=[{"role":"user","content":prompt}],
-                temperature=0.3
+                temperature=0.7
             )
 
             content = response.choices[0].message.content.strip()
+
+            print("RAW RESPONSE:", content[:500])
+            
 
             try:
 
@@ -1121,108 +1462,76 @@ async def generate_quiz_stream(
 
         # REMOVE GLOBAL DUPLICATES
 
+        # --- 1. FILTRO DUPLICATI E PULIZIA ---
         seen_questions = set()
         unique_questions = []
 
         for q in questions:
-
-            text_q = q.get("question","").strip().lower()
-
-            # filtro più intelligente (prime parole)
+            text_q = q.get("question", "").strip().lower()
             key = " ".join(text_q.split()[:8])
-
-            if key in seen_questions:
-                continue
-
-            seen_questions.add(key)
-            unique_questions.append(q)
-
-        # FILL MISSING QUESTIONS
-        if len(unique_questions) < req.num_questions:
-
-            missing = req.num_questions - len(unique_questions)
-            print(f"Filling {missing} missing questions...")
-
-            extra = await generate_batch(missing)
-
-            for q in extra:
-
-                text_q = q.get("question","").strip().lower()
-                key = " ".join(text_q.split()[:8])
-
-                if key in seen_questions:
-                    continue
-
+            if key not in seen_questions:
                 seen_questions.add(key)
                 unique_questions.append(q)
 
+        # --- 2. GENERAZIONE DOMANDE MANCANTI ---
+        if len(unique_questions) < req.num_questions:
+            missing = req.num_questions - len(unique_questions)
+            extra = await generate_batch(missing)
+            for q in extra:
+                text_q = q.get("question", "").strip().lower()
+                key = " ".join(text_q.split()[:8])
+                if key not in seen_questions:
+                    seen_questions.add(key)
+                    unique_questions.append(q)
                 if len(unique_questions) >= req.num_questions:
                     break
 
-        for q in unique_questions[:req.num_questions]:
-            # Trasforma il dizionario in stringa JSON + a capo
+        # --- 3. SALVATAGGIO NEL DB E INVIO STREAM ---
+        for i, q in enumerate(unique_questions[:req.num_questions]):
+            correct_val = q.get("correct", q.get("correct_answer", 0))
+            q["correct"] = int(correct_val)
+            
+            topic_val = q.get("topic")
+            if not topic_val or topic_val == "...":
+                topic_val = topics[0] if topics else "General"
+            q["topic"] = topic_val
+
+            db_save = SessionLocal()
+            try:
+                db_save.execute(
+                    text("""
+                        insert into quiz_questions 
+                        (quiz_id, question_order, question, options, correct, explanation, explanation_long, source_document, source_page, topic)
+                        values 
+                        (:quiz_id, :order, :question, :options, :correct, :explanation, :explanation_long, :doc, :page, :topic)
+                    """),
+                    {
+                        "quiz_id": quiz_id,
+                        "order": i,
+                        "question": q.get("question"),
+                        "options": json.dumps(q.get("options")),
+                        "correct": q["correct"],
+                        "explanation": q.get("explanation"),
+                        "explanation_long": q.get("explanation_long"),
+                        "doc": q.get("source_document"),
+                        "page": q.get("source_page"),
+                        "topic": q["topic"]
+                    }
+                )
+                db_save.commit()
+            except Exception as e:
+                print(f"❌ Errore salvataggio domanda {i}: {e}")
+                db_save.rollback()
+            finally:
+                db_save.close()
+
             yield json.dumps(q) + "\n"
 
+    # <-- QUESTO RETURN CHIUDE IL quiz_generator (4 spazi di rientro)
+    # <-- QUESTO RETURN CHIUDE LA FUNZIONE PRINCIPALE (allineato a 'async def')
     return StreamingResponse(quiz_generator(), media_type="text/event-stream")
 
-
-    questions = await quiz_generator()
-
-    # ======================
-    # SAVE QUIZ
-    # ======================
-
-    quiz_id = str(uuid.uuid4())
-
-    db = SessionLocal()
-
-    db.execute(
-        text("""
-        insert into quizzes
-        (id, project_id, user_id, num_questions, difficulty, language)
-        values
-        (:id, :project_id, :user_id, :num_questions, :difficulty, :language)
-        """),
-        {
-            "id": quiz_id,
-            "project_id": project_id,
-            "user_id": user_id,
-            "num_questions": req.num_questions,
-            "difficulty": req.difficulty,
-            "language": req.language
-        }
-    )
-
-    for i, q in enumerate(questions):
-
-        db.execute(
-            text("""
-            insert into quiz_questions
-            (quiz_id, question_order, question, options, correct, explanation, explanation_long, source_document, source_page)
-            values
-            (:quiz_id, :order, :question, :options, :correct, :explanation, :explanation_long, :doc, :page)
-            """),
-            {
-                "quiz_id": quiz_id,
-                "order": i,
-                "question": q.get("question"),
-                "options": json.dumps(q.get("options")),
-                "correct": q.get("correct"),
-                "explanation": q.get("explanation"),
-                "explanation_long": q.get("explanation_long"),
-                "doc": q.get("source_document"),
-                "page": q.get("source_page"),
-                "topic": q.get("topic")
-            }
-        )
-
-    db.commit()
-    db.close()
-
-    return {
-        "quiz_id": str(uuid.uuid4()),
-        "questions": questions
-    }
+    
 @app.post("/projects/{project_id}/generate_flashcards")
 async def generate_flashcards(
     project_id: str,
@@ -1232,82 +1541,126 @@ async def generate_flashcards(
 
     num_cards = 10
     user_id = user["id"]
+
+    def normalize_topic(t):
+        return " ".join(str(t).split()).strip()
+
     topics = []
+    db = SessionLocal()
 
     if req and isinstance(req, dict):
         num_cards = req.get("num_cards", 10)
-        topics = req.get("topics", [])
+        raw_topics = req.get("topics", [])
+        topics = [normalize_topic(t) for t in raw_topics]
+        topics = [normalize_string(t) for t in raw_topics if t]
+        print("🎯 CLEAN TOPICS:", topics)
 
-    # recuperiamo contesto dal vector DB
-    query_text = " ".join(topics) if topics else "important concepts"
+        
 
-    # 🔥 COSTRUIAMO QUERY FORTE BASATA SUI TOPICS
+    print("🎯 NORMALIZED TOPICS:", topics)
+
+    
+    # 🔥 RETRIEVAL BILANCIATO PER TOPIC
+    
+
+    rows = []
+    seen_ids = set()
+
     if topics:
-        topic_query = " ".join(topics)
-        query_text = f"study material about {topic_query}"
+        per_topic_limit = max(4, (num_cards // max(len(topics), 1)) + 2)
+
+        rows = db.execute(
+            text("""
+                select id, chunk_text, doc_title, page, topic
+                from chunks
+                where project_id = :project_id
+                and (
+                    """ + " OR ".join([
+                        f"lower(topic) like :kw{i}" for i in range(len(topics))
+                    ]) + """
+                )
+                limit :limit
+            """),
+            {
+                "project_id": project_id,
+                "limit": num_cards * 4,
+                **{
+                    f"kw{i}": f"%{t.split()[0].lower()}%"
+                    for i, t in enumerate(topics)
+                }
+            }
+        ).fetchall()
+
     else:
-        query_text = "important study concepts"
+        emb = client.embeddings.create(
+            model="text-embedding-3-small",
+            input="important study concepts"
+        )
+        query_embedding = emb.data[0].embedding
 
-    # 🔥 RETRIEVAL PIÙ PRECISO (NO RANDOM)
-    db = SessionLocal()
+        rows = db.execute(
+            text("""
+                select id, chunk_text, doc_title, page, topic
+                from chunks
+                where project_id = :project_id
+                order by embedding <-> CAST(:embedding AS vector)
+                limit 12
+            """),
+            {
+                "project_id": project_id,
+                "embedding": query_embedding
+            }
+        ).fetchall()
 
-    emb = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=query_text
-    )
+    topic_counts = {}
+    for r in rows:
+        t = r[4] or "UNKNOWN"
+        topic_counts[t] = topic_counts.get(t, 0) + 1
 
-    query_embedding = emb.data[0].embedding
-
-    rows = db.execute(
-        text("""
-            select chunk_text, doc_title, page
-            from chunks
-            where project_id = :project_id
-            order by embedding <-> CAST(:embedding AS vector)
-            limit 12
-        """),
-        {
-            "project_id": project_id,
-            "embedding": query_embedding
-        }
-    ).fetchall()
+    print("🧠 FLASHCARD RETRIEVAL DISTRIBUTION:", topic_counts)
 
     db.close()
 
-    context_chunks = [
-        {
-            "text": r[0],
-            "document": r[1],
-            "page": r[2]
-        }
-        for r in rows
-    ]
-    
+    chunk_topic_map = {
+        str(r[0]): " ".join(str(r[4]).split())
+        for r in rows if r[4]
+    }
 
-    context_text = "\n\n".join([c["text"] for c in context_chunks])
+    context_text = "\n\n".join([
+        f"### CHUNK_ID: {r[0]} | TOPIC: {r[4]} | FILE: {r[2]} | PAGE: {r[3]}\n{r[1]}"
+        for r in rows if r[1]
+    ])
 
     prompt = f"""
     You MUST generate EXACTLY {num_cards} flashcards.
+
+    FOCUS TOPIC:
+    {", ".join(topics) if topics else "GENERAL"}
+
+    CRITICAL RULE (VERY IMPORTANT):
+    - Distribute flashcards across ALL provided topics
+    - Each topic MUST be covered
+    - Do NOT focus on only one topic
+
+
     You are a strict study tutor.
 
-    You MUST follow these rules:
-
+    STRICT RULES:
     - Use ONLY the provided material
     - DO NOT use external knowledge
-    - If information is missing → SKIP the card
+    - If information is missing, skip the card
     - Each flashcard must test ONE clear concept
-    - Each flashcard MUST include a "topic"
-    - The topic must be a specific concept explicitly present in the material
-    - Avoid generic or vague topics
+    - Each flashcard MUST include a valid chunk_id
+    - The chunk_id MUST match one CHUNK_ID from the material
+    - You are NOT allowed to invent chunk IDs
+    - Do NOT generate the topic yourself
+    - The topic will be assigned by the system from the chunk
     - Avoid generic or vague questions
     - Avoid repeating similar questions
     - Avoid simple definition-only questions when possible
     - Prefer cause-effect, mechanisms, reasoning
 
     Return EXACTLY {num_cards} items.
-
-    IMPORTANT:
-    Each flashcard must be DIFFERENT in concept.
 
     Return ONLY JSON:
 
@@ -1316,7 +1669,7 @@ async def generate_flashcards(
         "question": "...",
         "answer": "...",
         "concept": "...",
-        "topic": "...",
+        "chunk_id": "Must match the CHUNK_ID from the material",
         "difficulty": "easy | medium | hard"
     }}
     ]
@@ -1324,6 +1677,9 @@ async def generate_flashcards(
     Study material:
     {context_text}
     """
+
+    print("🎯 USING TOPIC:", topics)
+    print("🧠 CONTEXT PREVIEW:", context_text[:300])
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -1348,8 +1704,9 @@ async def generate_flashcards(
 
         for card in flashcards:
 
-            q = card.get("question","").strip().lower()
-            a = card.get("answer","").strip()
+            q = card.get("question", "").strip().lower()
+            a = card.get("answer", "").strip()
+            chunk_id = str(card.get("chunk_id", "")).strip()
 
             # filtri qualità base
             if len(q) < 10 or len(a) < 5:
@@ -1358,38 +1715,61 @@ async def generate_flashcards(
             if "what is" in q and len(a.split()) < 5:
                 continue
 
+            if chunk_id not in chunk_topic_map:
+                print("❌ INVALID CHUNK_ID:", chunk_id)
+                continue
+
+            topic_from_db = chunk_topic_map.get(chunk_id)
+            if not topic_from_db:
+                print("⚠️ NO TOPIC FOUND FOR CHUNK:", chunk_id)
+                continue
+
+            card["topic"] = topic_from_db
+
             if q not in seen:
                 seen.add(q)
                 unique_flashcards.append(card)
 
-        flashcards = unique_flashcards
-        flashcards = flashcards[:num_cards]
-
-        if not isinstance(flashcards, list):
-            flashcards = []
-
-        # 🔥 FORCE EXACT NUMBER
-        flashcards = flashcards[:num_cards]
+        flashcards = unique_flashcards[:num_cards]
 
         # 🔥 SE MANCANO → GENERA FINO A COMPLETARE
-        while len(flashcards) < num_cards:
+        attempt = 0
+        max_attempts = 3
+        while len(flashcards) < num_cards and attempt < max_attempts:
 
             missing = num_cards - len(flashcards)
 
             print(f"⚠️ Filling missing flashcards: {missing}")
 
             extra_prompt = f"""
-        Generate {missing} NEW flashcards.
+            Generate {missing} NEW flashcards.
 
-        Rules:
-        - Do NOT repeat previous concepts
-        - Avoid similar questions
-        - Be specific and concrete
-        - Use ONLY the material
+            STRICT RULES:
+            - Use ONLY the provided material
+            - DO NOT use external knowledge
+            - Each flashcard MUST include a valid chunk_id
+            - The chunk_id MUST match one CHUNK_ID from the material
+            - You are NOT allowed to invent chunk IDs
+            - Do NOT generate the topic yourself
+            - Avoid repeating previous concepts
+            - Avoid similar questions
+            - Be specific and concrete
 
-        Study material:
-        {context_text}
-        """
+            Return ONLY JSON:
+
+            [
+            {{
+                "question": "...",
+                "answer": "...",
+                "concept": "...",
+                "chunk_id": "Must match the CHUNK_ID from the material",
+                "difficulty": "easy | medium | hard"
+            }}
+            ]
+
+            Study material:
+            {context_text}
+            """
 
             extra_response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -1413,7 +1793,24 @@ async def generate_flashcards(
                 if len(flashcards) >= num_cards:
                     break
 
-                q = card.get("question","").strip().lower()
+                q = card.get("question", "").strip().lower()
+                a = card.get("answer", "").strip()
+                chunk_id = str(card.get("chunk_id", "")).strip()
+
+                # filtri qualità base
+                if len(q) < 10 or len(a) < 5:
+                    continue
+
+                if chunk_id not in chunk_topic_map:
+                    print("❌ INVALID CHUNK_ID (extra):", chunk_id)
+                    continue
+
+                topic_from_db = chunk_topic_map.get(chunk_id)
+                if not topic_from_db:
+                    print("⚠️ NO TOPIC FOUND FOR EXTRA CHUNK:", chunk_id)
+                    continue
+
+                card["topic"] = topic_from_db
 
                 if q not in seen:
                     seen.add(q)
@@ -1434,6 +1831,9 @@ async def generate_flashcards(
     db = SessionLocal()
 
     for card in flashcards:
+        if not card.get("topic"):
+            print("⚠️ FLASHCARD WITHOUT TOPIC SKIPPED:", card.get("question"))
+            continue
 
         result = db.execute(
             text("""
@@ -1448,7 +1848,7 @@ async def generate_flashcards(
                 "user_id": user_id,
                 "question": card.get("question"),
                 "answer": card.get("answer"),
-                "topic": card.get("topic") or card.get("concept")
+                "topic": card.get("topic")
             }
         )
 
@@ -1481,7 +1881,10 @@ def search_project_chunks(
 
     # DEBUG
     print("🔍 RETRIEVAL QUERY:", full_query)
-    print("🎯 TOPICS:", topics)
+    def normalize_topic(t):
+        return " ".join(str(t).split()).strip()
+
+    
 
     emb = client.embeddings.create(
         model="text-embedding-3-small",
@@ -1494,32 +1897,59 @@ def search_project_chunks(
     # VECTOR SEARCH + RANDOM MIX
     # ======================
 
-    rows = db.execute(
-        text("""
-            (
-                select chunk_text, doc_title, page
+    if topics:
+        rows = []
+
+        for topic in topics:
+            topic_norm = normalize_string(topic)
+            topic_keyword = topic_norm.split()[0] if topic_norm else ""
+
+            topic_rows = db.execute(
+                text("""
+                    select chunk_text, doc_title, page, topic
+                    from chunks
+                    where project_id = :project_id
+                    and (
+                        lower(topic) like :topic_keyword
+                        OR lower(chunk_text) like :topic_keyword
+                    )
+                    order by embedding <-> CAST(:embedding AS vector)
+                    limit :k_per_topic
+                """),
+                {
+                    "project_id": project_id,
+                    "topic_keyword": f"%{topic_keyword.lower()}%",
+                    "embedding": query_embedding,
+                    "k_per_topic": max(3, k // max(len(topics), 1))
+                }
+            ).fetchall()
+
+            print(f"📚 SEARCH_PROJECT_CHUNKS topic '{topic}' (keyword '{topic_keyword}') -> {len(topic_rows)} rows")
+
+            rows.extend(topic_rows)
+            unique = {}
+            for r in rows:
+                unique[r[0]] = r  # r[0] = id
+
+            rows = list(unique.values())
+            rows = rows[:15]
+    else:
+        rows = db.execute(
+            text("""
+                select chunk_text, doc_title, page, topic
                 from chunks
                 where project_id = :project_id
                 order by embedding <-> CAST(:embedding AS vector)
                 limit :k
-            )
-
-            union
-
-            (
-                select chunk_text, doc_title, page
-                from chunks
-                where project_id = :project_id
-                order by random()
-                limit :k
-            )
-        """),
-        {
-            "project_id": project_id,
-            "k": k,
-            "embedding": query_embedding
-        }
-    ).fetchall()
+            """),
+            {
+                "project_id": project_id,
+                "k": k,
+                "embedding": query_embedding
+            }
+        ).fetchall()
+       
+    
 
     db.close()
 
@@ -1529,14 +1959,28 @@ def search_project_chunks(
 
     chunks = []
 
+    def normalize(s):
+        return " ".join(str(s).lower().split())
+
+    chunks = []
+
     for r in rows:
+
+        text_chunk = r[0]
+        chunk_topic = r[3]
+
+        
+
         chunks.append({
-            "text": r[0],
+            "text": text_chunk,
             "document": r[1],
-            "page": r[2]
+            "page": r[2],
+            "topic": chunk_topic
         })
 
     print("📦 CHUNKS RETRIEVED:", len(chunks))
+    
+    
 
     return chunks[:k]
 from sqlalchemy import text as sql_text
@@ -1868,17 +2312,26 @@ async def project_results(
     topic_rows = db.execute(
         text("""
             select qq.topic,
-                   avg(case when qa.is_correct then 1 else 0 end) as accuracy
+                    sum(case when qa.is_correct then 1 else 0 end) as correct,
+                    count(*) as total
             from quiz_answers qa
             join quiz_questions qq on qa.question_id = qq.id
             join quizzes q on qq.quiz_id = q.id
             where q.project_id = :project_id
             group by qq.topic
         """),
+        
         {"project_id": project_id}
+    
     ).fetchall()
-
-    topic_mastery = []
+    print("🔥 ACCURACY DEBUG topic_rows :", topic_rows)
+    topic_mastery = {
+    r[0]: {
+        "correct": int(r[1]),
+        "total": int(r[2])
+    }
+    for r in topic_rows
+}
 
     for r in topic_rows:
         topic_mastery.append({
@@ -2242,6 +2695,7 @@ async def get_quiz(quiz_id: str):
 async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
     # --- FIX: Controllo validità quiz_id ---
     quiz_id = req.get("quiz_id")
+    project_id = req.get("project_id")
     if not quiz_id or quiz_id == "":
         # Se non c'è l'ID, non salviamo ma non facciamo crashare il server
         return {"status": "error", "message": "quiz_id missing"}
@@ -2251,17 +2705,32 @@ async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
         db.execute(
             text("""
                 insert into quiz_attempts
-                (quiz_id, user_id, score, total_questions)
+                (quiz_id, user_id, project_id, score, total_questions)
                 values
-                (:quiz_id, :user_id, :score, :total_questions)
+                (:quiz_id, :user_id, :project_id, :score, :total_questions)
             """),
             {
                 "quiz_id": quiz_id,
                 "user_id": user["id"],
+                "project_id": project_id,
                 "score": req.get("score", 0),
                 "total_questions": req.get("total_questions", 0)
             }
         )
+        answers = req.get("answers", [])
+
+        for a in answers:
+            db.execute(
+                text("""
+                    insert into quiz_answers (question_id, is_correct)
+                    values (:question_id, :is_correct)
+                """),
+                {
+                    "quiz_id": quiz_id,
+                    "question_id": a.get("question_id"),
+                    "is_correct": a.get("is_correct", False)
+                }
+            )
         db.commit()
     except Exception as e:
         db.rollback()
@@ -2441,44 +2910,53 @@ async def ask_documents(req: AskRequest):
 
 
 
+print("🔥 MODEL FIELDS:", ActiveRecallRequest.__fields__.keys())
+
+
+# main.py
+
+# main.py
 
 @app.post("/projects/{project_id}/active_recall_question")
-async def active_recall_question(
-    project_id: str,
-    req: ActiveRecallRequest,
-    user = Depends(verify_user)
-):
+async def active_recall_question(project_id: str, req: ActiveRecallRequest, user = Depends(verify_user)):
+    # 1. Normalizzazione stringhe (rimuoviamo ogni dubbio sugli spazi)
+    def super_clean(s):
+        return re.sub(r'\s+', ' ', str(s).replace('\xa0', ' ')).strip()
 
-    # embedding query
-    # ======================
-    # WEAK TOPIC PRIORITY
-    # ======================
+    topics = [super_clean(t) for t in req.topics if t]
+    
+    if not topics:
+        return {"question": "No topics available", "concept": "General"}
 
-    weak_topic = None
+    # 2. ROTAZIONE FORZATA
+    # Usiamo l'indice del frontend per pescare il topic
+    current_focus = topics[req.index % len(topics)]
+    
+    # Estraiamo la parola chiave (es. da "Block Actions" prendiamo "Block")
+    # Questo serve per il matching nel DB se il nome intero è corrotto
+    keyword = current_focus.split()[0] if current_focus else ""
 
     db = SessionLocal()
+    
+    # 🔥 PRENDI I TOPIC DAL FRONTEND
+    topics = req.topics or []
 
-    rows = db.execute(
-        text("""
-            select qq.topic,
-                avg(case when qa.is_correct then 1 else 0 end) as accuracy
-            from quiz_answers qa
-            join quiz_questions qq on qa.question_id = qq.id
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-            group by qq.topic
-            order by accuracy asc
-            limit 1
-        """),
-        {"project_id": project_id}
-    ).fetchone()
+    # 🔥 NORMALIZZA
+    topics = [normalize_string(t) for t in topics if t]
 
-    db.close()
+    # 🔥 ROTAZIONE
+    if topics:
+        current_focus = topics[req.index % len(topics)]
+    else:
+        current_focus = "General"
 
-    if rows and rows[0]:
-        weak_topic = rows[0]
+    # 🔥 KEYWORD SEMPLICE (prima parola)
+    keyword = current_focus.split(" ")[0]
 
-    query_text = weak_topic if weak_topic else "important study concepts"
+    print("🎯 CURRENT FOCUS:", current_focus)
+    print("🔑 KEYWORD:", keyword)
+ 
+    query_text = " ".join(req.topics) if req.topics else "general study content"
 
     emb = client.embeddings.create(
         model="text-embedding-3-small",
@@ -2487,118 +2965,91 @@ async def active_recall_question(
 
     query_embedding = emb.data[0].embedding
 
-    db = SessionLocal()
-
     rows = db.execute(
         text("""
-            (
-                select chunk_text, doc_title, page
-                from chunks
-                where project_id = :project_id
-                order by embedding <-> CAST(:embedding AS vector)
-                limit 4
+            SELECT chunk_text, doc_title, page, topic
+            FROM chunks
+            WHERE project_id = :project_id
+            AND (
+                topic ILIKE :full_focus             -- Esempio: %Block Actions%
+                OR topic ILIKE :keyword_focus       -- Esempio: %Block%
+                OR chunk_text ILIKE :keyword_focus  -- Cerca "Block" nel testo
             )
-
-            union
-
-            (
-                select chunk_text, doc_title, page
-                from chunks
-                where project_id = :project_id
-                order by random()
-                limit 8
-            )
+            ORDER BY embedding <-> CAST(:embedding AS vector)
+            LIMIT 12
         """),
         {
             "project_id": project_id,
+            "full_focus": f"%{current_focus}%",
+            "keyword_focus": f"%{keyword}%",
             "embedding": query_embedding
         }
     ).fetchall()
-
-    import random
-
-    rows = list(rows)
-    random.shuffle(rows)
-
-    # 🔥 PRENDI SOLO 5 CHUNK (invece di tutti)
-    rows = rows[:5]
-
     db.close()
 
-    context_blocks = []
+    # ... (il resto del codice per generare la risposta con GPT)
 
-    for r in rows:
-        context_blocks.append(
-            f"DOCUMENT: {r[1]} | PAGE: {r[2]}\nCONTENT:\n{r[0][:400]}"
-        )
+    if not rows:
+        return {"question": "No context found for this topic.", "concept": current_focus}
+
+    # 5. Prepariamo il contesto per GPT
+    random.shuffle(rows)
+    selected_rows = rows[:5]
+    
+    context_blocks = []
+    for r in selected_rows:
+        block = f"SOURCE: {r[1]} (Page {r[2]}) | TOPIC: {r[3]}\nCONTENT: {r[0]}"
+        context_blocks.append(block)
 
     context = "\n\n---\n\n".join(context_blocks)
 
+    # 6. Prompt ottimizzato per varietà e precisione
     prompt = f"""
-    You are a strict study tutor generating ACTIVE RECALL questions.
-
-    You MUST follow these rules:
-
-    - Use ONLY the provided material
-    - DO NOT use external knowledge
-    - If the material is unclear → ask a simpler question
-    - Ask ONLY ONE question
-    - The question must focus on ONE clear concept
-    - Avoid vague or generic questions
-    - Avoid simple definitions when possible
-    - Prefer "why", "how", "what happens if"
-
-    GOOD examples:
-    - Why does X lead to Y?
-    - How does X affect Y?
-    - What happens if X is disrupted?
-
-    BAD examples:
-    - What is X?
-    - Explain everything about X
-
-    Material:
+    You are a professional tutor specializing in the Active Recall method.
+    TARGET TOPIC: {current_focus}
+    
+    CONTEXT MATERIAL:
     {context}
 
-    IMPORTANT:
-    - Use ONLY the information explicitly written above
-    - Do NOT infer missing details
-    - Do NOT add knowledge not present in the text
-    - If unsure, ask a simpler question based strictly on the text
+    STRICT RULES:
+    1. Focus ONLY on "{current_focus}".
+    2. Generate an open-ended question that requires reasoning (e.g., "How does...", "Why...", "What is the relationship...").
+    3. Avoid simple "What is X?" definitions.
+    4. Use ONLY the provided context.
+    5. The response MUST be a valid JSON object.
+    6. Language: English.
 
-    Difficulty rules:
-    - easy → direct recall from text
-    - medium → requires explanation or connection
-    - hard → requires reasoning or implications
-
-    Return ONLY JSON:
-
+    JSON FORMAT:
     {{
     "question": "...",
-    "concept": "...",
-    "difficulty": "easy | medium | hard",
+    "concept": "{current_focus}",
+    "difficulty": "medium",
     "source_document": "...",
     "source_page": "..."
     }}
     """
 
+    # 7. Chiamata a OpenAI con parametri di varietà (Temperature e Penalty)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.4,
         messages=[
-            {"role": "system", "content": "You generate active recall questions."},
-            {"role": "user", "content": prompt}
-        ]
+            {"role": "system", "content": "You generate unique active recall questions. Never repeat the same question structure twice."},
+            {"role": "user", "content": f"{prompt}\n\nSeed for variety: {time.time()}"}
+        ],
+        temperature=0.9,       # Aumenta la creatività
+        presence_penalty=0.6,  # Evita di ripetere gli stessi concetti
+        frequency_penalty=0.3, # Evita di usare le stesse parole
+        response_format={ "type": "json_object" }
     )
 
     content = response.choices[0].message.content.strip()
-    content = content.replace("```json","").replace("```","").strip()
-
+    
     try:
         data = json.loads(content)
     except:
-        data = {"question": "Explain an important concept from the material."}
-
+        # Fallback in caso di errore JSON
+        data = {"question": f"Explain a key mechanism of {current_focus} based on the text.", "concept": current_focus}
+    
     return data
 
 from typing import Optional
@@ -2610,8 +3061,13 @@ class ActiveRecallEvaluateRequest(BaseModel):
 
 @app.post("/generate_recovery_flashcards")
 async def generate_recovery_flashcards(req: dict):
+    data = req if isinstance(req, dict) else await req.json()
 
-    project_id = req.get("project_id")
+    topics = data.get("topics", [])
+
+    project_id = data.get("project_id")
+
+    print("🧠 RECOVERY TOPICS:", topics)
 
     db = SessionLocal()
 
@@ -2770,8 +3226,31 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
 @app.get("/projects/{project_id}/study_session")
 async def study_session(
     project_id: str,
+    topics: str = None,
     user = Depends(verify_user)
 ):
+    
+    def normalize(t):
+        return t.lower().replace(" ", "")
+
+    topics_list = [t.strip() for t in topics.split(",")] if topics else []
+
+    print("🎯 RAW TOPICS:", topics_list)
+
+    print("🚨 RAW TOPICS STRING:", topics)
+
+    topics_list = topics.split(",") if topics else []
+
+    print("🎯 TOPICS LIST:", topics_list)
+
+    # 🔥 fallback per compatibilità col codice esistente
+    topic = topics_list[0] if topics_list else None
+
+    # 🔥 NORMALIZZA
+    topics_list = list(set(topics_list))
+
+    print("🎯 CLEAN TOPICS:", topics_list)
+   
     db = SessionLocal()
 
     # ======================
@@ -2780,8 +3259,11 @@ async def study_session(
 
     weak_topic_rows = db.execute(
         text("""
-            select qq.topic,
-                avg(case when qa.is_correct then 1 else 0 end) as accuracy
+            select 
+                qq.topic,
+                sum(case when qa.is_correct then 1 else 0 end) as correct,
+                count(*) as total,
+                sum(case when qa.is_correct then 1 else 0 end)::float / count(*) as accuracy
             from quiz_answers qa
             join quiz_questions qq on qa.question_id = qq.id
             join quizzes q on qq.quiz_id = q.id
@@ -2792,19 +3274,61 @@ async def study_session(
         """),
         {"project_id": project_id}
     ).fetchall()
-
+    print("🔥 WEAK DEBUG topic_rows:", weak_topic_rows)
     weak_topics = [r[0] for r in weak_topic_rows if r[0]]
 
     # ======================
     # GENERATE FLASHCARDS
     # ======================
 
-    context_chunks = search_project_chunks(project_id, k=20)
-    context_text = "\n\n".join([c["text"][:400] for c in context_chunks])
+    context_chunks = search_project_chunks(
+        project_id=project_id,
+        topics=topics_list if len(topics_list) > 0 else None,
+        k=20
+    )
+
+    # 🔥 fallback se pochi chunk
+    if not context_chunks:
+        print("⚠️ NO CHUNKS FOUND → fallback")
+        context_chunks = search_project_chunks(
+            project_id=project_id,
+            k=20
+        )
+
+    # 🔥 funzione per pulire topic
+    def clean(t):
+        return " ".join(t.split()) if t else t
+
+    # 🔥 estrai topic dai chunk
+    chunk_topics = list(dict.fromkeys([
+        clean(c.get("topic")) for c in context_chunks if c.get("topic")
+    ]))
+
+    context_blocks = []
+
+    for c in context_chunks:
+        context_blocks.append(f"""
+    TOPIC: {c.get("topic")}
+
+    CONTENT:
+    {c.get("text", "")[:400]}
+    """)
+
+    context_text = "\n\n---\n\n".join(context_blocks)
     weak_topics_text = ", ".join(weak_topics) if weak_topics else "important concepts"
 
     prompt = f"""
     You are a strict study tutor generating flashcards for a focused study session.
+
+    FOCUS TOPIC:
+    {", ".join(topics_list) if topics_list else "GENERAL"}
+
+    CRITICAL RULE:
+    - "You MUST generate flashcards ONLY about these topics: \"{", ".join(topics_list) if topics_list else "GENERAL"}\""
+    Each flashcard MUST include the topic it comes from.
+    The topic MUST be exactly one of the topics written in the material.
+    - Even if other topics appear, IGNORE them
+    - If a chunk is not related to this topic, DO NOT use it
     Generate EXACTLY 15 flashcards.
     Focus especially on these weak topics:
     {weak_topics_text}
@@ -2829,6 +3353,7 @@ async def study_session(
     {{
         "question": "...",
         "answer": "..."
+        "topic": "..."
     }}
     ]
 
@@ -2850,9 +3375,25 @@ async def study_session(
 
     try:
         generated_cards = json.loads(content)
+
         if not isinstance(generated_cards, list):
             generated_cards = []
-    except:
+
+        seen = set()
+        unique_cards = []
+
+        for c in generated_cards:
+            q = c.get("question", "").strip().lower()
+
+            if q and q not in seen:
+                seen.add(q)
+                unique_cards.append(c)
+
+        generated_cards = unique_cards[:15]
+
+    except Exception as e:
+        print("❌ STUDY SESSION FLASHCARDS JSON ERROR:", e)
+        print("RAW GPT OUTPUT:", content)
         generated_cards = []
     
     if not isinstance(generated_cards, list):
@@ -2863,28 +3404,32 @@ async def study_session(
     for c in generated_cards:
 
         flashcard_id = str(uuid.uuid4())
+        assigned_topic = chunk_topics[len(flashcards) % len(chunk_topics)] if chunk_topics else topic
 
         db.execute(
             text("""
                 insert into flashcards
-                (id, project_id, user_id, question, answer)
+                (id, project_id, user_id, question, answer, topic)
                 values
-                (:id, :project_id, :user_id, :question, :answer)
+                (:id, :project_id, :user_id, :question, :answer, :topic)
             """),
             {
                 "id": flashcard_id,
                 "project_id": project_id,
                 "user_id": user["id"],
                 "question": c.get("question"),
-                "answer": c.get("answer")
+                "answer": c.get("answer"),
+                "topic": assigned_topic
             }
         )
 
         flashcards.append({
             "id": flashcard_id,
             "question": c.get("question"),
-            "answer": c.get("answer")
+            "answer": c.get("answer"),
+            "topic": assigned_topic
         })
+        print("🧠 FINAL FLASHCARD TOPICS:", [f["topic"] for f in flashcards])
     db.commit()
 
     # ======================
