@@ -365,9 +365,15 @@ def chunk_text(text, max_chars=1000, overlap=200):
 
         if len(p) > max_chars:
 
-            for i in range(0, len(p), max_chars):
-                sub = p[i:i+max_chars]
-                chunks.append(sub)
+            start = 0
+
+            while start < len(p):
+                end = start + max_chars
+                sub = p[start:end]
+
+                chunks.append(sub.strip())
+
+                start += max_chars - overlap
 
             continue
 
@@ -379,11 +385,12 @@ def chunk_text(text, max_chars=1000, overlap=200):
 
             chunks.append(current_chunk.strip())
 
-            current_chunk = current_chunk[-overlap:] + "\n\n" + p
+            overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+            current_chunk = overlap_text + "\n\n" + p
 
     if current_chunk:
         chunks.append(current_chunk.strip())
-
+    print("📄 TOTAL CHUNKS:", len(chunks))
     return chunks
 
 # ======================
@@ -923,7 +930,10 @@ def generate_quiz(
 
         print("🎯 FILTERED QUIZ ROWS:", len(rows))
 
-        rows = rows[:30]
+        import random
+        random.shuffle(rows)
+
+        rows = rows[:min(len(rows), 80)]
 
     else:
         print("🌍 GLOBAL QUIZ MODE (SAFE)")
@@ -945,7 +955,9 @@ def generate_quiz(
         ).fetchall()
     else:
         # 👉 fallback sicurezza (non dovrebbe mai succedere)
-        rows = all_rows[:30]
+        import random
+        random.shuffle(all_rows)
+        rows = all_rows[:min(len(all_rows), 80)]
 
     # 🔍 DEBUG CHUNKS
     for r in rows[:3]:
@@ -974,11 +986,7 @@ def generate_quiz(
         db.close()
         return {"quiz": []}
 
-    context = "\n\n".join([
-        f"### CHUNK_ID: {r[0]} | TOPIC: {r[4]}\n{r[1]}"
-        for r in rows
-        if r[1] and r[4] and normalize_string(r[4]) in active_topics
-    ])
+    
 
     # 2. GENERAZIONE A BATCH (Garantisce 30 domande e qualità)
     all_questions = []
@@ -987,6 +995,21 @@ def generate_quiz(
     target_count = req.num_questions if req.num_questions else 30
 
     while len(all_questions) < target_count and max_attempts > 0:
+        import random
+
+        # 🔥 scegli chunk diversi ogni volta
+        valid_rows = [
+            r for r in rows
+            if r[1] and r[4] and normalize_string(r[4]) in active_topics
+        ]
+
+        sample_size = min(15, len(valid_rows))
+        sampled_rows = random.sample(valid_rows, sample_size)
+
+        context = "\n\n".join([
+            f"### CHUNK_ID: {r[0]} | TOPIC: {r[4]}\n{r[1]}"
+            for r in sampled_rows
+        ])
         max_attempts -= 1  # Decrementiamo qui una volta sola
         remaining = target_count - len(all_questions)
         batch_size = min(15, remaining) 
@@ -1359,8 +1382,14 @@ async def generate_quiz_stream(
         - Avoid paraphrasing the same concept
         - Each question must test a UNIQUE concept
         - If you cannot find enough different concepts, generate fewer questions instead
-        Each question MUST include the CHUNK_ID it was generated from.
-        Use the CHUNK_ID from the chunk you used to generate the question.
+        - Each question MUST include the CHUNK_ID it was generated from.
+        - Use the CHUNK_ID from the chunk you used to generate the question.
+        - Each question must be based on a DIFFERENT part of the material.
+        - Do NOT repeat questions or concepts.
+        - Exactly ONE answer must be correct.
+        - All other options must be clearly incorrect.
+        - Do NOT use "All of the above".
+        - All answer options must be relevant to the question.
 
         The quiz must cover as many different topics from the material as possible.
 
