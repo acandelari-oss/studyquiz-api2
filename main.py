@@ -517,36 +517,46 @@ def process_topics_task(project_id: str):
             
             # UNIVERSAL PROMPT: Works for any discipline (Medicine, Law, Engineering, etc.)
             prompt = f"""
-            Act as a specialist in instructional design and knowledge organization. 
-            Analyze the provided text and extract its core conceptual structure.
+            Act as a specialist in Instructional Design and Knowledge Organization. 
+            Analyze the provided text to extract its fundamental conceptual hierarchy.
             
             GOAL:
-            Organize the information into a clear hierarchy of Macro-Categories and specific Topics to facilitate student learning.
+            Organize the information into a logical structure of Macro-Categories and specific Topics to facilitate academic study.
             
             STRICT RULES:
-            1. CATEGORY: Identify the broad domain or chapter heading (e.g., 'CONSTITUTIONAL LAW', 'MACROECONOMICS', 'ORGANIC CHEMISTRY'). Use UPPERCASE.
-            2. TOPIC: The specific concept, rule, entity, or theory (e.g., 'Article 13', 'Supply and Demand', 'Alkanes').
-            3. DESCRIPTION: Provide a precise, academic definition. Focus on the 'what' and 'why' (max 200 characters).
-            4. COVERAGE: Exhaustively extract all significant terms. Do not leave gaps in the material.
+            1. CATEGORY: Identify the primary organizational unit or domain of the text.
+            - Medicine: Use anatomical regions or systems (e.g., 'NECK ANATOMY', 'DIGESTIVE SYSTEM').
+            - Sciences: Use branches or chemical groups (e.g., 'INORGANIC CHEMISTRY', 'THERMODYNAMICS').
+            - Law: Use codes, areas, or legal entities (e.g., 'CIVIL LAW', 'CONTRACTS').
+            - General: Use major chapter themes.
+            - ALWAYS USE UPPERCASE for categories.
             
+            2. TOPIC: The specific concept, entity, rule, or theory (1-4 words).
+            
+            3. DESCRIPTION: Provide a dense, academic, and precise definition. Focus on 'What it is' and 'Its primary function or rule' (max 200 characters).
+            
+            4. COVERAGE: Exhaustively extract all technical terms. Do not skip any significant educational content.
+            
+            5. NO MICRO-CATEGORIES: Do not create a category for a single topic. Group related topics under a broader, logical Macro-Category.
+
             FORMAT RULES:
             - Return ONLY valid JSON.[cite: 2]
-            - Importance: Rate 1-10 based on how central the concept is to the overall subject.[cite: 2]
+            - Importance: Rate 1-10 based on how fundamental the concept is to the subject.[cite: 2]
 
             JSON STRUCTURE:
             {{
-              "categories": [
+            "categories": [
                 {{
-                  "name": "CATEGORY NAME",
-                  "topics": [
+                "name": "CATEGORY NAME",
+                "topics": [
                     {{ 
-                      "title": "Topic Name", 
-                      "description": "Clear academic definition", 
-                      "importance": 7 
+                    "title": "Topic Name", 
+                    "description": "Clear academic definition", 
+                    "importance": 7 
                     }}
-                  ]
+                ]
                 }}
-              ]
+            ]
             }}
 
             CONTENT TO ANALYZE:
