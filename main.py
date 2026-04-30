@@ -502,7 +502,7 @@ def process_topics_task(project_id: str):
 
         # Fetch chunks to analyze (up to 120 chunks)
         rows = db.execute(
-            text("select chunk_text from chunks where project_id = :project_id order by page asc limit 120"),
+            text("select chunk_text from chunks where project_id = :project_id order by page asc limit 1000"),
             {"project_id": project_id}
         ).fetchall()
 
@@ -514,84 +514,109 @@ def process_topics_task(project_id: str):
 
         for group in chunk_groups:
             group_text = "\n\n".join(group)
+            
+            # UNIVERSAL PROMPT: Works for any discipline (Medicine, Law, Engineering, etc.)
             prompt = f"""
-            Analyze the following text and extract core concepts grouped by Category.
-            For each topic, provide a one-sentence definition.
-
+            Act as a specialist in instructional design and knowledge organization. 
+            Analyze the provided text and extract its core conceptual structure.
+            
+            GOAL:
+            Organize the information into a clear hierarchy of Macro-Categories and specific Topics to facilitate student learning.
+            
+            STRICT RULES:
+            1. CATEGORY: Identify the broad domain or chapter heading (e.g., 'CONSTITUTIONAL LAW', 'MACROECONOMICS', 'ORGANIC CHEMISTRY'). Use UPPERCASE.
+            2. TOPIC: The specific concept, rule, entity, or theory (e.g., 'Article 13', 'Supply and Demand', 'Alkanes').
+            3. DESCRIPTION: Provide a precise, academic definition. Focus on the 'what' and 'why' (max 200 characters).
+            4. COVERAGE: Exhaustively extract all significant terms. Do not leave gaps in the material.
+            
             FORMAT RULES:
-            - Categories: Broad areas (e.g., 'Combat', 'Movement').
-            - Topics: Specific rules/entities (1-4 words).
-            - Description: A clear, concise one-sentence explanation.
-            - Format: Return ONLY valid JSON.
+            - Return ONLY valid JSON.[cite: 2]
+            - Importance: Rate 1-10 based on how central the concept is to the overall subject.[cite: 2]
 
             JSON STRUCTURE:
             {{
               "categories": [
                 {{
-                  "name": "Category Name",
+                  "name": "CATEGORY NAME",
                   "topics": [
-                    {{ "title": "Topic Name", "description": "Definition" }}
+                    {{ 
+                      "title": "Topic Name", 
+                      "description": "Clear academic definition", 
+                      "importance": 7 
+                    }}
                   ]
                 }}
               ]
             }}
 
-            CONTENT:
+            CONTENT TO ANALYZE:
             {group_text}
             """
 
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}]
+                messages=[{"role": "user", "content": prompt}],
+                response_format={ "type": "json_object" } # Ensures stable JSON output[cite: 2]
             )
 
             try:
-                # Clean and parse the JSON response
-                raw_content = response.choices[0].message.content
-                raw_content = raw_content.replace("```json", "").replace("```", "").strip()
-                data = json.loads(raw_content)
+                data = json.loads(response.choices[0].message.content.replace("```json", "").replace("```", "").strip())
 
-                # Loop through categories and nested topics
                 for cat in data.get("categories", []):
-                    category_name = (cat.get("name") or "General").strip().title()
+                    # 2. LOGICA DI UNIFICAZIONE CATEGORIE
+                    raw_category = (cat.get("name") or "GENERAL").strip().upper()
+                    
+                    # Controlliamo se nel DB per questo progetto esiste già una categoria simile
+                    # Questo evita di avere "MUSCLE ACTION" e "MUSCLE ACTIONS" separati
+                    existing_cat_row = db.execute(
+                        text("select category from topics where project_id = :pid and category ilike :c limit 1"),
+                        {"pid": project_id, "c": raw_category}
+                    ).fetchone()
+                    
+                    category_name = existing_cat_row[0] if existing_cat_row else raw_category
                     
                     for t_obj in cat.get("topics", []):
                         topic_title = (t_obj.get("title") or "").strip()
                         description = (t_obj.get("description") or "").strip()
+                        # Recuperiamo l'importanza se presente, altrimenti default a 5
+                        importance = t_obj.get("importance", 5) 
 
                         if not topic_title:
                             continue
 
-                        import re
-                        topic_title = re.sub(r'(?<!^)(?=[A-Z])', ' ', topic_title).title()
-                        topic_title = normalize_string(topic_title)
+                        # Manteniamo il titolo pulito senza regex aggressive che 
+                        # possono rovinare acronimi medici o tecnici
+                        topic_title = topic_title.strip()
 
                         key = topic_title.lower().strip()
                         if key in seen_titles:
                             continue
                         seen_titles.add(key)
 
-                        print("➡️ TOPIC:", topic_title)
+                        print(f"➡️ TOPIC: {topic_title} [{category_name}]")
 
-                        # 🔥 EMBEDDING (QUI DEVE GIRARE)
+                        # 🔥 EMBEDDING
                         try:
                             print("🔥 CREO EMBEDDING...")
-
+                            # Includiamo anche la categoria nell'input dell'embedding 
+                            # per migliorare la precisione della ricerca
+                            emb_input = f"{category_name} - {topic_title}: {description}"
+                            
                             emb = client.embeddings.create(
                                 model="text-embedding-3-small",
-                                input=f"{topic_title}: {description}"
+                                input=emb_input
                             )
 
                             embedding = emb.data[0].embedding
-                            print("✅ EMBEDDING OK:", len(embedding))
-
                             embedding_str = "[" + ",".join(map(str, embedding)) + "]"
 
                         except Exception as e:
                             print("❌ EMBEDDING ERROR:", e)
                             continue
 
-                        # 🔥 INSERT
+                        # 🔥 INSERT 
+                        # Ho aggiunto la colonna 'importance' nel caso volessi usarla, 
+                        # se non l'hai nel DB, rimuovila dalla query
                         db.execute(
                             text("""
                                 insert into topics 
@@ -721,9 +746,7 @@ async def ingest_stream(
                 reader = PdfReader(pdf_stream)
 
                 for page_index, page in enumerate(reader.pages):
-                    if page_index > 30:
-                        yield "Page limit reached → stopping\n"
-                        break
+                    
 
                     yield f"Page {page_index+1}\n"
 
