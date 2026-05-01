@@ -972,29 +972,42 @@ def generate_quiz(
         print("🌍 GLOBAL QUIZ MODE (SAFE)")
 
     if req.topics is None:
-        # 👉 SOLO per quiz da sidebar
+        print("🌍 GLOBAL QUIZ MODE (ROUND ROBIN ROTATION)")
+        # Questa query garantisce che venga preso un pezzo di testo per OGNI topic prima di passare al secondo
         rows = db.execute(
             text("""
+                WITH RankedChunks AS (
+                    SELECT 
+                        id, chunk_text, doc_title, page, topic,
+                        ROW_NUMBER() OVER (PARTITION BY topic ORDER BY RANDOM()) as rn
+                    FROM chunks
+                    WHERE project_id = :project_id
+                      AND chunk_text IS NOT NULL
+                      AND length(chunk_text) > 100
+                )
                 SELECT id, chunk_text, doc_title, page, topic
-                FROM chunks
-                WHERE project_id = :project_id
-                ORDER BY embedding <-> CAST(:embedding AS vector)
-                LIMIT 30
+                FROM RankedChunks
+                ORDER BY rn, topic
+                LIMIT 80
             """),
-            {
-                "project_id": project_id,
-                "embedding": str(query_embedding)
-            }
+            {"project_id": project_id}
         ).fetchall()
     else:
-        # 👉 fallback sicurezza (non dovrebbe mai succedere)
+        # Se l'utente ha selezionato topic specifici, filtriamo i chunk caricati prima
+        normalized_targets = [normalize_string(t) for t in req.topics]
+        filtered_rows = []
+        for r in all_rows:
+            topic_db = normalize_string(r[4])
+            if any(topic_db == target or topic_db.startswith(target) for target in normalized_targets):
+                filtered_rows.append(r)
+        
         import random
-        random.shuffle(all_rows)
-        rows = all_rows[:min(len(all_rows), 80)]
+        random.shuffle(filtered_rows)
+        rows = filtered_rows[:min(len(filtered_rows), 80)]
 
-    # 🔍 DEBUG CHUNKS
-    for r in rows[:3]:
-        print("📄 SAMPLE CHUNK:", r[1][:200])
+    # 🔍 DEBUG CHUNKS (Lascialo così vedi nel terminale se i topic ruotano)
+    for r in rows[:5]:
+        print(f"📄 CHUNK DA TOPIC: {r[4]} | TESTO: {r[1][:100]}...")
 
     chunk_topic_map = {
         str(r[0]): " ".join(str(r[4]).split()) 
