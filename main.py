@@ -1070,6 +1070,12 @@ def generate_quiz(
         Available Topics: {topics_str}
         Avoid these topics: {avoid_str}
 
+        STRICT RULES FOR DISTRACTORS:
+        1. SEMANTIC COHERENCE: All 5 options (A, B, C, D, E) must belong to the same category or anatomical system as the correct answer.
+        2. PLAUSIBILITY: Distractors must be plausible enough to challenge a prepared student. Do not use obviously unrelated terms.
+        3. NO OVERLAP: Ensure only one answer is strictly correct according to the provided material.
+        4. TARGET TOPICS: Focus specifically on {topics_str}.
+
         STRICT RULES:
         1. Use ONLY the provided material.
         2. Professional tone.
@@ -1610,295 +1616,134 @@ async def generate_quiz_stream(
 @app.post("/projects/{project_id}/generate_flashcards")
 async def generate_flashcards(
     project_id: str,
-    req: dict = None,
+    req: dict = Body(None),
     user = Depends(verify_user)
 ):
-
-    num_cards = 10
-    user_id = user["id"]
-
-    def normalize_topic(t):
-        return " ".join(str(t).split()).strip()
-
-    topics = []
+    gpt_text = "IA non ancora consultata" 
     db = SessionLocal()
-
-    if req and isinstance(req, dict):
-        num_cards = req.get("num_cards", 10)
-        raw_topics = req.get("topics", [])
-        topics = [normalize_topic(t) for t in raw_topics]
-        topics = [normalize_string(t) for t in raw_topics if t]
-        print("🎯 CLEAN TOPICS:", topics)
-
-        
-
-    print("🎯 NORMALIZED TOPICS:", topics)
-
+    flashcards = [] # FONDAMENTALE: inizializza la lista qui
     
-    # 🔥 RETRIEVAL BILANCIATO PER TOPIC
-    
-
-    rows = []
-    seen_ids = set()
-
-    if topics:
-        per_topic_limit = max(4, (num_cards // max(len(topics), 1)) + 2)
-
-        rows = db.execute(
-            text("""
-                select id, chunk_text, doc_title, page, topic
-                from chunks
-                where project_id = :project_id
-                and (
-                    """ + " OR ".join([
-                        f"lower(topic) like :kw{i}" for i in range(len(topics))
-                    ]) + """
-                )
-                limit :limit
-            """),
-            {
-                "project_id": project_id,
-                "limit": num_cards * 4,
-                **{
-                    f"kw{i}": f"%{t.split()[0].lower()}%"
-                    for i, t in enumerate(topics)
-                }
-            }
-        ).fetchall()
-
-    else:
-        emb = client.embeddings.create(
-            model="text-embedding-3-small",
-            input="important study concepts"
-        )
-        query_embedding = emb.data[0].embedding
-
-        rows = db.execute(
-            text("""
-                select id, chunk_text, doc_title, page, topic
-                from chunks
-                where project_id = :project_id
-                order by embedding <-> CAST(:embedding AS vector)
-                limit 12
-            """),
-            {
-                "project_id": project_id,
-                "embedding": query_embedding
-            }
-        ).fetchall()
-
-    topic_counts = {}
-    for r in rows:
-        t = r[4] or "UNKNOWN"
-        topic_counts[t] = topic_counts.get(t, 0) + 1
-
-    print("🧠 FLASHCARD RETRIEVAL DISTRIBUTION:", topic_counts)
-
-    db.close()
-
-    chunk_topic_map = {
-        str(r[0]): " ".join(str(r[4]).split())
-        for r in rows if r[4]
-    }
-
-    context_text = "\n\n".join([
-        f"### CHUNK_ID: {r[0]} | TOPIC: {r[4]} | FILE: {r[2]} | PAGE: {r[3]}\n{r[1]}"
-        for r in rows if r[1]
-    ])
-
-    prompt = f"""
-    You MUST generate EXACTLY {num_cards} flashcards.
-
-    FOCUS TOPIC:
-    {", ".join(topics) if topics else "GENERAL"}
-
-    CRITICAL RULE (VERY IMPORTANT):
-    - Distribute flashcards across ALL provided topics
-    - Each topic MUST be covered
-    - Do NOT focus on only one topic
-
-
-    You are a strict study tutor.
-
-    STRICT RULES:
-    - Use ONLY the provided material
-    - DO NOT use external knowledge
-    - If information is missing, skip the card
-    - Each flashcard must test ONE clear concept
-    - Each flashcard MUST include a valid chunk_id
-    - The chunk_id MUST match one CHUNK_ID from the material
-    - You are NOT allowed to invent chunk IDs
-    - Do NOT generate the topic yourself
-    - The topic will be assigned by the system from the chunk
-    - Avoid generic or vague questions
-    - Avoid repeating similar questions
-    - Avoid simple definition-only questions when possible
-    - Prefer cause-effect, mechanisms, reasoning
-
-    Return EXACTLY {num_cards} items.
-
-    Return ONLY JSON:
-
-    [
-    {{
-        "question": "...",
-        "answer": "...",
-        "concept": "...",
-        "chunk_id": "Must match the CHUNK_ID from the material",
-        "difficulty": "easy | medium | hard"
-    }}
-    ]
-
-    Study material:
-    {context_text}
-    """
-
-    print("🎯 USING TOPIC:", topics)
-    print("🧠 CONTEXT PREVIEW:", context_text[:300])
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.3,
-        messages=[
-            {"role": "system", "content": "You generate study flashcards."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-
-    gpt_text = response.choices[0].message.content
-
     try:
+        num_cards = 10
+        topics_list = []
+        if req and isinstance(req, dict):
+            num_cards = req.get("num_cards", 10)
+            topics_list = req.get("topics", [])
+            if isinstance(topics_list, str): topics_list = [topics_list]
 
-        gpt_text = gpt_text.replace("```json", "").replace("```", "").strip()
-        flashcards = json.loads(gpt_text)
+        print(f"🔥 START FLASHCARDS: Project {project_id} | Topics: {topics_list}")
 
-        # remove duplicate + low quality flashcards
+        # 1. RECUPERO CHUNK (Logica Study Session)
+        context_chunks = search_project_chunks(
+            project_id=project_id,
+            topics=topics_list if len(topics_list) > 0 else None,
+            k=30 
+        )
 
-        seen = set()
-        unique_flashcards = []
+        if not context_chunks:
+            print("⚠️ NO CHUNKS FOUND con topic → fallback globale")
+            context_chunks = search_project_chunks(project_id=project_id, k=30)
 
-        for card in flashcards:
+        if not context_chunks:
+            print("❌ NESSUN TESTO TROVATO NEL PROGETTO")
+            return {"flashcards": []}
 
-            q = card.get("question", "").strip().lower()
-            a = card.get("answer", "").strip()
-            chunk_id = str(card.get("chunk_id", "")).strip()
+        # 2. PREPARAZIONE CONTESTO E MAPPING
+        context_blocks = []
+        chunk_topic_map = {} 
+        for i, c in enumerate(context_chunks):
+            cid = f"CH-{i}"
+            topic_name = c.get("topic") or "General"
+            chunk_topic_map[cid] = topic_name
+            # Usiamo 'text' perché search_project_chunks restituisce dizionari con 'text'
+            context_blocks.append(f"### CHUNK_ID: {cid} | TOPIC: {topic_name}\n{c.get('text', '')}")
 
-            # filtri qualità base
-            if len(q) < 10 or len(a) < 5:
-                continue
+        context_text = "\n\n".join(context_blocks)
 
-            if "what is" in q and len(a.split()) < 5:
-                continue
+        prompt = f"""
+        Generate EXACTLY {num_cards} academic flashcards in JSON format.
+        
+        STRICT RULES:
+        1. Use ONLY the provided material.
+        2. Assign the correct 'chunk_id' to each card (e.g., "CH-0").
+        3. Aim for high-yield medical questions (Why, How, Mechanisms).
 
-            if chunk_id not in chunk_topic_map:
-                print("❌ INVALID CHUNK_ID:", chunk_id)
-                continue
+        Material:
+        {context_text}
 
-            topic_from_db = chunk_topic_map.get(chunk_id)
-            if not topic_from_db:
-                print("⚠️ NO TOPIC FOUND FOR CHUNK:", chunk_id)
-                continue
-
-            card["topic"] = topic_from_db
-
-            if q not in seen:
-                seen.add(q)
-                unique_flashcards.append(card)
-
-        flashcards = unique_flashcards[:num_cards]
-
-        # 🔥 SE MANCANO → GENERA FINO A COMPLETARE
-        attempt = 0
-        max_attempts = 3
-        while len(flashcards) < num_cards and attempt < max_attempts:
-
-            missing = num_cards - len(flashcards)
-
-            print(f"⚠️ Filling missing flashcards: {missing}")
-
-            extra_prompt = f"""
-            Generate {missing} NEW flashcards.
-
-            STRICT RULES:
-            - Use ONLY the provided material
-            - DO NOT use external knowledge
-            - Each flashcard MUST include a valid chunk_id
-            - The chunk_id MUST match one CHUNK_ID from the material
-            - You are NOT allowed to invent chunk IDs
-            - Do NOT generate the topic yourself
-            - Avoid repeating previous concepts
-            - Avoid similar questions
-            - Be specific and concrete
-
-            Return ONLY JSON:
-
-            [
+        Expected JSON Structure:
+        {{
+          "flashcards": [
             {{
-                "question": "...",
-                "answer": "...",
-                "concept": "...",
-                "chunk_id": "Must match the CHUNK_ID from the material",
-                "difficulty": "easy | medium | hard"
+              "question": "...",
+              "answer": "...",
+              "chunk_id": "CH-X",
+              "difficulty": "medium"
             }}
-            ]
+          ]
+        }}
+        """
 
-            Study material:
-            {context_text}
-            """
+        # 3. CHIAMATA A GPT
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.4,
+            messages=[
+                {"role": "system", "content": "You are a professional medical tutor. You MUST always respond in JSON format."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+        
+        gpt_text = response.choices[0].message.content
+        
+        # 4. PARSING E FILTRO
+        data = json.loads(gpt_text)
+        raw_cards = data.get("flashcards", [])
+        
+        seen = set()
+        for card in raw_cards:
+            q = card.get("question", "").strip().lower()
+            cid = str(card.get("chunk_id", "")).strip()
+            
+            # Verifichiamo che il chunk_id esista nella nostra mappa
+            if q and cid in chunk_topic_map and q not in seen:
+                card["topic"] = chunk_topic_map[cid]
+                seen.add(q)
+                flashcards.append(card)
 
-            extra_response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                temperature=0.7,
-                messages=[
-                    {"role": "system", "content": "You generate study flashcards."},
-                    {"role": "user", "content": extra_prompt}
-                ]
+        # Limitiamo al numero richiesto
+        flashcards = flashcards[:num_cards]
+
+        # 5. SALVATAGGIO NEL DATABASE
+        for card in flashcards:
+            # Usiamo text() per coerenza con il tuo stile
+            result = db.execute(
+                text("""
+                    INSERT INTO flashcards (project_id, user_id, question, answer, topic)
+                    VALUES (:project_id, :user_id, :question, :answer, :topic)
+                    RETURNING id
+                """),
+                {
+                    "project_id": project_id,
+                    "user_id": user["id"],
+                    "question": card.get("question"),
+                    "answer": card.get("answer"),
+                    "topic": card.get("topic")
+                }
             )
+            card["id"] = result.fetchone()[0]
 
-            extra_text = extra_response.choices[0].message.content
-            extra_text = extra_text.replace("```json", "").replace("```", "").strip()
-
-            try:
-                extra_cards = json.loads(extra_text)
-            except:
-                break
-
-            for card in extra_cards:
-
-                if len(flashcards) >= num_cards:
-                    break
-
-                q = card.get("question", "").strip().lower()
-                a = card.get("answer", "").strip()
-                chunk_id = str(card.get("chunk_id", "")).strip()
-
-                # filtri qualità base
-                if len(q) < 10 or len(a) < 5:
-                    continue
-
-                if chunk_id not in chunk_topic_map:
-                    print("❌ INVALID CHUNK_ID (extra):", chunk_id)
-                    continue
-
-                topic_from_db = chunk_topic_map.get(chunk_id)
-                if not topic_from_db:
-                    print("⚠️ NO TOPIC FOUND FOR EXTRA CHUNK:", chunk_id)
-                    continue
-
-                card["topic"] = topic_from_db
-
-                if q not in seen:
-                    seen.add(q)
-                    flashcards.append(card)
-
-            attempt += 1
+        db.commit()
+        return {"flashcards": flashcards}
 
     except Exception as e:
-
-        print("FLASHCARDS JSON ERROR:", e)
-        print("RAW GPT OUTPUT:", gpt_text)
-
-        flashcards = []
+        if db: db.rollback()
+        print(f"❌ ERRORE GENERAZIONE: {str(e)}")
+        print(f"📝 RAW GPT OUTPUT: {gpt_text}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
     # ======================
     # SAVE FLASHCARDS
     # ======================
@@ -2184,141 +2029,205 @@ async def get_flashcards(project_id: str):
 # ======================
 
 @app.get("/projects/{project_id}/summary")
-async def project_summary(
-    project_id: str,
-    user = Depends(verify_user)
-):
-
+async def project_summary(project_id: str, user = Depends(verify_user)):
     user_id = user["id"]
     db = SessionLocal()
+    try:
+        # 1. Statistiche generali Quiz
+        quiz_stats = db.execute(
+            text("""
+                SELECT 
+                    COUNT(qa.id), 
+                    AVG((qa.score::float / NULLIF(qa.total_questions, 0)) * 100)
+                FROM quiz_attempts qa
+                JOIN quizzes q ON qa.quiz_id = q.id
+                WHERE qa.user_id = :u_id AND q.project_id = :p_id
+                AND qa.total_questions > 0
+            """),
+            {"u_id": user_id, "p_id": project_id}
+        ).fetchone()
 
-    project = db.execute(
-        text("""
-            select id
-            from projects
-            where id = :project_id
-            and user_id = :user_id
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
+        # 2. Storico Quiz (history_rows)
+        history_rows = db.execute(
+            text("""
+                SELECT q.title, qa.score, qa.total_questions, qa.completed_at
+                FROM quiz_attempts qa
+                JOIN quizzes q ON qa.quiz_id = q.id
+                WHERE qa.user_id = :u_id AND q.project_id = :p_id
+                ORDER BY qa.completed_at DESC
+            """),
+            {"u_id": user_id, "p_id": project_id}
+        ).fetchall()
+
+        quiz_history = [
+            {"title": r[0], "score": r[1], "total": r[2], "date": r[3].isoformat() if r[3] else None} 
+            for r in history_rows
+        ]
+
+        # 3. Dettaglio Topic Ibrido (topic_rows)
+        topic_rows = db.execute(
+            text("""
+                WITH CombinedScores AS (
+                    SELECT 
+                        qq.topic, 
+                        (qa.score::float / NULLIF(qa.total_questions, 0)) * 100 as score
+                    FROM quiz_questions qq
+                    JOIN quizzes q ON qq.quiz_id = q.id
+                    JOIN quiz_attempts qa ON qa.quiz_id = q.id
+                    WHERE q.project_id = :p_id AND qa.user_id = :u_id
+                    
+                    UNION ALL
+                    
+                    SELECT 
+                        f.topic,
+                        CASE WHEN fr.is_correct THEN 100 ELSE 0 END as score
+                    FROM flashcards f
+                    JOIN flashcard_reviews fr ON f.id = fr.flashcard_id
+                    WHERE f.project_id = :p_id AND f.user_id = :u_id
+                )
+                SELECT topic, AVG(score) FROM CombinedScores GROUP BY topic
+            """),
+            {"p_id": project_id, "u_id": user_id}
+        ).fetchall()
+
+        topics_detail = [
+            {"topic": r[0] or "General", "score": round(float(r[1]), 1) if r[1] is not None else 0} 
+            for r in topic_rows
+        ]
+
+        # Conteggio flashcard riviste per il box (opzionale)
+        f_count = db.execute(
+            text("SELECT COUNT(DISTINCT flashcard_id) FROM flashcard_reviews fr JOIN flashcards f ON fr.flashcard_id = f.id WHERE f.project_id = :p_id AND f.user_id = :u_id"),
+            {"p_id": project_id, "u_id": user_id}
+        ).scalar() or 0
+
+        # IL RETURN DEVE CONTENERE TUTTE LE CHIAVI
+        return {
+            "quiz_attempts": int(quiz_stats[0]) if quiz_stats[0] else 0,
+            "messaggio_segreto": "Sto leggendo questo file!",
+            "avg_score": round(float(quiz_stats[1]), 1) if quiz_stats[1] else 0,
+            "topics_count": len(topics_detail_list),
+            "flashcards_reviewed": f_count, # La variabile del conteggio flashcard
+            "quiz_history": quiz_history_list,    # <--- FONDAMENTALE
+            "topics_detail": topics_detail_list,  # <--- FONDAMENTALE
+            "topic_mastery": topics_detail_list   # Per la compatibilità con ResultsView
         }
-    ).fetchone()
 
-    if not project:
+    except Exception as e:
+        print(f"ERRORE CRITICO: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
         db.close()
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    quiz_attempts = db.execute(
-        text("""
-            select count(*)
-            from quiz_attempts
-            where user_id = :user_id
-            and quiz_id in (
-                select id from quizzes where project_id = :project_id
-            )
-        """),
-        {
-            "user_id": user_id,
-            "project_id": project_id
-        }
-    ).scalar()
-
-    avg_score = db.execute(
-        text("""
-            select avg(
-                (score::float / total_questions) * 100
-            )
-            from quiz_attempts
-            where user_id = :user_id
-            and quiz_id in (
-                select id from quizzes where project_id = :project_id
-            )
-        """),
-        {
-            "user_id": user_id,
-            "project_id": project_id
-        }
-    ).scalar()
-
-    if avg_score is None:
-        avg_score = 0
-
-    flashcards_reviewed = db.execute(
-        text("""
-            select count(*)
-            from flashcards
-            where project_id = :project_id
-            and last_review is not null
-        """),
-        {
-            "project_id": project_id
-        }
-    ).scalar()
-
-    topics_count = db.execute(
-        text("""
-            select count(distinct topic)
-            from quiz_questions qq
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-        """),
-        {
-            "project_id": project_id
-        }
-    ).scalar()
-
-    db.close()
-
-    return {
-        "quiz_attempts": quiz_attempts or 0,
-        "avg_score": round(avg_score, 1),
-        "flashcards_reviewed": flashcards_reviewed or 0,
-        "topics_count": topics_count or 0
-    }
 
 @app.get("/projects/{project_id}/flashcards_detailed_stats")
-async def flashcards_detailed_stats(
-    project_id: str,
-    user = Depends(verify_user)
-):
+async def flashcards_detailed_stats(project_id: str, user = Depends(verify_user)):
 
     db = SessionLocal()
 
+    # Cambiamo la query per raggruppare per topic
+    # Nota: usiamo la tabella 'flashcards' per i nomi dei topic e 'flashcard_reviews' per i voti
     rows = db.execute(
         text("""
-            select
-                count(*) as total,
-                sum(case when is_correct = false then 1 else 0 end) as wrong,
-                sum(case when difficulty = 1 then 1 else 0 end) as hard,
-                sum(case when difficulty = 2 then 1 else 0 end) as correct,
-                sum(case when difficulty = 3 then 1 else 0 end) as easy
-            from flashcard_reviews
-            where project_id = :project_id
-            and user_id = :user_id
+            SELECT 
+                f.topic,
+                COUNT(fr.id) as total,
+                SUM(CASE WHEN fr.is_correct = false THEN 1 ELSE 0 END) as wrong,
+                SUM(CASE WHEN fr.difficulty = 1 THEN 1 ELSE 0 END) as hard,
+                SUM(CASE WHEN fr.difficulty = 2 THEN 1 ELSE 0 END) as good,
+                SUM(CASE WHEN fr.difficulty = 3 THEN 1 ELSE 0 END) as easy
+            FROM flashcards f
+            LEFT JOIN flashcard_reviews fr ON f.id = fr.flashcard_id
+            WHERE f.project_id = :project_id 
+              AND f.user_id = :user_id
+            GROUP BY f.topic
         """),
         {
             "project_id": project_id,
             "user_id": user["id"]
         }
-    ).fetchone()
+    ).fetchall()
 
     db.close()
 
-    total = rows[0] or 1
+    # Trasformiamo i risultati in un dizionario mappato per topic
+    stats_by_topic = {}
+    for r in rows:
+        topic_name = r[0] or "General"
+        total = r[1] or 0
+        
+        # Se non ci sono review per questo topic, mettiamo tutto a zero
+        if total == 0:
+            stats_by_topic[topic_name] = {
+                "total": 0, "wrong": 0, "hard": 0, "good": 0, "easy": 0, "accuracy": 0
+            }
+            continue
 
-    return {
-        "total": total,
-        "wrong": rows[1] or 0,
-        "hard": rows[2] or 0,
-        "correct": rows[3] or 0,
-        "easy": rows[4] or 0,
-        "accuracy": round(((rows[3] + rows[4]) / total) * 100, 1)
-    }
+        wrong = r[2] or 0
+        hard = r[3] or 0
+        good = r[4] or 0
+        easy = r[5] or 0
+        
+        stats_by_topic[topic_name] = {
+            "total": total,
+            "wrong": wrong,
+            "hard": hard,
+            "good": good, # Il tuo frontend usa 'good' per il colore blu
+            "easy": easy,
+            "accuracy": round(((good + easy) / total) * 100, 1)
+        }
+
+    return stats_by_topic
 
 # ======================
 # PROJECT RESULTS
 # ======================
+@app.get("/projects/{project_id}/flashcards_detailed_stats")
+async def flashcards_detailed_stats(
+    project_id: str,
+    user = Depends(verify_user)
+):
+    db = SessionLocal() # Apre la connessione
+    try:
+        # La tua query SQL raggruppata per topic
+        rows = db.execute(
+            text("""
+                select
+                    topic,
+                    sum(case when is_correct = false then 1 else 0 end) as wrong,
+                    sum(case when difficulty = 1 then 1 else 0 end) as hard,
+                    sum(case when difficulty = 2 then 1 else 0 end) as correct,
+                    sum(case when difficulty = 3 then 1 else 0 end) as easy,
+                    count(*) as total
+                from flashcard_reviews
+                where project_id = :project_id
+                  and user_id = :user_id
+                group by topic
+            """),
+            {"project_id": project_id, "user_id": user["id"]}
+        ).fetchall()
+
+        # Trasformazione dati
+        stats_by_topic = {}
+        for r in rows:
+            topic_name = r[0] or "General"
+            stats_by_topic[topic_name] = {
+                "wrong": int(r[1] or 0),
+                "hard": int(r[2] or 0),
+                "good": int(r[3] or 0), # Manteniamo 'good' per coerenza frontend
+                "easy": int(r[4] or 0),
+                "total": int(r[5] or 0)
+            }
+
+        return stats_by_topic
+
+    except Exception as e:
+        print(f"❌ Error fetching detailed stats: {e}")
+        # Opzionale: puoi sollevare un'eccezione HTTP qui
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+    
+    finally:
+        db.close() # <--- SEMPRE QUI, garantisce che la connessione torni al pool
+
 
 @app.get("/projects/{project_id}/results")
 async def project_results(
@@ -2649,9 +2558,9 @@ async def review_flashcard(
             db.execute(
                 text("""
                     insert into flashcard_reviews
-                    (flashcard_id, project_id, user_id, is_correct, difficulty, elapsed_seconds)
+                    (flashcard_id, project_id, user_id, is_correct, difficulty, elapsed_seconds, topic)
                     values
-                    (:flashcard_id, :project_id, :user_id, :is_correct, :difficulty, :elapsed_seconds)
+                    (:flashcard_id, :project_id, :user_id, :is_correct, :difficulty, :elapsed_seconds, :topic)
                 """),
                 {
                     "flashcard_id": flashcard_id,
@@ -2659,7 +2568,8 @@ async def review_flashcard(
                     "user_id": user["id"],
                     "is_correct": is_correct,
                     "difficulty": difficulty,
-                    "elapsed_seconds": req.get("elapsed_seconds", 0)
+                    "elapsed_seconds": req.get("elapsed_seconds", 0),
+                    "topic": flashcard_row[2]
                 }
             )
 
@@ -2768,53 +2678,78 @@ async def get_quiz(quiz_id: str):
 
 @app.post("/save_quiz_attempt")
 async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
-    # --- FIX: Controllo validità quiz_id ---
     quiz_id = req.get("quiz_id")
-    project_id = req.get("project_id")
-    if not quiz_id or quiz_id == "":
-        # Se non c'è l'ID, non salviamo ma non facciamo crashare il server
-        return {"status": "error", "message": "quiz_id missing"}
+    user_id = user["id"]  # <--- Recuperiamo l'ID dell'utente autenticato
+    answers = req.get("answers", [])
 
     db = SessionLocal()
     try:
-        db.execute(
-            text("""
-                insert into quiz_attempts
-                (quiz_id, user_id, project_id, score, total_questions)
-                values
-                (:quiz_id, :user_id, :project_id, :score, :total_questions)
-            """),
-            {
-                "quiz_id": quiz_id,
-                "user_id": user["id"],
-                "project_id": project_id,
-                "score": req.get("score", 0),
-                "total_questions": req.get("total_questions", 0)
-            }
-        )
-        answers = req.get("answers", [])
-
+        # 1. Salva il tentativo (se non lo fa già Supabase, o per sicurezza)
+        # Se hai già una riga in quiz_attempts, questo passaggio serve a legare il tutto
+        
         for a in answers:
             db.execute(
                 text("""
-                    insert into quiz_answers (question_id, is_correct)
-                    values (:question_id, :is_correct)
+                    insert into quiz_answers (quiz_id, question_id, is_correct, topic, user_id)
+                    values (:quiz_id, :question_id, :is_correct, :topic, :user_id)
                 """),
                 {
                     "quiz_id": quiz_id,
                     "question_id": a.get("question_id"),
-                    "is_correct": a.get("is_correct", False)
+                    "is_correct": a.get("is_correct", False),
+                    "topic": a.get("topic", "General"),
+                    "user_id": user_id  # <--- Passiamo lo user_id al DB
                 }
             )
         db.commit()
+        print(f"✅ Salvate {len(answers)} risposte per l'utente {user_id}")
+        return {"status": "saved"}
     except Exception as e:
         db.rollback()
-        print(f"Database Error: {e}")
+        print(f"❌ Database Error: {e}")
         return {"status": "error", "detail": str(e)}
     finally:
         db.close()
 
-    return {"status": "saved"}
+@app.get("/projects/{project_id}/stats")
+async def get_quiz_stats(project_id: str, user = Depends(verify_user)):
+    db = SessionLocal()
+    try:
+        # Questa query unisce Quiz e Flashcards calcolando i totali per ogni topic
+        query = text("""
+            SELECT topic, 
+                   SUM(correct_count) as total_correct, 
+                   SUM(total_count) as total_all
+            FROM (
+                -- Parte 1: Risposte dai Quiz
+                SELECT qa.topic, 
+                       COUNT(*) FILTER (WHERE qa.is_correct) as correct_count, 
+                       COUNT(*) as total_count
+                FROM quiz_answers qa
+                JOIN quiz_attempts qatt ON qa.quiz_id = qatt.quiz_id
+                WHERE qatt.project_id = :p_id AND qa.user_id = :u_id
+                GROUP BY qa.topic
+                
+                UNION ALL
+                
+                -- Parte 2: Risposte dalle Flashcards
+                SELECT topic, 
+                       COUNT(*) FILTER (WHERE is_correct) as correct_count, 
+                       COUNT(*) as total_count
+                FROM flashcard_reviews
+                WHERE project_id = :p_id AND user_id = :u_id
+                GROUP BY topic
+            ) subquery
+            WHERE topic IS NOT NULL
+            GROUP BY topic
+        """)
+        
+        result = db.execute(query, {"p_id": project_id, "u_id": user["id"]}).fetchall()
+        
+        # Restituisce il formato che il tuo Frontend già si aspetta
+        return {r[0]: {"correct": int(r[1]), "total": int(r[2])} for r in result}
+    finally:
+        db.close()
 
 @app.get("/projects/{project_id}/quiz_attempts_summary")
 async def quiz_attempts_summary(project_id: str, user = Depends(verify_user)):
@@ -3229,6 +3164,42 @@ Material:
         return {"flashcards": json.loads(content)}
     except:
         return {"flashcards": []}
+
+@app.get("/projects/{project_id}/flashcards_detailed_stats")
+async def get_flashcards_detailed_stats(project_id: str, user = Depends(verify_user)):
+    db = SessionLocal()
+    try:
+        # Recupera il conteggio delle flashcard raggruppate per topic e difficoltà
+        rows = db.execute(
+            text("""
+                SELECT LOWER(TRIM(topic)), difficulty, COUNT(*) as count
+                FROM flashcards
+                WHERE project_id = :project_id
+                GROUP BY topic, difficulty
+            """),
+            {"project_id": project_id}
+        ).fetchall()
+
+        stats = {}
+        for row in rows:
+            topic = row[0] or "General"
+            diff = row[1] or "unseen" # Se non sono state ancora studiate
+            count = row[2]
+
+            if topic not in stats:
+                stats[topic] = {"wrong": 0, "hard": 0, "good": 0, "easy": 0, "total": 0}
+            
+            # Mapping delle chiavi per il frontend
+            if diff == "wrong": stats[topic]["wrong"] += count
+            elif diff == "hard": stats[topic]["hard"] += count
+            elif diff == "good": stats[topic]["good"] += count
+            elif diff == "easy": stats[topic]["easy"] += count
+            
+            stats[topic]["total"] += count
+
+        return stats
+    finally:
+        db.close()
 
 @app.post("/active_recall_evaluate")
 async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
