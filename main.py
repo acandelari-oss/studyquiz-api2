@@ -27,6 +27,13 @@ from typing import Optional, List
 import time
 import re
 
+MAX_RECOMMENDED_PAGES = 150
+MAX_WARNING_PAGES = 100
+MAX_STRONG_WARNING_PAGES = 180
+
+MAX_TOPIC_PROCESSING_SECONDS = 240
+MAX_ASSIGNMENT_MATCHES = 30000
+
 def normalize_string(s: str) -> str:
     if not s: return ""
     # Sostituisce \xa0 (non-breaking space) con spazio normale
@@ -123,8 +130,15 @@ class QuizRequest(BaseModel):
     num_questions: int
     difficulty: str
     language: str
+
+    # 🔥 NUOVO SISTEMA
+    topic_ids: Optional[List[str]] = []
+
+    # 🔥 LEGACY TEMPORANEO
     topics: Optional[List[str]] = []
-    topic: Optional[str] = None 
+
+    # 🔥 LEGACY TEMPORANEO
+    topic: Optional[str] = None
 
 class IngestDocument(BaseModel):
     title: str
@@ -491,10 +505,65 @@ def ingest(
     db.close()
     return {"status": "ok"}
 
+def should_hide_topic(topic_title: str):
+
+    t = topic_title.lower().strip()
+
+    weak_patterns = [
+        "deep muscles",
+        "superficial muscles",
+        "compartments of",
+        "muscles of the posterior compartment",
+        "muscles of the anterior compartment",
+        "pronators and supinators",
+        "muscle origins and insertions",
+        "actions and innervation",
+    ]
+
+    return any(p in t for p in weak_patterns)
+
+def rebalance_taxonomy(final_data):
+
+    MIN_TOPICS_PER_CATEGORY = 2
+
+    categories = final_data.get("categories", [])
+
+    strong_categories = []
+    weak_topics = []
+
+    # separa categorie forti/deboli
+    for cat in categories:
+
+        topics = cat.get("topics", [])
+
+        if len(topics) >= MIN_TOPICS_PER_CATEGORY:
+            strong_categories.append(cat)
+        else:
+            weak_topics.extend(topics)
+
+    # fallback
+    if not strong_categories:
+        return final_data
+
+    # category più grande
+    main_category = max(
+        strong_categories,
+        key=lambda c: len(c.get("topics", []))
+    )
+
+    # sposta topic deboli
+    main_category["topics"].extend(weak_topics)
+
+    return {
+        "categories": strong_categories
+    }
+
 def process_topics_task(project_id: str):
     db = SessionLocal()
     try:
         print("BACKGROUND TOPICS START:", project_id)
+        import time
+        topic_start_time = time.time()
         # 1. Update status and clear old topics
         db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
         db.execute(text("delete from topics where project_id = :project_id"), {"project_id": project_id})
@@ -502,158 +571,533 @@ def process_topics_task(project_id: str):
 
         # Fetch chunks to analyze (up to 120 chunks)
         rows = db.execute(
-            text("select chunk_text from chunks where project_id = :project_id order by page asc limit 1000"),
+            text("""
+                select chunk_text, section
+                from chunks
+                where project_id = :project_id
+                order by page asc
+                limit 1000
+            """),
             {"project_id": project_id}
         ).fetchall()
 
-        all_text_chunks = [r[0] for r in rows if r[0]]
+        all_chunks = [
+            {
+                "text": r[0],
+                "section": r[1] or "GENERAL"
+            }
+            for r in rows
+            if r[0]
+        ]
         # Group chunks into batches of 20
-        chunk_groups = [all_text_chunks[i:i+20] for i in range(0, len(all_text_chunks), 20)]
+        from collections import defaultdict
+
+        section_groups = defaultdict(list)
+
+        for chunk in all_chunks:
+            section_groups[chunk["section"]].append(chunk["text"])
         
         seen_titles = set()
+        all_candidate_topics = []
 
-        for group in chunk_groups:
-            group_text = "\n\n".join(group)
-            
-            # UNIVERSAL PROMPT: Works for any discipline (Medicine, Law, Engineering, etc.)
-            prompt = f"""
-            Act as a specialist in Instructional Design and Knowledge Organization. 
-            Analyze the provided text to extract its fundamental conceptual hierarchy.
-            
-            GOAL:
-            Organize the information into a logical structure of Macro-Categories and specific Topics to facilitate academic study.
-            
-            STRICT RULES:
-            1. CATEGORY: Identify the primary organizational unit or domain of the text.
-            - Medicine: Use anatomical regions or systems (e.g., 'NECK ANATOMY', 'DIGESTIVE SYSTEM').
-            - Sciences: Use branches or chemical groups (e.g., 'INORGANIC CHEMISTRY', 'THERMODYNAMICS').
-            - Law: Use codes, areas, or legal entities (e.g., 'CIVIL LAW', 'CONTRACTS').
-            - General: Use major chapter themes.
-            - ALWAYS USE UPPERCASE for categories.
-            
-            2. TOPIC: The specific concept, entity, rule, or theory (1-4 words).
-            
-            3. DESCRIPTION: Provide a dense, academic, and precise definition. Focus on 'What it is' and 'Its primary function or rule' (max 200 characters).
-            
-            4. COVERAGE: Exhaustively extract all technical terms. Do not skip any significant educational content.
-            
-            5. NO MICRO-CATEGORIES: Do not create a category for a single topic. Group related topics under a broader, logical Macro-Category.
+        for section_name, section_chunks in section_groups.items():
+            if time.time() - topic_start_time > MAX_TOPIC_PROCESSING_SECONDS:
+                print("⏰ TOPIC PROCESSING TIMEOUT - stopping safely")
 
-            FORMAT RULES:
-            - Return ONLY valid JSON.[cite: 2]
-            - Importance: Rate 1-10 based on how fundamental the concept is to the subject.[cite: 2]
+                db.execute(
+                    text("""
+                        UPDATE projects
+                        SET topic_status = 'partial'
+                        WHERE id = :project_id
+                    """),
+                    {"project_id": project_id}
+                )
 
-            JSON STRUCTURE:
-            {{
-            "categories": [
+                db.commit()
+                break
+
+            mini_groups = [
+                section_chunks[i:i+20]
+                for i in range(0, len(section_chunks), 20)
+            ]
+            for mini_group in mini_groups:
+                if time.time() - topic_start_time > MAX_TOPIC_PROCESSING_SECONDS:
+                    print("⏰ TOPIC MINI-GROUP TIMEOUT - stopping safely")
+
+                    db.execute(
+                        text("""
+                            UPDATE projects
+                            SET topic_status = 'partial'
+                            WHERE id = :project_id
+                        """),
+                        {"project_id": project_id}
+                    )
+
+                    db.commit()
+                    break
+
+                group_text = "\n\n".join(mini_group)
+            
+                # UNIVERSAL PROMPT: Works for any discipline (Medicine, Law, Engineering, etc.)
+                # OPTIMIZED PROMPT: Focused on Pedagogical Hierarchy and Topic Consolidation
+                prompt = f"""
+                Act as a specialist in Instructional Design and Knowledge Organization. 
+                Analyze the provided text to extract its fundamental conceptual hierarchy.
+                
+                GOAL:
+                Organize the information into a logical structure of Macro-Categories and robust Study Topics.
+                
+                STRICT RULES:
+                1. CATEGORY RULES:
+
+                - The provided DOCUMENT SECTION is the Category.
+
+                - You MUST reuse the exact DOCUMENT SECTION name as the Category.
+
+                - Do NOT invent new Categories.
+                - Do NOT generalize Categories.
+                - Do NOT rename Categories.
+                - Do NOT merge Categories.
+
+                - Categories should preserve the educational structure of the source material while grouping concepts into semantically coherent learning domains.
+
+                - Avoid creating categories unrelated to the document structure.
+
+                - DO NOT invent unrelated or alternative high-level Categories.
+
+                - Keep the hierarchy aligned with the actual structure of the source document.
+
+                - Categories must preserve the educational organization already present in the material.
+
+                - Use UPPERCASE for Category names.
+                -Each topic must semantically belong to its parent category.
+
+                -Topics and categories must describe the same conceptual domain.
+                -Topics must remain narrow enough to represent a focused retrievable study unit.
+
+                -Avoid placing unrelated concepts inside the same category.
+
+                GOOD CATEGORY EXAMPLES:
+                - MUSCLES OF THE LOWER LIMB
+                - MUSCLES OF THE UPPER LIMB
+                - FASCIAL STRUCTURES
+                - CELL BIOLOGY
+                - CONTRACT LAW
+                - THERMODYNAMICS
+
+                BAD CATEGORY EXAMPLES:
+                - DEEP MUSCLES OF THE POSTERIOR COMPARTMENT
+                - ROTATOR CUFF MUSCLES
+                - ANTERIOR MUSCLES OF THE LEG
+
+                - Categories should describe a broad educational area, not a specific Study Topic.
+
+                - ALWAYS USE UPPERCASE.
+                
+                2. TOPIC CREATION RULES:
+
+                - Create ONLY pedagogically meaningful Study Topics.
+                - A Study Topic must represent a coherent unit suitable for an actual study session.
+                - A Topic title must not duplicate or trivially restate its parent Category name.
+                - DO NOT create Topics for:
+                - isolated terms
+                - single definitions
+                - individual list items
+                - tiny subcomponents
+                - concepts explained with minimal context
+                unless they are universally recognized as major standalone concepts in the discipline.
+
+                - Consolidate strongly related concepts into broader educational Topics.
+
+                - Prefer broader conceptual Topics over highly granular fragmentation.
+
+                GOOD TOPIC CHARACTERISTICS:
+                - Represents a coherent study unit
+                - Covers a meaningful conceptual area
+                - Supports multiple quiz questions
+                - Supports multiple flashcards
+                - Can reasonably correspond to a focused study session
+                - Contains concepts that are commonly studied together
+                - Reflects the actual educational structure of the source material
+
+                BAD TOPIC CHARACTERISTICS:
+                - Isolated keywords or vocabulary terms
+                - Extremely narrow details with little standalone relevance
+                - Topics containing only one trivial fact
+                - Fragmented micro-topics that do not support meaningful study
+                - Artificially broad topics combining unrelated concepts
+
+                - A Topic should:
+                - support a complete study session
+                - contain multiple internal concepts
+                - support multiple quiz questions
+                - support multiple flashcards
+                - represent meaningful educational scope
+
+                - Prefer FEWER but STRONGER Topics.
+
+                - Topics should normally aggregate multiple related concepts internally, even if those concepts are not explicitly listed in the title.
+                
+                3. DESCRIPTION: Provide a dense, academic definition. If the Topic is a consolidation of multiple items, the description must briefly summarize all of them.
+                
+                4. IMPORTANCE: Rate 1-10 based on how fundamental the concept is to the subject.
+
+                FORMAT RULES:
+                - Return ONLY valid JSON.
+                - Ensure names are professional and academically accurate.
+
+                JSON STRUCTURE:
                 {{
-                "name": "CATEGORY NAME",
-                "topics": [
-                    {{ 
-                    "title": "Topic Name", 
-                    "description": "Clear academic definition", 
-                    "importance": 7 
+                "categories": [
+                    {{
+                    "name": "CATEGORY NAME",
+                    "topics": [
+                        {{ 
+                        "title": "Consolidated Topic Name", 
+                        "description": "Comprehensive academic definition covering the grouped concepts", 
+                        "importance": 8 
+                        }}
+                    ]
                     }}
                 ]
                 }}
+
+                DOCUMENT SECTION:
+                {section_name}
+
+                CONTENT TO ANALYZE:
+                {group_text}
+                """
+
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={ "type": "json_object" } # Ensures stable JSON output[cite: 2]
+                )
+
+                try:
+                    data = json.loads(response.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+
+                    for cat in data.get("categories", []):
+                        # KEEP ORIGINAL DOCUMENT CATEGORY
+                        raw_category = (
+                            cat.get("name") or "GENERAL"
+                        ).strip().upper()
+
+                        category_name = raw_category
+                        
+                        
+                        
+                        for t_obj in cat.get("topics", []):
+                            topic_title = (t_obj.get("title") or "").strip()
+                            description = (t_obj.get("description") or "").strip()
+
+                            # Recuperiamo l'importanza se presente, altrimenti default a 5
+                            importance = t_obj.get("importance", 5)
+
+                            # 🔥 DISPLAY FILTER LOGIC
+
+                            is_display_topic = True
+
+                            #if should_hide_topic(topic_title):
+                                #is_display_topic = False
+
+                        
+
+                            #if importance <= 4:
+                                #is_display_topic = False
+
+                            if not topic_title:
+                                continue
+
+                            # Manteniamo il titolo pulito senza regex aggressive che 
+                            # possono rovinare acronimi medici o tecnici
+                            topic_title = topic_title.strip()
+
+                            key = topic_title.lower().strip()
+                            if key in seen_titles:
+                                continue
+                            seen_titles.add(key)
+
+                            print(f"➡️ TOPIC: {topic_title} [{category_name}]")
+                            all_candidate_topics.append({
+                                "category": category_name,
+                                "topic": topic_title,
+                                "description": description,
+                                "importance": importance
+    })
+
+                           
+                            
+
+                except Exception as e:
+                    print(f"Error parsing JSON in chunk: {e}")
+                    continue 
+        print("🌍 STARTING GLOBAL TOPIC CONSOLIDATION")
+        from collections import defaultdict
+
+        section_map = defaultdict(list)
+
+        for t in all_candidate_topics:
+
+            category = t["category"]
+
+            section_map[category].append(t)
+
+        topics_text = ""
+
+        MAX_TOPICS_FOR_CONSOLIDATION = 120
+
+        for category, topics in section_map.items():
+
+            print("🧠 CONSOLIDATION CATEGORY:", category)
+            print("🧠 CONSOLIDATION TOPICS:", len(topics))
+
+            topics_text += f"\n\n=== CATEGORY: {category} ===\n"
+
+            for t in topics[:MAX_TOPICS_FOR_CONSOLIDATION]:
+
+                topics_text += f"""
+        TOPIC: {t['topic']}
+        DESCRIPTION: {t['description']}
+        IMPORTANCE: {t['importance']}
+        """
+
+        global_prompt = f"""
+        Act as a senior Instructional Designer and Knowledge Architect.
+
+        You are given MANY candidate Study Topics extracted from different portions of the same document.
+
+        Your task is to CONSOLIDATE them into a SINGLE coherent educational taxonomy.
+
+        GOALS:
+        - Merge ONLY genuinely redundant or overlapping Topics.
+        - NEVER merge Topics belonging to different Categories.
+        - Categories represent hard educational boundaries.
+        - Topics from different Categories must always remain separated even if semantically related.
+        - Preserve important educational subdomains as separate Topics.
+        - Do NOT merge Topics that belong to different conceptual depths.
+        Examples:
+        - "Forearm Muscles" and "Pronator Teres" are different depths.
+        - "Truth Tables" and "Sentential Logic" are different depths.
+        - Only merge Topics representing the same pedagogical level.
+        - Do NOT merge Topics that represent distinct study areas, even if related.
+        - Remove redundant Topics
+        - Eliminate overly granular Topics
+        - Create pedagogically balanced Study Topics with moderate granularity
+        - Ensure complete document coverage
+        - Preserve ALL major educational concepts
+
+        IMPORTANT:
+        - Categories must be broad academic domains.
+        - Topics must represent meaningful study units.
+        - Avoid fragmentation.
+        - Avoid duplicate or overlapping Topics.
+        - Prefer pedagogically balanced Topics.
+        Examples of Topics that SHOULD remain separate:
+        - Concepts that are independently studied
+        - Topics with distinct educational objectives
+        - Topics that support separate quiz generation
+        - Topics with substantially different conceptual scope
+        - Topics that are commonly taught as separate units
+        - Topics that require different reasoning processes or learning goals
+        - Avoid excessive fragmentation.
+        - Avoid overly broad mega-topics.
+        - A Topic should represent a focused but complete study unit.
+        - Topics should normally correspond to 15-30 minutes of focused study.
+        - Preserve important subdomains when they have substantial educational relevance.
+
+        Return ONLY valid JSON.
+
+        FORMAT:
+
+        {{
+        "categories": [
+            {{
+            "name": "CATEGORY",
+            "topics": [
+                {{
+                "title": "TOPIC",
+                "description": "DESCRIPTION",
+                "importance": 8
+                }}
             ]
             }}
+        ]
+        }}
 
-            CONTENT TO ANALYZE:
-            {group_text}
-            """
+        CANDIDATE TOPICS:
 
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                response_format={ "type": "json_object" } # Ensures stable JSON output[cite: 2]
-            )
+        {topics_text}
+        """
+        print("🚀 STARTING FINAL CONSOLIDATION CALL")
 
-            try:
-                data = json.loads(response.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+        final_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": global_prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
 
-                for cat in data.get("categories", []):
-                    # 2. LOGICA DI UNIFICAZIONE CATEGORIE
-                    raw_category = (cat.get("name") or "GENERAL").strip().upper()
-                    
-                    # Controlliamo se nel DB per questo progetto esiste già una categoria simile
-                    # Questo evita di avere "MUSCLE ACTION" e "MUSCLE ACTIONS" separati
-                    existing_cat_row = db.execute(
-                        text("select category from topics where project_id = :pid and category ilike :c limit 1"),
-                        {"pid": project_id, "c": raw_category}
-                    ).fetchone()
-                    
-                    category_name = existing_cat_row[0] if existing_cat_row else raw_category
-                    
-                    for t_obj in cat.get("topics", []):
-                        topic_title = (t_obj.get("title") or "").strip()
-                        description = (t_obj.get("description") or "").strip()
-                        # Recuperiamo l'importanza se presente, altrimenti default a 5
-                        importance = t_obj.get("importance", 5) 
+        final_data = json.loads(
+            final_response.choices[0].message.content
+        )
+        print("✅ FINAL CONSOLIDATION RESPONSE RECEIVED")
+        print("✅ GLOBAL CONSOLIDATION COMPLETE")
+        print(json.dumps(final_data, indent=2))
+        final_data = rebalance_taxonomy(final_data)        
+       
+        # 🔥 DELETE OLD TOPIC-CHUNK LINKS
 
-                        if not topic_title:
-                            continue
+        db.execute(
+            text("""
+                DELETE FROM topic_chunks
+                WHERE topic_id IN (
+                    SELECT id
+                    FROM topics
+                    WHERE project_id = :project_id
+                )
+            """),
+            {"project_id": project_id}
+        )
 
-                        # Manteniamo il titolo pulito senza regex aggressive che 
-                        # possono rovinare acronimi medici o tecnici
-                        topic_title = topic_title.strip()
+        # 🔥 DELETE OLD TOPICS
 
-                        key = topic_title.lower().strip()
-                        if key in seen_titles:
-                            continue
-                        seen_titles.add(key)
+        db.execute(
+            text("""
+                DELETE FROM topics
+                WHERE project_id = :project_id
+            """),
+            {"project_id": project_id}
+        )
 
-                        print(f"➡️ TOPIC: {topic_title} [{category_name}]")
-
-                        # 🔥 EMBEDDING
-                        try:
-                            print("🔥 CREO EMBEDDING...")
-                            # Includiamo anche la categoria nell'input dell'embedding 
-                            # per migliorare la precisione della ricerca
-                            emb_input = f"{category_name} - {topic_title}: {description}"
-                            
-                            emb = client.embeddings.create(
-                                model="text-embedding-3-small",
-                                input=emb_input
-                            )
-
-                            embedding = emb.data[0].embedding
-                            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-
-                        except Exception as e:
-                            print("❌ EMBEDDING ERROR:", e)
-                            continue
-
-                        # 🔥 INSERT 
-                        # Ho aggiunto la colonna 'importance' nel caso volessi usarla, 
-                        # se non l'hai nel DB, rimuovila dalla query
-                        db.execute(
-                            text("""
-                                insert into topics 
-                                (project_id, category, topic, description, embedding)
-                                values 
-                                (:project_id, :category, :topic, :description, CAST(:embedding AS vector))
-                            """),
-                            {
-                                "project_id": project_id, 
-                                "category": category_name, 
-                                "topic": topic_title, 
-                                "description": description,
-                                "embedding": embedding_str
-                            }
-                        )
-                db.commit() 
-
-            except Exception as e:
-                print(f"Error parsing JSON in chunk: {e}")
-                continue 
-                
-        assign_topics_to_chunks(project_id)
-
-        # 2. Final status update
-        db.execute(text("update projects set topic_status = 'completed' where id = :project_id"), {"project_id": project_id})
         db.commit()
-        print("TOPIC GENERATION COMPLETE")
+
+        print("🧹 OLD TOPICS + TOPIC_CHUNKS REMOVED")
+        for cat in final_data.get("categories", []):
+
+            category_name = (
+                cat.get("name") or "GENERAL"
+            ).strip().upper()
+
+            for t_obj in cat.get("topics", []):
+
+                topic_title = (
+                    t_obj.get("title") or ""
+                ).strip()
+
+                description = (
+                    t_obj.get("description") or ""
+                ).strip()
+
+                importance = t_obj.get("importance", 5)
+
+                if not topic_title:
+                    continue
+
+                is_display_topic = True
+
+                #if should_hide_topic(topic_title):
+                    #is_display_topic = False
+
+                #if importance <= 4:
+                    #is_display_topic = False
+
+                emb_input = (
+                    f"{category_name} - "
+                    f"{topic_title}: "
+                    f"{description}"
+                )
+
+                emb = client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=emb_input
+                )
+
+                embedding = emb.data[0].embedding
+
+                embedding_str = "[" + ",".join(
+                    map(str, embedding)
+                ) + "]"
+
+                db.execute(
+                    text("""
+                        insert into topics
+                        (
+                            project_id,
+                            category,
+                            topic,
+                            description,
+                            embedding,
+                            is_display_topic,
+                            source_section
+                        )
+                        values
+                        (
+                            :project_id,
+                            :category,
+                            :topic,
+                            :description,
+                            CAST(:embedding AS vector),
+                            :is_display_topic,
+                            :source_section
+                        )
+                    """),
+                    {
+                        "project_id": project_id,
+                        "category": category_name,
+                        "topic": topic_title,
+                        "description": description,
+                        "embedding": embedding_str,
+                        "is_display_topic": is_display_topic,
+                        "source_section": category_name
+                    }
+                )
+
+        db.commit()
+        print("🧠 STARTING TOPIC-CHUNK ASSIGNMENT")
+
+        try:
+            assign_topics_to_chunks(project_id)
+            print("✅ TOPIC-CHUNK ASSIGNMENT COMPLETED")
+        except Exception as e:
+            print("❌ TOPIC-CHUNK ASSIGNMENT FAILED:", e)
+
+        
+        # ======================
+        # FINAL STATUS UPDATE
+        # ======================
+
+        
+
+        final_db = SessionLocal()
+
+        final_db.execute(
+            text("""
+                UPDATE projects
+                SET topic_status = 'completed'
+                WHERE id = :project_id
+            """),
+            {"project_id": project_id}
+        )
+
+        final_db.commit()
+
+        check = final_db.execute(
+            text("""
+                SELECT topic_status
+                FROM projects
+                WHERE id = :project_id
+            """),
+            {"project_id": project_id}
+        ).fetchone()
+
+        print("✅ PROJECT TOPIC STATUS = COMPLETED")
+        print("🔥 STATUS READBACK:", check[0])
+
+        final_db.close()
+        
 
     except Exception as e:
         db.rollback()
@@ -664,40 +1108,239 @@ def process_topics_task(project_id: str):
         db.close()
 
 def assign_topics_to_chunks(project_id: str):
+
     db = SessionLocal()
 
     try:
-        print("🔗 START TOPIC ASSIGNMENT")
 
-        db.execute(text("""
-            update chunks c
-            set topic = sub.topic
-            from (
+        print("🔗 START TOPIC ASSIGNMENT")
+        print("🧪 ENTER assign_topics_to_chunks")
+
+        # pulizia link precedenti
+        db.execute(
+            text("""
+                delete from topic_chunks
+                where topic_id in (
+                    select id
+                    from topics
+                    where project_id = :project_id
+                )
+            """),
+            {"project_id": project_id}
+        )
+
+        # 🔥 RECUPERA MATCH CANDIDATI
+
+        matches = db.execute(
+            text("""
                 select
                     c.id as chunk_id,
+                    c.chunk_text,
+                    c.section,
+
+                    t.id as topic_id,
                     t.topic,
-                    row_number() over (
-                        partition by c.id
-                        order by c.embedding <-> t.embedding
-                    ) as rn
+                    t.category,
+                    t.source_section,
+
+                    (
+                        c.embedding <#> t.embedding
+                    ) as similarity
+
                 from chunks c
                 join topics t
                     on c.project_id = t.project_id
-                where c.project_id = :project_id
-            ) sub
-            where c.id = sub.chunk_id
-              and sub.rn = 1
-        """), {"project_id": project_id})
+
+                where
+                    c.project_id = :project_id
+            """),
+            {"project_id": project_id}
+        ).fetchall()
+        print("🔢 TOPIC ASSIGNMENT MATCHES:", len(matches))
+        print("🧪 MATCH QUERY COMPLETED")
+        print("🧪 TOTAL MATCHES:", len(matches))
+
+        if len(matches) > MAX_ASSIGNMENT_MATCHES:
+            print("⚠️ TOO MANY MATCHES - applying safety cap")
+            matches = matches[:MAX_ASSIGNMENT_MATCHES]
+
+        links_created = 0
+        assignments = set()
+
+        processed_matches = 0
+
+        for row in matches:
+            processed_matches += 1
+
+            if processed_matches % 5000 == 0:
+                print("🧪 PROCESSED MATCHES:", processed_matches)
+
+            chunk_id = row[0]
+            chunk_text = (row[1] or "").lower()
+            chunk_section = (row[2] or "").lower()
+
+            topic_id = row[3]
+            topic_name = (row[4] or "").lower()
+            topic_category = (row[5] or "").lower()
+            topic_section = (row[6] or "").lower()
+
+            similarity = row[7]
+            same_section = (
+                chunk_section == topic_section
+            )
+
+            # 🔥 KEYWORD OVERLAP
+
+            topic_words = [
+                w for w in topic_name.split()
+                if len(w) > 4
+            ]
+
+            keyword_overlap = sum(
+                1 for w in topic_words
+                if w in chunk_text
+            )
+
+            # 🔥 SECTION BONUS
+
+            
+
+            section_bonus = 0
+
+            if same_section:
+                section_bonus += 0.20
+
+            # 🔥 FINAL SCORE
+
+            final_score = (
+                similarity
+                + section_bonus
+                + (keyword_overlap * 0.05)
+            )
+
+            if final_score > -0.55:
+
+                key = (topic_id, chunk_id)
+
+                if key in assignments:
+                    continue
+
+                assignments.add(key)
+
+                db.execute(
+                    text("""
+                        insert into topic_chunks
+                        (topic_id, chunk_id)
+                        values
+                        (:topic_id, :chunk_id)
+                    """),
+                    {
+                        "topic_id": topic_id,
+                        "chunk_id": chunk_id
+                    }
+                )
+
+                links_created += 1
 
         db.commit()
-        print("✅ TOPIC ASSIGNMENT DONE")
+        print("🧪 FINAL ASSIGNMENT COMMIT DONE")
+
+        count = db.execute(
+            text("""
+                select count(*)
+                from topic_chunks tc
+                join topics t
+                    on tc.topic_id = t.id
+                where t.project_id = :project_id
+            """),
+            {"project_id": project_id}
+        ).fetchone()[0]
+
+        print(f"✅ SAVED {links_created} TOPIC-CHUNK LINKS")
 
     except Exception as e:
+
         db.rollback()
         print("❌ TOPIC ASSIGNMENT ERROR:", e)
 
     finally:
         db.close()
+
+def detect_section_title(text: str, current_section="GENERAL"):
+
+    if not text:
+        return current_section
+
+    lines = [
+        l.strip()
+        for l in text.split("\n")
+        if l.strip()
+    ]
+
+    strong_candidates = []
+
+    for line in lines[:15]:
+
+        clean = line.strip()
+
+        upper_ratio = (
+            sum(1 for c in clean if c.isupper())
+            / max(len(clean), 1)
+        )
+
+        if (
+            upper_ratio > 0.7
+            and 2 <= len(clean.split()) <= 8
+        ):
+            strong_candidates.append(clean.upper())
+
+        anatomical_keywords = [
+            "upper limb",
+            "lower limb",
+            "shoulder",
+            "arm",
+            "forearm",
+            "hand",
+            "hip",
+            "thigh",
+            "leg",
+            "foot",
+            "pelvis"
+        ]
+
+        if any(
+            kw in clean.lower()
+            for kw in anatomical_keywords
+        ):
+            strong_candidates.append(clean.upper())
+
+        
+
+        if len(clean) < 5 or len(clean) > 120:
+            continue
+
+        
+
+        
+
+        if (
+            any(k in clean.lower() for k in anatomical_keywords)
+            and upper_ratio > 0.5
+        ):
+
+            if upper_ratio > 0.45:
+                strong_candidates.append(clean)
+
+    if strong_candidates:
+
+        best = max(
+            strong_candidates,
+            key=len
+        )
+
+        return best.upper()
+
+    return current_section
 
 @app.post("/projects/{project_id}/ingest_stream")
 async def ingest_stream(
@@ -755,14 +1398,51 @@ async def ingest_stream(
 
                 reader = PdfReader(pdf_stream)
 
+                total_pages = len(reader.pages)
+
+                yield f"FILE_ANALYSIS|pages={total_pages}\n"
+
+                if total_pages > MAX_WARNING_PAGES:
+                    yield (
+                        "LARGE_FILE_WARNING|"
+                        f"pages={total_pages}|"
+                        "message=Large academic file detected. "
+                        "We can process it, but topic generation may take longer. "
+                        "For best results, consider splitting very large files by chapter.\n"
+                    )
+
+                current_section = (
+                    clean_text(doc.title)
+                    .upper()
+                )
                 for page_index, page in enumerate(reader.pages):
                     
 
                     yield f"Page {page_index+1}\n"
+                    db.execute(
+                        text("""
+                            UPDATE projects
+                            SET last_processed_page = :page
+                            WHERE id = :project_id
+                        """),
+                        {
+                            "page": page_index + 1,
+                            "project_id": project_id
+                        }
+                    )
+
+                    db.commit()
 
                     page_text = page.extract_text()
 
                     page_text = clean_text(page_text)
+                    current_section = detect_section_title(
+                        page_text,
+                        current_section
+                    )
+
+                    section_title = current_section
+                    print(f"📚 DETECTED SECTION: {section_title}")
 
                     if not page_text or not page_text.strip():
                         yield f"OCR page {page_index+1}\n"
@@ -799,9 +1479,9 @@ async def ingest_stream(
                         db.execute(
                             text("""
                                 insert into chunks
-                                (project_id, doc_title, chunk_text, embedding, page, topic)
+                                (project_id, doc_title, chunk_text, embedding, page, topic, section)
                                 values
-                                (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page, :topic)
+                                (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page, :topic, :section)
                             """),
                             {
                                 "project_id": project_id,
@@ -809,7 +1489,8 @@ async def ingest_stream(
                                 "chunk_text": chunk,
                                 "embedding": embedding_str,
                                 "page": page_index + 1,      
-                                "topic": normalize_string(doc.title) if doc.title else "General"
+                                "topic": None,
+                                "section": section_title
                             }
                         )
                         db.commit()
@@ -874,6 +1555,114 @@ def expand_topics_with_db(project_id, topics, db):
         return topics
 
     return list(set(expanded))
+
+# ======================
+# LEARNING SCOPE
+# ======================
+
+def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
+    db = SessionLocal()
+
+    try:
+        topic_ids = topic_ids or []
+
+        if topic_ids:
+            scope_type = "single_topic" if len(topic_ids) == 1 else "multi_topic"
+
+            rows = db.execute(
+                text("""
+                    SELECT
+                        c.id,
+                        c.chunk_text,
+                        c.doc_title,
+                        c.page,
+                        t.topic,
+                        t.id as topic_id
+                    FROM topic_chunks tc
+                    JOIN chunks c
+                        ON c.id = tc.chunk_id
+                    JOIN topics t
+                        ON t.id = tc.topic_id
+                    WHERE t.project_id = :project_id
+                    AND tc.topic_id IN :topic_ids
+                    AND c.chunk_text IS NOT NULL
+                    AND length(c.chunk_text) > 100
+                    LIMIT :limit
+                """),
+                {
+                    "project_id": project_id,
+                    "topic_ids": tuple(topic_ids),
+                    "limit": limit
+                }
+            ).fetchall()
+
+        else:
+            scope_type = "global"
+
+            rows = db.execute(
+                text("""
+                    SELECT
+                        c.id,
+                        c.chunk_text,
+                        c.doc_title,
+                        c.page,
+                        COALESCE(t.topic, 'General') as topic,
+                        t.id as topic_id
+                    FROM chunks c
+                    LEFT JOIN topic_chunks tc
+                        ON tc.chunk_id = c.id
+                    LEFT JOIN topics t
+                        ON t.id = tc.topic_id
+                    WHERE c.project_id = :project_id
+                    AND c.chunk_text IS NOT NULL
+                    AND length(c.chunk_text) > 100
+                    ORDER BY RANDOM()
+                    LIMIT :limit
+                """),
+                {
+                    "project_id": project_id,
+                    "limit": limit
+                }
+            ).fetchall()
+
+        chunks = []
+
+        for r in rows:
+            chunks.append({
+                "chunk_id": str(r[0]),
+                "chunk_text": r[1],
+                "doc_title": r[2],
+                "page": r[3],
+                "topic": r[4],
+                "topic_id": str(r[5]) if r[5] else None
+            })
+
+        topic_map = {
+            c["chunk_id"]: c["topic"]
+            for c in chunks
+            if c.get("topic")
+        }
+
+        topics = {}
+
+        for c in chunks:
+            if c["topic_id"]:
+                topics[c["topic_id"]] = {
+                    "id": c["topic_id"],
+                    "topic": c["topic"]
+                }
+
+        return {
+            "scope_type": scope_type,
+            "topic_ids": topic_ids,
+            "topics": list(topics.values()),
+            "chunks": chunks,
+            "topic_map": topic_map,
+            "chunk_count": len(chunks)
+        }
+
+    finally:
+        db.close()
 # ======================
 # GENERATE QUIZ
 # ======================
@@ -886,6 +1675,7 @@ def generate_quiz(
 ):
     # 🔥 PRINT 1 — INIZIO FUNZIONE
     print("🔥 ENTER generate_quiz")
+    print("🔥 FULL REQUEST:", req.dict())
 
     user_id = user["id"]
     db = SessionLocal()
@@ -924,7 +1714,25 @@ def generate_quiz(
     # ======================
 
     print(f"DEBUG: Avvio generazione quiz per progetto {project_id}")
-    print("📥 TOPICS:", req.topics)
+
+    # 🔥 NUOVO SISTEMA
+    topic_ids = req.topic_ids or []
+
+    scope = resolve_learning_scope(project_id, topic_ids, limit=80)
+
+    print("🧠 LEARNING SCOPE:", scope["scope_type"])
+    print("📦 SCOPE CHUNKS:", scope["chunk_count"])
+    print("🎯 SCOPE TOPICS:", scope["topics"][:3])
+
+    # 🔥 LEGACY
+    legacy_topics = req.topics or []
+
+    print("📥 TOPIC IDS:", topic_ids)
+    print("📥 LEGACY TOPICS:", legacy_topics)
+    print("🔥 QUIZ REQUEST RECEIVED")
+    print("topic_ids:", topic_ids)
+    print("legacy_topics:", legacy_topics)
+    print("num_questions:", req.num_questions)
     
     # 1. RETRIEVAL POTENZIATO (120 chunk)
     query_text = " ".join(req.topics) if req.topics else "General overview of the provided documents"
@@ -933,92 +1741,47 @@ def generate_quiz(
 
     rows = []
 
-    # 🔥 prendiamo tutti i chunk una volta sola
-    all_rows = db.execute(
-        text("""
-            SELECT id, chunk_text, doc_title, page, topic
-            FROM chunks
-            WHERE project_id = :project_id
-        """),
-        {"project_id": project_id}
-    ).fetchall()
+    rows = []
 
-    if req.topics:
-        normalized_targets = [normalize_string(t) for t in req.topics]
+    # =====================================
+    # NEW LEARNING GRAPH RETRIEVAL
+    # =====================================
 
-        for r in all_rows:
-            topic_db = normalize_string(r[4])
+    scope = resolve_learning_scope(
+        project_id=project_id,
+        topic_ids=topic_ids,
+        limit=80
+    )
 
-            for target in normalized_targets:
-                if (
-                    topic_db == target
-                    or topic_db.startswith(target)
-                    or target.startswith(topic_db)
-                ):
-                    rows.append(r)
-                    break
+    print("🧠 LEARNING SCOPE:", scope["scope_type"])
 
-        # 🔥 rimuovi duplicati
-        rows = list({r[0]: r for r in rows}.values())
+    retrieved_chunks = scope["chunks"]
 
-        print("🎯 FILTERED QUIZ ROWS:", len(rows))
+    print("📦 RETRIEVED CHUNKS:", len(retrieved_chunks))
 
-        import random
-        random.shuffle(rows)
+    topic_map = scope["topic_map"]
 
-        rows = rows[:min(len(rows), 80)]
 
-    else:
-        print("🌍 GLOBAL QUIZ MODE (SAFE)")
-
-    if req.topics is None:
-        print("🌍 GLOBAL QUIZ MODE (ROUND ROBIN ROTATION)")
-        # Questa query garantisce che venga preso un pezzo di testo per OGNI topic prima di passare al secondo
-        rows = db.execute(
-            text("""
-                WITH RankedChunks AS (
-                    SELECT 
-                        id, chunk_text, doc_title, page, topic,
-                        ROW_NUMBER() OVER (PARTITION BY topic ORDER BY RANDOM()) as rn
-                    FROM chunks
-                    WHERE project_id = :project_id
-                      AND chunk_text IS NOT NULL
-                      AND length(chunk_text) > 100
-                )
-                SELECT id, chunk_text, doc_title, page, topic
-                FROM RankedChunks
-                ORDER BY rn, topic
-                LIMIT 80
-            """),
-            {"project_id": project_id}
-        ).fetchall()
-    else:
-        # Se l'utente ha selezionato topic specifici, filtriamo i chunk caricati prima
-        normalized_targets = [normalize_string(t) for t in req.topics]
-        filtered_rows = []
-        for r in all_rows:
-            topic_db = normalize_string(r[4])
-            if any(topic_db == target or topic_db.startswith(target) for target in normalized_targets):
-                filtered_rows.append(r)
-        
-        import random
-        random.shuffle(filtered_rows)
-        rows = filtered_rows[:min(len(filtered_rows), 80)]
-
-    # 🔍 DEBUG CHUNKS (Lascialo così vedi nel terminale se i topic ruotano)
-    for r in rows[:5]:
-        print(f"📄 CHUNK DA TOPIC: {r[4]} | TESTO: {r[1][:100]}...")
+    for c in retrieved_chunks[:5]:
+        print(
+            f"📄 CHUNK DA TOPIC: {c['topic']} | TESTO: {c['chunk_text'][:100]}..."
+        )
 
     chunk_topic_map = {
-        str(r[0]): " ".join(str(r[4]).split()) 
-        for r in rows if r[4]
+        c["chunk_id"]: " ".join(str(c["topic"]).split())
+        for c in retrieved_chunks
+        if c["topic"]
     }
+    print("🧠 CHUNK TOPIC MAP SAMPLE:")
+    print(list(chunk_topic_map.items())[:5])
 
     if req.topics:
         active_topics = [normalize_string(t) for t in req.topics]
     else:
         active_topics = list(set(
-            normalize_string(r[4]) for r in rows if r[4]
+            normalize_string(c["topic"])
+            for c in retrieved_chunks
+            if c["topic"]
         )) or ["General"]
 
     # 4. Fallback se non ci sono topic
@@ -1028,7 +1791,7 @@ def generate_quiz(
     print("🎯 ACTIVE TOPICS (CLEANED):", active_topics)
     
 
-    if not rows:
+    if not retrieved_chunks:
         db.close()
         return {"quiz": []}
 
@@ -1044,17 +1807,20 @@ def generate_quiz(
         import random
 
         # 🔥 scegli chunk diversi ogni volta
-        valid_rows = [
-            r for r in rows
-            if r[1] and r[4] and normalize_string(r[4]) in active_topics
+        valid_chunks = [
+            c for c in retrieved_chunks
+            if c["chunk_text"]
+            and c["topic"]
+            and normalize_string(c["topic"]) in active_topics
         ]
 
-        sample_size = min(15, len(valid_rows))
-        sampled_rows = random.sample(valid_rows, sample_size)
+        sample_size = min(15, len(valid_chunks))
+
+        sampled_chunks = random.sample(valid_chunks, sample_size)
 
         context = "\n\n".join([
-            f"### CHUNK_ID: {r[0]} | TOPIC: {r[4]}\n{r[1]}"
-            for r in sampled_rows
+            f"### CHUNK_ID: {c['chunk_id']} | TOPIC: {c['topic']}\n{c['chunk_text']}"
+            for c in sampled_chunks
         ])
         max_attempts -= 1  # Decrementiamo qui una volta sola
         remaining = target_count - len(all_questions)
@@ -1136,12 +1902,13 @@ def generate_quiz(
                         q["correct_answer"] = correct_val
                         q["correct"] = correct_val
 
-                        print("🧩 CHUNK ID:", chunk_id)
-                        print("🧩 TOPIC FROM MAP:", chunk_topic_map.get(chunk_id))
-                        print("🧠 TOPIC FROM GPT:", q.get("topic"))
+                       
 
-                        # 🔥 SINCRONIZZAZIONE TOPIC E CAMPI
                         topic_from_db = chunk_topic_map.get(chunk_id)
+
+                        
+                        # 🔥 SINCRONIZZAZIONE TOPIC E CAMPI
+                        
                         if topic_from_db:
                             q["topic"] = topic_from_db
                         else:
@@ -1625,24 +2392,37 @@ async def generate_flashcards(
     
     try:
         num_cards = 10
+
         topics_list = []
+        topic_ids = []
+
         if req and isinstance(req, dict):
+
             num_cards = req.get("num_cards", 10)
+
             topics_list = req.get("topics", [])
-            if isinstance(topics_list, str): topics_list = [topics_list]
+            topic_ids = req.get("topic_ids", [])
+
+            if isinstance(topics_list, str):
+                topics_list = [topics_list]
 
         print(f"🔥 START FLASHCARDS: Project {project_id} | Topics: {topics_list}")
 
-        # 1. RECUPERO CHUNK (Logica Study Session)
-        context_chunks = search_project_chunks(
+        # =====================================
+        # NEW LEARNING GRAPH RETRIEVAL
+        # =====================================
+
+        scope = resolve_learning_scope(
             project_id=project_id,
-            topics=topics_list if len(topics_list) > 0 else None,
-            k=30 
+            topic_ids=req.get("topic_ids", []),
+            limit=30
         )
 
-        if not context_chunks:
-            print("⚠️ NO CHUNKS FOUND con topic → fallback globale")
-            context_chunks = search_project_chunks(project_id=project_id, k=30)
+        print("🧠 FLASHCARD LEARNING SCOPE:", scope["scope_type"])
+
+        context_chunks = scope["chunks"]
+
+        print("📦 FLASHCARD CHUNKS:", len(context_chunks))
 
         if not context_chunks:
             print("❌ NESSUN TESTO TROVATO NEL PROGETTO")
@@ -1656,7 +2436,9 @@ async def generate_flashcards(
             topic_name = c.get("topic") or "General"
             chunk_topic_map[cid] = topic_name
             # Usiamo 'text' perché search_project_chunks restituisce dizionari con 'text'
-            context_blocks.append(f"### CHUNK_ID: {cid} | TOPIC: {topic_name}\n{c.get('text', '')}")
+            context_blocks.append(
+                f"### CHUNK_ID: {cid} | TOPIC: {topic_name}\n{c.get('chunk_text', '')}"
+            )
 
         context_text = "\n\n".join(context_blocks)
 
@@ -1744,41 +2526,7 @@ async def generate_flashcards(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-    # ======================
-    # SAVE FLASHCARDS
-    # ======================
-
-    db = SessionLocal()
-
-    for card in flashcards:
-        if not card.get("topic"):
-            print("⚠️ FLASHCARD WITHOUT TOPIC SKIPPED:", card.get("question"))
-            continue
-
-        result = db.execute(
-            text("""
-            insert into flashcards
-            (project_id, user_id, question, answer, topic)
-            values
-            (:project_id, :user_id, :question, :answer, :topic)
-            returning id
-            """),
-            {
-                "project_id": project_id,
-                "user_id": user_id,
-                "question": card.get("question"),
-                "answer": card.get("answer"),
-                "topic": card.get("topic")
-            }
-        )
-
-        new_id = result.fetchone()[0]
-        card["id"] = new_id
-
-    db.commit()
-    db.close()
-
-    return {"flashcards": flashcards}
+    
 def search_project_chunks(
     project_id: str,
     query: str = None,
@@ -1889,6 +2637,16 @@ def search_project_chunks(
         text_chunk = r[0]
         chunk_topic = r[3]
 
+        if (
+            not chunk_topic
+            or str(chunk_topic).lower().endswith(".pdf")
+        ):
+            chunk_topic = (
+                normalize_string(r[1])
+                .replace(".pdf", "")
+                .replace("_", " ")
+            )
+
         
 
         chunks.append({
@@ -1912,10 +2670,11 @@ async def get_topics(project_id: str):
         # We now select category, topic, and description
         result = db.execute(
             sql_text("""
-                SELECT category, topic, description 
+                SELECT id, category, topic, description  
                 FROM topics 
                 WHERE project_id = :project_id
-                AND topic IS NOT NULL 
+                AND topic IS NOT NULL
+                AND is_display_topic = true
                 ORDER BY category ASC, topic ASC
             """), 
             {"project_id": project_id}
@@ -1923,40 +2682,54 @@ async def get_topics(project_id: str):
         rows = result.fetchall()
         
         # We format them into the structured object your UI needs
-        return {"topics": [
-            {
-                "category": r[0] or "General",
-                "topic": r[1],
-                "description": r[2] or "",
-                "difficulty": "medium",
-                "accuracy": 50
-            } for r in rows
-        ]}
+        return {
+            "topics": [
+                {
+                    "id": str(r[0]),
+                    "category": r[1] or "General",
+                    "topic": r[2],
+                    "description": r[3] or "",
+                    "difficulty": "medium",
+                    "accuracy": 50
+                }
+                for r in rows
+            ]
+        }
     finally:
         db.close()
 
 @app.get("/projects/{project_id}/topic_status")
+
 def get_topic_status(
     project_id: str,
     user = Depends(verify_user)
 ):
-    db = SessionLocal()
+    from sqlalchemy.orm import sessionmaker
 
+    FreshSession = sessionmaker(bind=engine)
+
+    db = FreshSession()
+    db.expire_all()
+    print("🧠 TOPIC STATUS REQUEST FOR:", project_id)
     try:
+        print("🔄 FORCING FRESH STATUS READ")
         row = db.execute(
             text("""
-                select topic_status
+                select topic_status, last_processed_page
                 from projects
                 where id = :project_id
             """),
             {"project_id": project_id}
         ).fetchone()
-
+        print("📦 RAW DB ROW:", row)
         if not row:
             raise HTTPException(status_code=404, detail="Project not found")
 
+        print("🔥 RAW STATUS FROM DB:", row[0])
+
         return {
-            "status": row[0] or "idle"
+            "status": row[0] or "idle",
+            "last_processed_page": row[1] or 0
         }
 
     finally:
@@ -2005,10 +2778,10 @@ async def get_flashcards(project_id: str):
 
     rows = db.execute(
         text("""
-            select question, answer
+            select id, question, answer, topic
             from flashcards
             where project_id = :project_id
-            order by created_at desc
+            order by random()
         """),
         {"project_id": project_id}
     ).fetchall()
@@ -2019,8 +2792,10 @@ async def get_flashcards(project_id: str):
 
     for r in rows:
         flashcards.append({
-            "question": r[0],
-            "answer": r[1]
+            "id": r[0],
+            "question": r[1],
+            "answer": r[2],
+            "topic": r[3]
         })
 
     return {"flashcards": flashcards}
@@ -2106,7 +2881,7 @@ async def project_summary(project_id: str, user = Depends(verify_user)):
             "quiz_attempts": int(quiz_stats[0]) if quiz_stats[0] else 0,
             "messaggio_segreto": "Sto leggendo questo file!",
             "avg_score": round(float(quiz_stats[1]), 1) if quiz_stats[1] else 0,
-            "topics_count": len(topics_detail_list),
+            "topics_count": len(topic_mastery),
             "flashcards_reviewed": f_count, # La variabile del conteggio flashcard
             "quiz_history": quiz_history_list,    # <--- FONDAMENTALE
             "topics_detail": topics_detail_list,  # <--- FONDAMENTALE
@@ -2292,43 +3067,197 @@ async def project_results(
     # ======================
     # TOPIC ACCURACY
     # ======================
-
-    topic_rows = db.execute(
+    attempt_rows = db.execute(
         text("""
-            select qq.topic,
-                    sum(case when qa.is_correct then 1 else 0 end) as correct,
-                    count(*) as total
-            from quiz_answers qa
-            join quiz_questions qq on qa.question_id = qq.id
-            join quizzes q on qq.quiz_id = q.id
-            where q.project_id = :project_id
-            group by qq.topic
+            select answers
+            from quiz_attempts
+            where project_id = :project_id
+            and user_id = :user_id
         """),
-        
-        {"project_id": project_id}
-    
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
     ).fetchall()
-    print("🔥 ACCURACY DEBUG topic_rows :", topic_rows)
-    topic_mastery = {
-    r[0]: {
-        "correct": int(r[1]),
-        "total": int(r[2])
-    }
-    for r in topic_rows
-}
 
-    for r in topic_rows:
+    topic_mastery_map = {}
+
+    for row in attempt_rows:
+
+        answers = row[0] or []
+
+        for a in answers:
+
+            topic = a.get("topic", "general")
+
+            if topic not in topic_mastery_map:
+                topic_mastery_map[topic] = {
+                    "correct": 0,
+                    "total": 0
+                }
+
+            topic_mastery_map[topic]["total"] += 1
+
+            if a.get("is_correct"):
+                topic_mastery_map[topic]["correct"] += 1
+
+    topic_mastery = []
+
+    for topic, stats in topic_mastery_map.items():
+
+        accuracy = 0
+
+        if stats["total"] > 0:
+            accuracy = round(
+                (stats["correct"] / stats["total"]) * 100,
+                1
+            )
+
         topic_mastery.append({
-            "topic": r[0],
-            "accuracy": round((r[1] or 0) * 100,1)
+            "topic": topic,
+            "correct": stats["correct"],
+            "total": stats["total"],
+            "accuracy": accuracy
         })
+
+    # ======================
+    # GLOBAL QUIZ METRICS
+    # ======================
+
+    total_correct = sum(
+        t["correct"] for t in topic_mastery
+    )
+
+    total_questions = sum(
+        t["total"] for t in topic_mastery
+    )
+
+    total_wrong = total_questions - total_correct
+
+    average_accuracy = 0
+
+    if total_questions > 0:
+        average_accuracy = round(
+            (total_correct / total_questions) * 100,
+            1
+        )
+
+
+    # ======================
+    # FLASHCARD METRICS
+    # ======================
+
+    flashcard_stats = db.execute(
+        text("""
+            SELECT
+                COUNT(*) as total_reviews,
+                SUM(
+                    CASE
+                        WHEN is_correct THEN 1
+                        ELSE 0
+                    END
+                ) as correct_reviews
+            FROM flashcard_reviews
+            WHERE project_id = :project_id
+            AND user_id = :user_id
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
+    ).fetchone()
+
+    flashcard_reviews_count = int(flashcard_stats[0] or 0)
+    flashcard_correct = int(flashcard_stats[1] or 0)
+
+    flashcard_accuracy = 0
+
+    if flashcard_reviews_count > 0:
+        flashcard_accuracy = round(
+            (flashcard_correct / flashcard_reviews_count) * 100,
+            1
+        )
+
+    # ======================
+    # DUE TODAY
+    # ======================
+
+    due_today = db.execute(
+        text("""
+            select count(*)
+            from flashcards
+            where project_id = :project_id
+            and user_id = :user_id
+            and next_review is not null
+            and next_review <= now()
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
+    ).scalar()
+
+    if due_today is None:
+        due_today = 0
+
+    # ======================
+    # MOST FORGOTTEN TOPICS
+    # ======================
+
+    forgotten_rows = db.execute(
+        text("""
+            select
+                topic,
+                sum(
+                    case
+                        when is_correct then 1
+                        else 0
+                    end
+                ) as correct,
+                count(*) as total
+            from flashcard_reviews
+            where project_id = :project_id
+            and user_id = :user_id
+            and topic is not null
+            group by topic
+            having count(*) >= 2
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
+    ).fetchall()
+
+    forgotten_topics = []
+
+    for r in forgotten_rows:
+
+        accuracy = 0
+
+        if r[2] > 0:
+            accuracy = round((r[1] / r[2]) * 100, 1)
+
+        forgotten_topics.append({
+            "topic": r[0],
+            "accuracy": accuracy,
+            "reviews": int(r[2])
+        })
+
+    forgotten_topics.sort(key=lambda x: x["accuracy"])
+
+    # ======================
+    # WEAK AREAS
+    # ======================
+
+    weak_areas = sorted(
+        topic_mastery,
+        key=lambda x: x["accuracy"]
+    )[:3]
 
     db.close()
 
-    return {
-        "quiz_history": quiz_history,
-        "topic_mastery": topic_mastery
-    }
+
+   
     # ======================
     # QUIZ ATTEMPTS
     # ======================
@@ -2337,14 +3266,12 @@ async def project_results(
         text("""
             select count(*)
             from quiz_attempts
-            where user_id = :user_id
-            and quiz_id in (
-                select id from quizzes where project_id = :project_id
-            )
+            where project_id = :project_id
+            and user_id = :user_id
         """),
         {
-            "user_id": user_id,
-            "project_id": project_id
+            "project_id": project_id,
+            "user_id": user_id
         }
     ).scalar()
 
@@ -2406,11 +3333,41 @@ async def project_results(
 
     db.close()
 
-    return {
+    print("🔥 FINAL RESULTS RESPONSE:")
+    print({
+        "quiz_history": quiz_history,
+        "topic_mastery": topic_mastery,
+        "topics_detail": topic_mastery,
         "quiz_attempts": quiz_attempts or 0,
         "avg_score": round(avg_score, 1),
+    })
+
+    return {
+        "quiz_history": quiz_history,
+        "topic_mastery": topic_mastery,
+        "topics_detail": topic_mastery,
+
+        # QUIZ METRICS
+        "quiz_attempts": quiz_attempts or 0,
+        "total_correct": total_correct,
+        "total_wrong": total_wrong,
+        "average_accuracy": average_accuracy,
+
+        # FLASHCARD METRICS
+        "flashcard_reviews": flashcard_reviews_count,
+        "flashcard_accuracy": flashcard_accuracy,
+
+        # RETENTION INTELLIGENCE
+        "due_today": due_today,
+        "forgotten_topics": forgotten_topics[:3],
+
+        # LEARNING METRICS
+        "avg_score": round(avg_score, 1),
         "flashcards_reviewed": flashcards_reviewed or 0,
-        "topics_count": topics_count or 0
+        "topics_count": topics_count or 0,
+
+        # DIAGNOSTICS
+        "weak_areas": weak_areas
     }
 @app.get("/projects/{project_id}/flashcards_count")
 async def flashcards_count(project_id: str):
@@ -2461,9 +3418,8 @@ async def study_flashcards(project_id: str, limit: int = 20):
         })
 
     return {"flashcards": cards}
+
 @app.post("/review_flashcard")
-
-
 async def review_flashcard(
     req: dict = Body(...),
     user = Depends(verify_user)
@@ -2545,7 +3501,7 @@ async def review_flashcard(
 
         flashcard_row = db.execute(
             text("""
-                select project_id, user_id
+                select project_id, topic
                 from flashcards
                 where id = :flashcard_id
             """),
@@ -2553,7 +3509,13 @@ async def review_flashcard(
                 "flashcard_id": flashcard_id
             }
         ).fetchone()
-
+        print("🔥 SAVING FLASHCARD REVIEW:", {
+            "flashcard_id": flashcard_id,
+            "project_id": flashcard_row[0],
+            "user_id": user["id"],
+            "topic": flashcard_row[1],
+            "is_correct": is_correct
+        })
         if flashcard_row:
             db.execute(
                 text("""
@@ -2569,7 +3531,7 @@ async def review_flashcard(
                     "is_correct": is_correct,
                     "difficulty": difficulty,
                     "elapsed_seconds": req.get("elapsed_seconds", 0),
-                    "topic": flashcard_row[2]
+                    "topic": flashcard_row[1]
                 }
             )
 
@@ -2697,7 +3659,7 @@ async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
                     "quiz_id": quiz_id,
                     "question_id": a.get("question_id"),
                     "is_correct": a.get("is_correct", False),
-                    "topic": a.get("topic", "General"),
+                    "topic": (a.get("topic") or "General").strip().lower(),
                     "user_id": user_id  # <--- Passiamo lo user_id al DB
                 }
             )
@@ -2717,37 +3679,54 @@ async def get_quiz_stats(project_id: str, user = Depends(verify_user)):
     try:
         # Questa query unisce Quiz e Flashcards calcolando i totali per ogni topic
         query = text("""
-            SELECT topic, 
-                   SUM(correct_count) as total_correct, 
-                   SUM(total_count) as total_all
-            FROM (
-                -- Parte 1: Risposte dai Quiz
-                SELECT qa.topic, 
-                       COUNT(*) FILTER (WHERE qa.is_correct) as correct_count, 
-                       COUNT(*) as total_count
-                FROM quiz_answers qa
-                JOIN quiz_attempts qatt ON qa.quiz_id = qatt.quiz_id
-                WHERE qatt.project_id = :p_id AND qa.user_id = :u_id
-                GROUP BY qa.topic
-                
-                UNION ALL
-                
-                -- Parte 2: Risposte dalle Flashcards
-                SELECT topic, 
-                       COUNT(*) FILTER (WHERE is_correct) as correct_count, 
-                       COUNT(*) as total_count
-                FROM flashcard_reviews
-                WHERE project_id = :p_id AND user_id = :u_id
-                GROUP BY topic
-            ) subquery
-            WHERE topic IS NOT NULL
-            GROUP BY topic
+            SELECT 
+                LOWER(TRIM(qa.topic)) as topic,
+                COUNT(*) FILTER (WHERE qa.is_correct) as correct_count,
+                COUNT(*) as total_count
+            FROM quiz_answers qa
+            WHERE qa.user_id = :u_id
+            AND qa.topic IS NOT NULL
+            AND LOWER(TRIM(qa.topic)) != 'general'
+            GROUP BY LOWER(TRIM(qa.topic))
+
+            UNION ALL
+
+            SELECT 
+                LOWER(TRIM(topic)) as topic,
+                COUNT(*) FILTER (WHERE is_correct) as correct_count,
+                COUNT(*) as total_count
+            FROM flashcard_reviews
+            WHERE project_id = :p_id
+            AND user_id = :u_id
+            AND topic IS NOT NULL
+            AND LOWER(TRIM(topic)) != 'general'
+            GROUP BY LOWER(TRIM(topic))
         """)
         
-        result = db.execute(query, {"p_id": project_id, "u_id": user["id"]}).fetchall()
-        
-        # Restituisce il formato che il tuo Frontend già si aspetta
-        return {r[0]: {"correct": int(r[1]), "total": int(r[2])} for r in result}
+        result = db.execute(
+            query,
+            {"p_id": project_id, "u_id": user["id"]}
+        ).fetchall()
+        print("🔥 RAW STATS RESULT:", result)
+
+        merged = {}
+
+        for r in result:
+            topic = (r[0] or "").strip().lower()
+
+            if not topic:
+                continue
+
+            if topic not in merged:
+                merged[topic] = {
+                    "correct": 0,
+                    "total": 0
+                }
+
+            merged[topic]["correct"] += int(r[1] or 0)
+            merged[topic]["total"] += int(r[2] or 0)
+
+        return merged
     finally:
         db.close()
 
@@ -3327,19 +4306,26 @@ async def study_session(
     # GENERATE FLASHCARDS
     # ======================
 
-    context_chunks = search_project_chunks(
+    scope = resolve_learning_scope(
         project_id=project_id,
-        topics=topics_list if len(topics_list) > 0 else None,
-        k=20
+        # topic_ids=topic_ids,
+        limit=30
     )
 
-    # 🔥 fallback se pochi chunk
+    context_chunks = scope["chunks"]
+
+    # fallback globale
     if not context_chunks:
-        print("⚠️ NO CHUNKS FOUND → fallback")
-        context_chunks = search_project_chunks(
+
+        print("⚠️ NO CHUNKS FOUND → GLOBAL FALLBACK")
+
+        scope = resolve_learning_scope(
             project_id=project_id,
-            k=20
+            topic_ids=[],
+            limit=30
         )
+
+        context_chunks = scope["chunks"]
 
     # 🔥 funzione per pulire topic
     def clean(t):
