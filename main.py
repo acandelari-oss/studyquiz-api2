@@ -846,7 +846,7 @@ def process_topics_task(project_id: str):
 
         topics_text = ""
 
-        MAX_TOPICS_FOR_CONSOLIDATION = 120
+        MAX_TOPICS_FOR_CONSOLIDATION = 40
 
         for category, topics in section_map.items():
 
@@ -931,21 +931,45 @@ def process_topics_task(project_id: str):
         {topics_text}
         """
         print("🚀 STARTING FINAL CONSOLIDATION CALL")
+        print("🧠 CONSOLIDATION INPUT LENGTH:", len(topics_text))
+        print("🧠 TOTAL CATEGORIES:", len(section_map))
 
-        final_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "user", "content": global_prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
+        try:
 
-        final_data = json.loads(
-            final_response.choices[0].message.content
-        )
-        print("✅ FINAL CONSOLIDATION RESPONSE RECEIVED")
-        print("✅ GLOBAL CONSOLIDATION COMPLETE")
-        print(json.dumps(final_data, indent=2))
+            final_response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "user", "content": global_prompt}
+                ],
+                response_format={"type": "json_object"}
+            )
+
+            final_data = json.loads(
+                final_response.choices[0].message.content
+            )
+
+            print("✅ FINAL CONSOLIDATION RESPONSE RECEIVED")
+            print("✅ GLOBAL CONSOLIDATION COMPLETE")
+            print(json.dumps(final_data, indent=2))
+
+        except Exception as e:
+
+            print("❌ FINAL CONSOLIDATION FAILED:", e)
+
+            # FALLBACK:
+            # usa direttamente i candidate topics
+            final_data = {
+                "categories": []
+            }
+
+            for category, topics in section_map.items():
+
+                final_data["categories"].append({
+                    "name": category,
+                    "topics": topics[:40]
+                })
+
+            print("⚠️ USING FALLBACK TOPIC STRUCTURE")
         final_data = rebalance_taxonomy(final_data)        
        
         # 🔥 DELETE OLD TOPIC-CHUNK LINKS
@@ -1834,17 +1858,27 @@ def generate_quiz(
         system_prompt = f"""
         You are an academic researcher. Generate {batch_size} high-quality questions in {req.language}.
         Available Topics: {topics_str}
+        Distribute questions evenly across different subtopics and concepts found in the material.
+        Prioritize conceptual coverage breadth over repetition depth.
         Avoid these topics: {avoid_str}
 
         STRICT RULES FOR DISTRACTORS:
         1. SEMANTIC COHERENCE: All 5 options (A, B, C, D, E) must belong to the same category or anatomical system as the correct answer.
         2. PLAUSIBILITY: Distractors must be plausible enough to challenge a prepared student. Do not use obviously unrelated terms.
         3. NO OVERLAP: Ensure only one answer is strictly correct according to the provided material.
-        4. TARGET TOPICS: Focus specifically on {topics_str}.
+        4. Distractors must be partially plausible but scientifically incorrect in the specific context of the question.
+        5. Only one answer must remain correct even under expert-level interpretation.
+        6. TARGET TOPICS: Focus specifically on {topics_str}.
+        7. Each question must test a DIFFERENT concept.
+        8. Avoid semantic overlap between questions.
+        9. Do not ask multiple questions about the same enzyme, mechanism, pathway, or biological function.
+        10. Max 1 question per specific molecular mechanism unless absolutely necessary.
 
         STRICT RULES:
         1. Use ONLY the provided material.
         2. Professional tone.
+        IMPORTANT:
+        Two questions are considered duplicates even if wording changes but the biological concept being tested is the same.
         3. Return ONLY valid JSON.
         """
 
@@ -2168,8 +2202,88 @@ async def generate_quiz_stream(
 
         context = "\n\n---\n\n".join(material_blocks)
 
+        # =========================================
+        # REASONING UNIT EXTRACTION
+        # =========================================
+
+        reasoning_material = []
+
+        async def extract_reasoning_units(block):
+
+            extraction_prompt = f"""
+            You MUST use ONLY the provided material.
+
+            Extract:
+            - causes
+            - effects
+            - relationships
+            - comparisons
+            - transformations
+            - conditions
+
+            Focus ONLY on concepts explicitly supported by the material.
+
+            Return STRICT JSON:
+
+            {{
+            "units": [
+                {{
+                "condition": "...",
+                "mechanism": "...",
+                "effect": "..."
+                }}
+            ]
+            }}
+
+            MATERIAL:
+            {block}
+            """
+
+            try:
+
+                response = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": extraction_prompt
+                        }
+                    ],
+                    temperature=0.3
+                )
+
+                content = response.choices[0].message.content.strip()
+
+                content = (
+                    content
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .strip()
+                )
+
+                data = json.loads(content)
+
+                return data.get("units", [])
+
+            except Exception as e:
+
+                print("⚠️ REASONING EXTRACTION ERROR:", e)
+
+                return []
+        
+        # EXTRACT REASONING UNITS
+
+        for block in material_blocks[:25]:
+
+            units = await extract_reasoning_units(block)
+
+            reasoning_material.extend(units)
+
+        print("🧠 TOTAL REASONING UNITS:", len(reasoning_material))
+
         # GENERAZIONE QUIZ
-        batch_size = 8
+        batch_size = 4 if req.difficulty == "hard" else 8
         num_batches = (req.num_questions + batch_size - 1) // batch_size
 
 
@@ -2179,20 +2293,31 @@ async def generate_quiz_stream(
         You MUST use ONLY the material provided below.
         Each section starts with '### TOPIC: [Name]'.
 
-        You are NOT allowed to use external knowledge.
+        Use the provided material as the ONLY factual source.
 
-        Material:
-        {context}
+        You may infer relationships, consequences, mechanisms, comparisons, or applications ONLY if they are logically supported by the material.
+        Do not invent concepts, facts, mechanisms, laws, events, or terminology not grounded in the provided content.
 
-        Generate {n} high-quality multiple choice study questions.
+        Reasoning Units:
+        {json.dumps(reasoning_material[:80], indent=2)}
 
+        Generate {n} short assessment scenarios.
+
+        Each scenario must:
+        - describe a condition, change, interaction, comparison, consequence, transformation, or system behavior
+        - require the student to infer the correct answer
+        - evaluate reasoning and conceptual understanding
+        - avoid direct factual recall
+        - avoid textbook-style definitions
+
+The student should need to interpret the situation, not simply recognize a memorized fact.
         IMPORTANT:
         Each question MUST focus on a COMPLETELY DIFFERENT concept.
 
         CRITICAL INSTRUCTIONS FOR QUESTION VARIETY:
         - NEVER start a question with "What is", "What are", or "Define".
         - Focus on APPLICATION: Create scenarios where the user must apply a rule or concept.
-        - Focus on MECHANISMS: Ask "How does [X] affect [Y]?" or "In what sequence does [X] occur?"
+        - Focus on relationships, consequences, interactions, transformations, comparisons, interpretations, or applied understanding.
         - Focus on COMPARISON: "Which feature distinguishes [X] from [Y]?"
         - Avoid trivial definitions; test for deep understanding and cause-effect relationships.
 
@@ -2215,6 +2340,63 @@ async def generate_quiz_stream(
         Avoid generating multiple questions about the same biological mechanism.
 
         Difficulty: {req.difficulty}
+
+        If Difficulty is HARD:
+        - EVERY question MUST be built as a short applied situation.
+        - Do NOT ask direct recall questions.
+        - Do NOT ask "What is", "Which enzyme", "What role", "What function", "Which pathway" questions.
+        - The question must describe a condition, change, case, conflict, mechanism failure, interpretation problem, or applied scenario.
+        - The correct answer must require reasoning from the material, not simply recognizing a term.
+        - If a question can be answered by matching one keyword to one definition, reject it and generate another.
+
+        Difficulty Rules:
+
+        EASY:
+        - Focus on definitions, terminology, and direct recall
+        - Questions should test basic recognition of concepts
+        - Avoid multi-step reasoning
+        - Avoid clinical or applied scenarios
+
+        MEDIUM:
+        - Focus on mechanisms, relationships, and cause-effect reasoning
+        - Include pathway interactions and functional understanding
+        - Require moderate reasoning to identify the correct answer
+
+        HARD:
+        - Generate applied, analytical, or reasoning-focused questions
+        - Avoid direct definition or recall questions
+        - The student must infer the answer from a situation, mechanism, consequence, comparison, or relationship
+        - Questions should require analysis, not memorization
+        - Prefer short applied scenarios over direct factual prompts
+
+        BAD HARD QUESTION:
+        "What is the role of X?"
+
+        GOOD HARD QUESTION:
+        "A mechanism responsible for X is altered.
+        Which consequence would MOST likely occur?"
+
+        BAD HARD QUESTION:
+        "Which process performs Y?"
+
+        GOOD HARD QUESTION:
+        "A system changes from condition A to condition B.
+        Which explanation BEST accounts for the change?"
+
+        BAD HARD QUESTION:
+        "What is the function of Y?"
+
+        GOOD HARD QUESTION:
+        "Two related mechanisms produce different outcomes under the same condition.
+        Which explanation BEST accounts for the difference?"
+        
+    
+        - Avoid starting most questions with:
+        "What is..."
+        "Which is..."
+        "What role..."
+        unless necessary.
+
         Language: {req.language}
 
         Rules:
@@ -2338,6 +2520,19 @@ async def generate_quiz_stream(
         for i, q in enumerate(unique_questions[:req.num_questions]):
             correct_val = q.get("correct", q.get("correct_answer", 0))
             q["correct"] = int(correct_val)
+            # SHUFFLE OPTIONS TO AVOID POSITION BIAS
+
+            try:
+
+                correct_text = q["options"][q["correct"]]
+
+                random.shuffle(q["options"])
+
+                q["correct"] = q["options"].index(correct_text)
+
+            except Exception as e:
+
+                print("⚠️ Shuffle error:", e)
             
             topic_val = q.get("topic")
             if not topic_val or topic_val == "...":
