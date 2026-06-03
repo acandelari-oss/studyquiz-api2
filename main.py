@@ -1982,6 +1982,29 @@ async def generate_quiz(
         print("📊 HEURISTIC SCORE:", heuristic_score)
 
         print("🔍 VALIDATING:", question_text)
+        
+
+        print("🎨 STYLE:", style)
+
+        print(
+            "✅ CORRECT:",
+            question.get("correct")
+        )
+
+        print(
+            "✅ CORRECT_ANSWER:",
+            question.get("correct_answer")
+        )
+
+        print(
+            "📋 OPTIONS:",
+            question.get("options")
+        )
+
+        print(
+            "📝 EXPLANATION:",
+            question.get("explanation")
+        )
 
         scenario_indicators = [
 
@@ -2399,6 +2422,13 @@ async def generate_quiz(
 
                 Generate EXACTLY {n} university-style multiple choice questions.
 
+                IMPORTANT:
+                Each question MUST contain EXACTLY 5 answer options.
+
+                Questions with 4 options are invalid.
+
+                Return exactly 5 options for every question.
+
                 Requirements:
 
                 - concise question stems
@@ -2522,6 +2552,13 @@ async def generate_quiz(
                 You MUST use ONLY the material provided below.
 
             Use the provided material as the ONLY factual source.
+
+            IMPORTANT:
+            Each question MUST contain EXACTLY 5 answer options.
+
+            Questions with 4 options are invalid.
+
+            Return exactly 5 options for every question.
 
             QUESTION STYLE:
 
@@ -2810,6 +2847,8 @@ async def generate_quiz(
 
             data = json.loads(content)
 
+            questions = []
+
             if isinstance(data, list):
 
                 questions = data
@@ -2819,6 +2858,14 @@ async def generate_quiz(
                 if "questions" in data:
 
                     questions = data["questions"]
+                    for q in questions:
+                        print("🔥 BEFORE NORMALIZATION")
+                        print(json.dumps(q, indent=2))
+                        print("🎨 STYLE:", style)
+                        print(
+                            "🔢 OPTIONS COUNT:",
+                            len(q.get("options", []))
+                        )
 
                 elif (
                     "question" in data
@@ -2827,12 +2874,18 @@ async def generate_quiz(
 
                     questions = [data]
 
-               
+                # 🔥 GPT ha restituito:
+                # { "question": { ... } }
 
-            else:
+                elif (
+                    "question" in data
+                    and isinstance(data["question"], dict)
+                ):
 
-                questions = []
+                    questions = [data["question"]]
+
             print("📊 GPT GENERATED:", len(questions))
+            print("📦 AFTER NORMALIZATION:", json.dumps(questions, indent=2))
             print("🚨 QUESTIONS PARSED:", len(questions))
             print("🚨 ABOUT TO ENTER VALIDATION LOOP")
             if isinstance(data, dict):
@@ -3046,13 +3099,52 @@ async def generate_quiz(
         print(
             f"📊 REFILL RESULT: {len(all_questions)}/{req.num_questions}"
         )
+        print("\n🧠 FINAL QUESTIONS BEFORE SAVE")
+        print("=" * 80)
+
+        for q in all_questions:
+
+            print("QUESTION:")
+            print(q.get("question"))
+
+            print("OPTIONS:")
+            print(q.get("options"))
+
+            print("CORRECT:")
+            print(q.get("correct_answer"))
+
+            print("EXPLANATION:")
+            print(q.get("explanation"))
+
+            print("-" * 80)
+            print("\n🧠 FINAL QUESTIONS BEFORE SAVE")
+            print("=" * 80)
+
+            for q in all_questions:
+
+                print("QUESTION:")
+                print(q.get("question"))
+
+                print("OPTIONS:")
+                print(q.get("options"))
+
+                print("CORRECT:")
+                print(
+                    q.get("correct_answer", q.get("correct"))
+                )
+
+                print("EXPLANATION:")
+                print(q.get("explanation"))
+
+                print("-" * 80)
     db.close()
     quiz_id = str(uuid.uuid4())
 
     db_save = SessionLocal()
     try:
         print("🔥 STO PER FARE INSERT QUIZ")
-
+        print("💾 SAVING")
+        print(json.dumps(q, indent=2))
         # ✅ INSERT QUIZ (UNA SOLA VOLTA)
         db_save.execute(
             text("""
@@ -3094,35 +3186,83 @@ async def generate_quiz(
 
                 answer_text = q["correct_answer"].strip()
 
+                print("🔍 MATCHING ANSWER TEXT:")
+                print(answer_text)
+
                 matched_index = None
 
                 for idx, option in enumerate(q.get("options", [])):
 
                     clean_option = str(option).strip()
 
+                    print(f"   OPTION {idx}: {clean_option}")
+
                     if clean_option == answer_text:
+
                         matched_index = idx
+
+                        print("✅ EXACT MATCH:", idx)
+
                         break
 
                     if clean_option.startswith(answer_text):
+
                         matched_index = idx
+
+                        print("✅ OPTION STARTSWITH ANSWER:", idx)
+
                         break
 
                     if answer_text.startswith(clean_option):
+
                         matched_index = idx
+
+                        print("✅ ANSWER STARTSWITH OPTION:", idx)
+
                         break
 
                 if matched_index is not None:
+
+                    print("🎯 FINAL MATCHED INDEX:", matched_index)
+
                     q["correct_answer"] = matched_index
 
                 else:
-                    print("❌ COULD NOT MATCH CORRECT ANSWER:", q)
+
+                    print("❌ NO MATCH FOUND")
+                    print("ANSWER:", answer_text)
+                    print("OPTIONS:", q.get("options"))
+
                     q["correct_answer"] = 0
 
             else:
                 q["correct_answer"] = int(q["correct_answer"])
+            # 🔥 EXPLANATION FALLBACK
+
+            if not q.get("explanation"):
+
+                q["explanation"] = (
+                    q.get("explanation_long")
+                    or q.get("reasoning")
+                    or q.get("rationale")
+                    or ""
+                )
+            if not q.get("explanation"):
+
+                print("⚠️ MISSING EXPLANATION:")
+                print(q.get("question"))
+            
+            print(
+                "📝 EXPLANATION LENGTH:",
+                len(q.get("explanation", ""))
+            )
 
         for i, q in enumerate(all_questions):
+            print("💾 SAVING QUESTION")
+            print("QUESTION:", q["question"])
+            print("CORRECT_ANSWER SAVED:", q.get("correct_answer"))
+            print("OPTIONS:", q.get("options"))
+
             print("👉 SALVO DOMANDA:", q["question"])
 
             result = db_save.execute(
