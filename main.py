@@ -602,12 +602,23 @@ def process_topics_task(project_id: str):
 
         for chunk in all_chunks:
             section_groups[chunk["section"]].append(chunk["text"])
+            print("📚 TOTAL SECTIONS:", len(section_groups))
+            print("📦 TOTAL CHUNKS:", len(all_chunks))
         
         seen_titles = set()
         all_candidate_topics = []
 
         for section_name, section_chunks in section_groups.items():
+            total_mini_groups = 0
 
+            for chunks in section_groups.values():
+                total_mini_groups += len([
+                    chunks[i:i+20]
+                    for i in range(0, len(chunks), 20)
+                ])
+
+            print("📦 TOTAL MINI GROUPS:", total_mini_groups)
+            
             print(
                 f"📂 SECTION: {section_name}"
             )
@@ -863,6 +874,17 @@ def process_topics_task(project_id: str):
             len(all_candidate_topics)
         )
         print("🌍 STARTING GLOBAL TOPIC CONSOLIDATION")
+
+        print(
+                "⏱️ BEFORE FINAL CONSOLIDATION:",
+                round(time.time() - topic_start_time, 1),
+                "seconds"
+             )
+
+        print(
+            "📦 TOTAL CANDIDATE TOPICS:",
+            len(all_candidate_topics)
+        )
         from collections import defaultdict
 
         section_map = defaultdict(list)
@@ -886,6 +908,9 @@ def process_topics_task(project_id: str):
 
             for t in topics[:MAX_TOPICS_FOR_CONSOLIDATION]:
 
+                
+
+               
                 topics_text += f"""
         TOPIC: {t['topic']}
         DESCRIPTION: {t['description']}
@@ -968,6 +993,15 @@ def process_topics_task(project_id: str):
         print("🚀 STARTING FINAL CONSOLIDATION CALL")
         print("🧠 CONSOLIDATION INPUT LENGTH:", len(topics_text))
         print("🧠 TOTAL CATEGORIES:", len(section_map))
+        print(
+            "🚀 STARTING FINAL CONSOLIDATION GPT CALL"
+        )
+
+        print(
+            "⏱️ ELAPSED:",
+            round(time.time() - topic_start_time, 1),
+            "seconds"
+        )
 
         try:
 
@@ -982,7 +1016,11 @@ def process_topics_task(project_id: str):
             final_data = json.loads(
                 final_response.choices[0].message.content
             )
-
+            print(
+                "🏁 AFTER GPT CONSOLIDATION:",
+                round(time.time() - topic_start_time, 1),
+                "seconds"
+            )
             print("✅ FINAL CONSOLIDATION RESPONSE RECEIVED")
             print("✅ GLOBAL CONSOLIDATION COMPLETE")
             print(json.dumps(final_data, indent=2))
@@ -1883,6 +1921,7 @@ async def generate_quiz(
             .lower()
         )
         print("🔍 CHECKING:", normalized)
+        print("🚨 ENTER LOOP")
         for pattern in LOW_QUALITY_PATTERNS:
 
             if normalized.startswith(pattern):
@@ -1899,7 +1938,7 @@ async def generate_quiz(
                 if len(first_part.split()) < 12:
 
                     return True
-
+        print("✅ CHECK PASSED")
         return False
 
     def score_reasoning_quality(question_text):
@@ -2335,7 +2374,9 @@ async def generate_quiz(
         scenarios = await generate_scenarios(n)
 
         print("📊 SCENARIOS GENERATED:", len(scenarios))
-
+        print("🚀 GENERATE_BATCH START")
+        print("STYLE:", style)
+        print("N:", n)
         for i, s in enumerate(scenarios):
             print(
                 f"📄 SCENARIO {i+1}:",
@@ -2828,14 +2869,17 @@ async def generate_quiz(
             SUPPORTING MATERIAL ONLY:
             {json.dumps(retrieved_chunks[:10], indent=2)}
             """
-
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o" if req.difficulty == "hard" else "gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.7
-        )
-
+            print("🎨 STYLE:", style)
+            print("📝 PROMPT EXISTS:", "prompt" in locals())
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model="gpt-4o" if req.difficulty == "hard" else "gpt-4o-mini",
+                messages=[{"role":"user","content":prompt}],
+                temperature=0.7
+            )
+        if "response" not in locals():
+            print("❌ RESPONSE NEVER CREATED")
+            return []
         content = response.choices[0].message.content.strip()
 
         print("RAW RESPONSE:", content[:500])
