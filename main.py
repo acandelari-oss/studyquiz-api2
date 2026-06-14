@@ -567,7 +567,9 @@ def process_topics_task(project_id: str):
     db = SessionLocal()
     try:
         print("BACKGROUND TOPICS START:", project_id)
-        import time
+        
+       
+        topic_phase_timer = time.time()
         topic_start_time = time.time()
         # 1. Update status and clear old topics
         db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
@@ -581,7 +583,7 @@ def process_topics_task(project_id: str):
                 from chunks
                 where project_id = :project_id
                 order by page asc
-                limit 1000
+                limit 400
             """),
             {"project_id": project_id}
         ).fetchall()
@@ -595,6 +597,13 @@ def process_topics_task(project_id: str):
             if r[0]
         ]
         print("📦 TOTAL CHUNKS:", len(all_chunks))
+        print(
+            "⏱️ CHUNKS LOADED:",
+            round(time.time() - topic_phase_timer, 1),
+            "seconds"
+        )
+
+        topic_phase_timer = time.time()
         # Group chunks into batches of 20
         from collections import defaultdict
 
@@ -873,6 +882,13 @@ def process_topics_task(project_id: str):
             "📚 TOTAL CANDIDATE TOPICS:",
             len(all_candidate_topics)
         )
+        print(
+            "⏱️ EXTRACTION COMPLETE:",
+            round(time.time() - topic_phase_timer, 1),
+            "seconds"
+        )
+
+        topic_phase_timer = time.time()
         print("🌍 STARTING GLOBAL TOPIC CONSOLIDATION")
 
         print(
@@ -1023,6 +1039,13 @@ def process_topics_task(project_id: str):
             )
             print("✅ FINAL CONSOLIDATION RESPONSE RECEIVED")
             print("✅ GLOBAL CONSOLIDATION COMPLETE")
+            print(
+                "⏱️ CONSOLIDATION COMPLETE:",
+                round(time.time() - topic_phase_timer, 1),
+                "seconds"
+            )
+
+            topic_phase_timer = time.time()
             print(json.dumps(final_data, indent=2))
 
         except Exception as e:
@@ -1153,11 +1176,23 @@ def process_topics_task(project_id: str):
                 )
 
         db.commit()
+        print(
+            "⏱️ TOPICS SAVED:",
+            round(time.time() - topic_phase_timer, 1),
+            "seconds"
+        )
+
+        topic_phase_timer = time.time()
         print("🧠 STARTING TOPIC-CHUNK ASSIGNMENT")
 
         try:
             assign_topics_to_chunks(project_id)
             print("✅ TOPIC-CHUNK ASSIGNMENT COMPLETED")
+            print(
+            "⏱️ ASSIGNMENT COMPLETE:",
+            round(time.time() - topic_phase_timer, 1),
+            "seconds"
+        )
         except Exception as e:
             print("❌ TOPIC-CHUNK ASSIGNMENT FAILED:", e)
 
@@ -1254,6 +1289,27 @@ def assign_topics_to_chunks(project_id: str):
             {"project_id": project_id}
         ).fetchall()
         print("🔢 TOPIC ASSIGNMENT MATCHES:", len(matches))
+        topics_count = db.execute(
+            text("""
+                select count(*)
+                from topics
+                where project_id = :project_id
+            """),
+            {"project_id": project_id}
+        ).fetchone()[0]
+
+        chunks_count = db.execute(
+            text("""
+                select count(*)
+                from chunks
+                where project_id = :project_id
+            """),
+            {"project_id": project_id}
+        ).fetchone()[0]
+
+        print("📊 CHUNKS:", chunks_count)
+        print("📊 TOPICS:", topics_count)
+        print("📊 MATCHES:", len(matches))
         print("🧪 MATCH QUERY COMPLETED")
         print("🧪 TOTAL MATCHES:", len(matches))
 
@@ -1315,7 +1371,7 @@ def assign_topics_to_chunks(project_id: str):
                 + (keyword_overlap * 0.05)
             )
 
-            if final_score > -0.55:
+            if final_score > -0.35:
 
                 key = (topic_id, chunk_id)
 
@@ -1354,6 +1410,26 @@ def assign_topics_to_chunks(project_id: str):
         ).fetchone()[0]
 
         print(f"✅ SAVED {links_created} TOPIC-CHUNK LINKS")
+        stats = db.execute(
+            text("""
+                select
+                    t.topic,
+                    count(*)
+                from topic_chunks tc
+                join topics t
+                    on tc.topic_id = t.id
+                where t.project_id = :project_id
+                group by t.topic
+                order by count(*) desc
+            """),
+            {"project_id": project_id}
+        ).fetchall()
+
+        print()
+        print("📊 TOPIC DISTRIBUTION")
+        for row in stats:
+            print(row[0], "->", row[1])
+        print()
 
     except Exception as e:
 
@@ -1662,11 +1738,16 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
 
     try:
         topic_ids = topic_ids or []
+        print("🚨 RESOLVE LEARNING SCOPE")
+        print("🚨 TOPIC IDS:", topic_ids)
+        print("🚨 LEN:", len(topic_ids))
 
         if topic_ids:
+            print("🚨 ENTERING TOPIC BRANCH")
             scope_type = "single_topic" if len(topic_ids) == 1 else "multi_topic"
 
             rows = db.execute(
+            
                 text("""
                     SELECT
                         c.id,
@@ -1692,8 +1773,17 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                     "limit": limit
                 }
             ).fetchall()
+            print("🎯 TOPIC FILTER ACTIVE")
+
+            for r in rows[:20]:
+                print()
+                print("TOPIC:", r[4])
+                print("PAGE:", r[3])
+                print((r[1] or "")[:250])
+                print("-" * 80)
 
         else:
+            print("🚨 ENTERING GLOBAL BRANCH")
             scope_type = "global"
 
             rows = db.execute(
@@ -1830,14 +1920,44 @@ async def generate_quiz(
     # 🔥 NUOVO SISTEMA
     topic_ids = req.topic_ids or []
 
-    scope = resolve_learning_scope(project_id, topic_ids, limit=80)
+    # 🔥 LEGACY
+    legacy_topics = req.topics or []
+
+    if not topic_ids and legacy_topics:
+
+        topic_rows = db.execute(
+            text("""
+                select id
+                from topics
+                where project_id = :project_id
+                and topic in :topics
+            """),
+            {
+                "project_id": project_id,
+                "topics": tuple(legacy_topics)
+            }
+        ).fetchall()
+
+        topic_ids = [
+            str(r[0])
+            for r in topic_rows
+        ]
+
+        print(
+            "🔄 CONVERTED LEGACY TOPICS TO IDS:",
+            topic_ids
+        )
+    print("🚨 FINAL TOPIC IDS USED:", topic_ids)
+
+    scope = resolve_learning_scope(
+        project_id,
+        topic_ids,
+        limit=80
+    )
 
     print("🧠 LEARNING SCOPE:", scope["scope_type"])
     print("📦 SCOPE CHUNKS:", scope["chunk_count"])
     print("🎯 SCOPE TOPICS:", scope["topics"][:3])
-
-    # 🔥 LEGACY
-    legacy_topics = req.topics or []
 
     print("📥 TOPIC IDS:", topic_ids)
     print("📥 LEGACY TOPICS:", legacy_topics)
@@ -1870,6 +1990,15 @@ async def generate_quiz(
     retrieved_chunks = scope["chunks"]
 
     print("📦 RETRIEVED CHUNKS:", len(retrieved_chunks))
+    from collections import Counter
+
+    topic_counter = Counter(
+        str(c.get("topic", "General"))
+        for c in retrieved_chunks
+    )
+
+    print("📊 RETRIEVED TOPIC DISTRIBUTION:")
+    print(topic_counter.most_common(20))
     for c in retrieved_chunks[:5]:
 
         print("📄 QUIZ CHUNK SAMPLE")
