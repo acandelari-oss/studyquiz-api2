@@ -1774,10 +1774,16 @@ LOW_QUALITY_PATTERNS = [
             ]
 @app.post("/projects/{project_id}/generate_quiz")
 async def generate_quiz(
+    
+
+    
     project_id: str,
     req: QuizRequest,
     user = Depends(verify_user)
 ):
+    quiz_start = time.time()
+
+    print("🚀 QUIZ START")
     # 🔥 PRINT 1 — INIZIO FUNZIONE
     print("🔥 ENTER generate_quiz")
     print("🔥 FULL REQUEST:", req.dict())
@@ -2056,6 +2062,14 @@ async def generate_quiz(
             "as a result",
             "because",
             "while",
+            "as",
+            "if",
+            "upon",
+            "given",
+            "leads to",
+            "results in",
+            "increases",
+            "decreases",
 
             # IT
             "durante",
@@ -2076,23 +2090,24 @@ async def generate_quiz(
             "calo"
         ]
 
-        if style != "exam":     
+        if style != "exam":
 
             if not any(
                 x in normalized
                 for x in scenario_indicators
             ):
 
-                print("🚫 NO SCENARIO STRUCTURE")
+                print("⚠️ NO SCENARIO STRUCTURE")
+                print("QUESTION:", question_text)
 
-                return False
+                heuristic_score -= 1
 
         if style != "exam":
 
             if heuristic_score <= -2:
 
                 print("🚫 HEURISTIC REJECTION")
-
+                
                 return False
 
         if style != "exam":
@@ -2100,9 +2115,9 @@ async def generate_quiz(
             if fails_basic_reasoning_check(question_text):
 
                 print("🚫 BASIC FILTER REJECTED")
-
+                print("❌ REJECT REASON: heuristic")
                 return False
-
+        print("✅ QUESTION ACCEPTED")
         return True
 
     def rewrite_question_opening(question_text):
@@ -2192,7 +2207,7 @@ async def generate_quiz(
     """
 
         try:
-
+            reasoning_start = time.time()
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="gpt-4o-mini",
@@ -2204,7 +2219,7 @@ async def generate_quiz(
                 ],
                 temperature=0.3
             )
-
+            
             content = (
                 response
                 .choices[0]
@@ -2212,6 +2227,9 @@ async def generate_quiz(
                 .replace("```json", "")
                 .replace("```", "")
                 .strip()
+            )
+            print(
+                f"🧠 REASONING TIME: {time.time() - reasoning_start:.1f}s"
             )
 
             data = json.loads(content)
@@ -2337,7 +2355,7 @@ async def generate_quiz(
         """
 
         try:
-
+            scenario_start = time.time()
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="gpt-4o-mini",
@@ -2351,7 +2369,9 @@ async def generate_quiz(
             )
 
             content = response.choices[0].message.content.strip()
-
+            print(
+                f"🎲 SCENARIO TIME: {time.time() - scenario_start:.1f}s"
+            )
             content = (
                 content
                 .replace("```json", "")
@@ -2362,21 +2382,30 @@ async def generate_quiz(
             data = json.loads(content)
 
             return data.get("scenarios", [])
-
+            print(
+                f"⏱ TOTAL QUIZ TIME: {time.time() - quiz_start:.1f}s"
+            )
         except Exception as e:
 
             print("⚠️ SCENARIO GENERATION ERROR:", e)
+            
 
             return []
 
     async def generate_batch(n, style):
+        batch_start = time.time()
 
-        scenarios = await generate_scenarios(n)
+        print("📦 BATCH START")
+        if style == "exam":
+            scenarios = []
+        else:
+            scenarios = await generate_scenarios(n)
 
         print("📊 SCENARIOS GENERATED:", len(scenarios))
         print("🚀 GENERATE_BATCH START")
         print("STYLE:", style)
         print("N:", n)
+        
         for i, s in enumerate(scenarios):
             print(
                 f"📄 SCENARIO {i+1}:",
@@ -2385,13 +2414,21 @@ async def generate_quiz(
 
         validated_questions = []
 
-        for i, scenario_obj in enumerate(scenarios[:n]):
+        if style == "exam":
+            loop_items = [None]
+        else:
+            loop_items = scenarios[:n]
+
+        all_validated_questions = []
+
+        for i, scenario_obj in enumerate(loop_items):
 
             if style != "exam":
 
                 print(
                     f"🎯 PROCESSING SCENARIO {i+1}/{len(scenarios)}"
                 )
+                print("🔢 N INSIDE LOOP:", n)
 
                 scenario_text = scenario_obj.get(
                     "scenario",
@@ -2592,278 +2629,278 @@ async def generate_quiz(
                 prompt = f"""
                 You MUST use ONLY the material provided below.
 
-            Use the provided material as the ONLY factual source.
+                Use the provided material as the ONLY factual source.
 
-            IMPORTANT:
-            Each question MUST contain EXACTLY 5 answer options.
+                IMPORTANT:
+                Each question MUST contain EXACTLY 5 answer options.
 
-            Questions with 4 options are invalid.
+                Questions with 4 options are invalid.
 
-            Return exactly 5 options for every question.
+                Return exactly 5 options for every question.
 
-            QUESTION STYLE:
+                QUESTION STYLE:
 
-            {style_instruction}
+                {style_instruction}
 
-            Scenario Diversity Rules:
+                Scenario Diversity Rules:
 
-            - Each question must test a DIFFERENT inference.
-            - Each question must focus on a DIFFERENT mechanism,
-            consequence,
-            adaptation,
-            compensation,
-            or causal relationship.
-            - Do NOT generate multiple questions that can be answered
-            using the same reasoning process.
-            - Do NOT paraphrase the same question multiple times.
-            - If multiple questions are generated, they should explore
-            different aspects of the scenario.
+                - Each question must test a DIFFERENT inference.
+                - Each question must focus on a DIFFERENT mechanism,
+                consequence,
+                adaptation,
+                compensation,
+                or causal relationship.
+                - Do NOT generate multiple questions that can be answered
+                using the same reasoning process.
+                - Do NOT paraphrase the same question multiple times.
+                - If multiple questions are generated, they should explore
+                different aspects of the scenario.
 
-            You may infer:
-            - mechanisms
-            - consequences
-            - relationships
-            - adaptations
-            - compensations
-            - downstream effects
+                You may infer:
+                - mechanisms
+                - consequences
+                - relationships
+                - adaptations
+                - compensations
+                - downstream effects
 
-            ONLY if they are logically supported by the material.
+                ONLY if they are logically supported by the material.
 
-            PRIMARY SCENARIO CONTEXT:
+                PRIMARY SCENARIO CONTEXT:
 
-            {scenario_text}
+                {scenario_text}
 
 
-            DIAGNOSTIC REASONING BLUEPRINT:
+                DIAGNOSTIC REASONING BLUEPRINT:
 
-            Observable Change:
-            {reasoning_chain.get("observable_change", "")}
+                Observable Change:
+                {reasoning_chain.get("observable_change", "")}
 
-            Hidden Cause:
-            {reasoning_chain.get("hidden_cause", "")}
+                Hidden Cause:
+                {reasoning_chain.get("hidden_cause", "")}
 
-            Required Inference:
-            {reasoning_chain.get("required_inference", "")}
+                Required Inference:
+                {reasoning_chain.get("required_inference", "")}
 
-            Common Wrong Interpretation:
-            {reasoning_chain.get("common_wrong_interpretation", "")}
+                Common Wrong Interpretation:
+                {reasoning_chain.get("common_wrong_interpretation", "")}
 
-            Downstream Effect:
-            {reasoning_chain.get("downstream_effect", "")}
+                Downstream Effect:
+                {reasoning_chain.get("downstream_effect", "")}
 
-            IMPORTANT:
+                IMPORTANT:
 
-            The ENTIRE question MUST be built around this scenario.
+                The ENTIRE question MUST be built around this scenario.
 
-            The scenario is the PRIMARY source for the question.
+                The scenario is the PRIMARY source for the question.
 
-            The provided material is ONLY supporting context.
+                The provided material is ONLY supporting context.
 
-            If the scenario is removed,
-            the question MUST become impossible to answer correctly.
+                If the scenario is removed,
+                the question MUST become impossible to answer correctly.
 
-            The question MUST directly depend on:
-            - the observed changes
-            - the described condition
-            - the adaptation
-            - the consequence
-            - the comparison
-            
+                The question MUST directly depend on:
+                - the observed changes
+                - the described condition
+                - the adaptation
+                - the consequence
+                - the comparison
+                
 
-            contained in the scenario.
+                contained in the scenario.
 
-            DO NOT generate generic textbook questions.
+                DO NOT generate generic textbook questions.
 
-            DO NOT ask about isolated definitions,
-            rules,
-            pathways,
-            or static facts
-            unless they are REQUIRED to interpret the scenario itself.
+                DO NOT ask about isolated definitions,
+                rules,
+                pathways,
+                or static facts
+                unless they are REQUIRED to interpret the scenario itself.
 
-            Transform the scenario into an applied reasoning question.
+                Transform the scenario into an applied reasoning question.
 
-            The FIRST sentence of the question MUST describe:
-            - a condition
-            - a system change
-            - a dysfunction
-            - a compensation
-            - an adaptation
-            - a metabolic transition
-            or
-            - an observed consequence
+                The FIRST sentence of the question MUST describe:
+                - a condition
+                - a system change
+                - a dysfunction
+                - a compensation
+                - an adaptation
+                - a metabolic transition
+                or
+                - an observed consequence
 
-            derived directly from the scenario.
-
-            The scenario itself MUST become the question stem.
-
-            ONLY AFTER describing the situation,
-            ask the reasoning question.
-
-            The question MUST NOT start with:
-            - What
-            - Which
-            - During which
-            - In which
-            - How does
-
-            The question MUST start with a concrete situation, for example:
-            - During...
-            - When...
-            - After...
-            - If...
-            - Following...
-            - A system...
-            - An observed change...
-            - A prolonged condition...
-
-            If the question starts with What, Which, During which, In which, or How does, it is INVALID.
-
-            The student should need to:
-            The question MUST specifically test the REQUIRED INFERENCE
-            from the diagnostic reasoning blueprint above.
-
-            The correct answer should ONLY become obvious
-            after interpreting the observable change correctly.
-
-            The wrong answers should reflect:
-            - common misconceptions
-            - superficial interpretations
-            - incomplete causal reasoning
-            or
-            - confusion between related mechanisms.
+                derived directly from the scenario.
+
+                The scenario itself MUST become the question stem.
+
+                ONLY AFTER describing the situation,
+                ask the reasoning question.
+
+                The question MUST NOT start with:
+                - What
+                - Which
+                - During which
+                - In which
+                - How does
+
+                The question MUST start with a concrete situation, for example:
+                - During...
+                - When...
+                - After...
+                - If...
+                - Following...
+                - A system...
+                - An observed change...
+                - A prolonged condition...
+
+                If the question starts with What, Which, During which, In which, or How does, it is INVALID.
+
+                The student should need to:
+                The question MUST specifically test the REQUIRED INFERENCE
+                from the diagnostic reasoning blueprint above.
+
+                The correct answer should ONLY become obvious
+                after interpreting the observable change correctly.
+
+                The wrong answers should reflect:
+                - common misconceptions
+                - superficial interpretations
+                - incomplete causal reasoning
+                or
+                - confusion between related mechanisms.
 
-            situation
-            → interpretation
-            → mechanism
-            → consequence
-            → answer
-
-            NOT:
-
-            keyword
-            → memorized fact
-            → answer
-
-            The question MUST require reasoning about:
-            - a change
-            - a consequence
-            - a comparison
-            - a system response
-            - a failure
-            - a dependency
-            or
-            - a downstream effect
-
-            Questions solvable through direct factual recall alone
-            are LOW QUALITY.
-
-            Avoid:
-            - direct definitions
-            - glossary-style questions
-            - isolated factual recall
-            - textbook-style prompts
-            - single-step recognition questions
-
-            BAD:
-            "What is the role of glucagon?"
-
-            BAD:
-            "Which pathway produces NADPH?"
-
-            GOOD:
-            "During prolonged fasting, glucose utilization decreases in peripheral tissues while fatty acid oxidation increases.
-
-            Which downstream metabolic adaptation would MOST likely occur?"
-
-            GOOD:
-            "A compensatory metabolic response temporarily stabilizes energy production after a regulatory pathway becomes less effective.
-
-            Which mechanism BEST explains the observed adaptation?"
-
-            IMPORTANT:
-            - Each question MUST focus on a DIFFERENT concept
-            - Do NOT repeat mechanisms or pathways
-            - Cover different parts of the material
-            - Exactly ONE answer must be correct
-            - Do NOT use "All of the above"
-            - Incorrect options must still be plausible
-
-            Difficulty: {req.difficulty}
-
-            EASY:
-            - basic understanding
-            - direct mechanisms
-            - limited reasoning
-
-            MEDIUM:
-            - cause-effect reasoning
-            - interactions between processes
-            - moderate interpretation
-
-            HARD:
-            - applied reasoning
-            - hidden mechanisms
-            - interpretation of consequences
-            - at least TWO reasoning steps
-            - scenario-driven reasoning
-
-            LANGUAGE REQUIREMENT:
-
-            Generate ALL content exclusively in {req.language}.
-
-            This includes:
-            - question text
-            - answer options
-            - explanations
-            - feedback
-
-            Do NOT use any other language.
-            Do NOT mix languages.
-            
-
-            Return STRICT JSON.
-
-            Generate EXACTLY {n} questions.
-
-            The questions array MUST contain EXACTLY {n} question objects.
-
-            Returning fewer than {n} questions is INVALID.
-
-            Example structure:
-
-            {{
-            "questions": [
+                situation
+                → interpretation
+                → mechanism
+                → consequence
+                → answer
+
+                NOT:
+
+                keyword
+                → memorized fact
+                → answer
+
+                The question MUST require reasoning about:
+                - a change
+                - a consequence
+                - a comparison
+                - a system response
+                - a failure
+                - a dependency
+                or
+                - a downstream effect
+
+                Questions solvable through direct factual recall alone
+                are LOW QUALITY.
+
+                Avoid:
+                - direct definitions
+                - glossary-style questions
+                - isolated factual recall
+                - textbook-style prompts
+                - single-step recognition questions
+
+                BAD:
+                "What is the role of glucagon?"
+
+                BAD:
+                "Which pathway produces NADPH?"
+
+                GOOD:
+                "During prolonged fasting, glucose utilization decreases in peripheral tissues while fatty acid oxidation increases.
+
+                Which downstream metabolic adaptation would MOST likely occur?"
+
+                GOOD:
+                "A compensatory metabolic response temporarily stabilizes energy production after a regulatory pathway becomes less effective.
+
+                Which mechanism BEST explains the observed adaptation?"
+
+                IMPORTANT:
+                - Each question MUST focus on a DIFFERENT concept
+                - Do NOT repeat mechanisms or pathways
+                - Cover different parts of the material
+                - Exactly ONE answer must be correct
+                - Do NOT use "All of the above"
+                - Incorrect options must still be plausible
+
+                Difficulty: {req.difficulty}
+
+                EASY:
+                - basic understanding
+                - direct mechanisms
+                - limited reasoning
+
+                MEDIUM:
+                - cause-effect reasoning
+                - interactions between processes
+                - moderate interpretation
+
+                HARD:
+                - applied reasoning
+                - hidden mechanisms
+                - interpretation of consequences
+                - at least TWO reasoning steps
+                - scenario-driven reasoning
+
+                LANGUAGE REQUIREMENT:
+
+                Generate ALL content exclusively in {req.language}.
+
+                This includes:
+                - question text
+                - answer options
+                - explanations
+                - feedback
+
+                Do NOT use any other language.
+                Do NOT mix languages.
+                
+
+                Return STRICT JSON.
+
+                Generate EXACTLY 1 question.
+
+                The questions array MUST contain EXACTLY 1 question object.
+
+                Returning fewer than 1 question is INVALID.
+
+                Example structure:
+
                 {{
-                    "question": "...",
-                    "options": ["...", "...", "...", "...", "..."],
-                    "correct": 0,
-                    "topic": "...",
-                    "explanation": "Short explanation",
-                    "explanation_long": "2-3 sentences maximum",
-                    "source_document": "Exact file name",
-                    "source_page": "Page number"
-                }},
-                {{
-                    "question": "...",
-                    "options": ["...", "...", "...", "...", "..."],
-                    "correct": 1,
-                    "topic": "...",
-                    "explanation": "Short explanation",
-                    "explanation_long": "2-3 sentences maximum",
-                    "source_document": "Exact file name",
-                    "source_page": "Page number"
-                }},
-                {{
-                    "question": "...",
-                    "options": ["...", "...", "...", "...", "..."],
-                    "correct": 2,
-                    "topic": "...",
-                    "explanation": "Short explanation",
-                    "explanation_long": "2-3 sentences maximum",
-                    "source_document": "Exact file name",
-                    "source_page": "Page number"
-                }}
-            ]
+                "questions": [
+                    {{
+                        "question": "...",
+                        "options": ["...", "...", "...", "...", "..."],
+                        "correct": 0,
+                        "topic": "...",
+                        "explanation": "Short explanation",
+                        "explanation_long": "2-3 sentences maximum",
+                        "source_document": "Exact file name",
+                        "source_page": "Page number"
+                    }},
+                    {{
+                        "question": "...",
+                        "options": ["...", "...", "...", "...", "..."],
+                        "correct": 1,
+                        "topic": "...",
+                        "explanation": "Short explanation",
+                        "explanation_long": "2-3 sentences maximum",
+                        "source_document": "Exact file name",
+                        "source_page": "Page number"
+                    }},
+                    {{
+                        "question": "...",
+                        "options": ["...", "...", "...", "...", "..."],
+                        "correct": 2,
+                        "topic": "...",
+                        "explanation": "Short explanation",
+                        "explanation_long": "2-3 sentences maximum",
+                        "source_document": "Exact file name",
+                        "source_page": "Page number"
+                    }}
+                ]
             }}
 
             SUPPORTING MATERIAL ONLY:
@@ -2871,154 +2908,208 @@ async def generate_quiz(
             """
             print("🎨 STYLE:", style)
             print("📝 PROMPT EXISTS:", "prompt" in locals())
+            gpt_start = time.time()
+
+            print("🤖 OPENAI START")
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="gpt-4o" if req.difficulty == "hard" else "gpt-4o-mini",
                 messages=[{"role":"user","content":prompt}],
                 temperature=0.7
             )
-        if "response" not in locals():
-            print("❌ RESPONSE NEVER CREATED")
-            return []
-        content = response.choices[0].message.content.strip()
+            if "response" not in locals():
+                print("❌ RESPONSE NEVER CREATED CHECKPOINT 2879")
+                return []
+            content = response.choices[0].message.content.strip()
+            print(
+                f"🤖 OPENAI TIME: {time.time() - gpt_start:.1f}s"
+            )
+            print("RAW RESPONSE:", content[:500])
+            #print(
+             #   "📊 QUESTIONS FROM THIS SCENARIO:",
+            #    len(normalized_questions)
+            #)
 
-        print("RAW RESPONSE:", content[:500])
-        
+            try:
 
-        try:
+                content = content.replace("```json","").replace("```","").strip()
 
-            content = content.replace("```json","").replace("```","").strip()
+                data = json.loads(content)
 
-            data = json.loads(content)
+                questions = []
 
-            questions = []
+                if isinstance(data, list):
 
-            if isinstance(data, list):
+                    questions = data
 
-                questions = data
+                elif isinstance(data, dict):
 
-            elif isinstance(data, dict):
+                    if "questions" in data:
 
-                if "questions" in data:
+                        questions = data["questions"]
+                        for q in questions:
+                            print("🔥 BEFORE NORMALIZATION")
+                        
+                            print("🎨 STYLE:", style)
+                            print(
+                                "🔢 OPTIONS COUNT:",
+                                len(q.get("options", []))
+                            )
 
-                    questions = data["questions"]
-                    for q in questions:
-                        print("🔥 BEFORE NORMALIZATION")
-                        print(json.dumps(q, indent=2))
-                        print("🎨 STYLE:", style)
-                        print(
-                            "🔢 OPTIONS COUNT:",
-                            len(q.get("options", []))
-                        )
+                    elif (
+                        "question" in data
+                        and "options" in data
+                    ):
 
-                elif (
-                    "question" in data
-                    and "options" in data
-                ):
+                        questions = [data]
 
-                    questions = [data]
+                    # 🔥 GPT ha restituito:
+                    # { "question": { ... } }
 
-                # 🔥 GPT ha restituito:
-                # { "question": { ... } }
+                    elif (
+                        "question" in data
+                        and isinstance(data["question"], dict)
+                    ):
 
-                elif (
-                    "question" in data
-                    and isinstance(data["question"], dict)
-                ):
+                        questions = [data["question"]]
 
-                    questions = [data["question"]]
-
-            print("📊 GPT GENERATED:", len(questions))
-            print("📦 AFTER NORMALIZATION:", json.dumps(questions, indent=2))
-            print("🚨 QUESTIONS PARSED:", len(questions))
-            print("🚨 ABOUT TO ENTER VALIDATION LOOP")
-            if isinstance(data, dict):
-                print("🔑 JSON KEYS:", data.keys())
-            else:
-                print("🔑 JSON TYPE:", type(data))
-            print("📦 QUESTIONS:")
-            print(json.dumps(questions, indent=2))
-            
-            validated_questions = []
-            if style == "exam":
-
-                scenario_text = ""
-
-                reasoning_chain = {
-                    "observable_change": "",
-                    "hidden_cause": "",
-                    "required_inference": "",
-                    "common_wrong_interpretation": "",
-                    "downstream_effect": ""
-                }
-
-                loop_items = range(n)
-
-            else:
-
-                loop_items = scenarios[:n]
-            print("🚨 LOOP START")
-            
-            for q in questions:
-
-                print("🔍 Q OBJECT:", q)
-
-                reasoning_score = score_reasoning_quality(
-                    q["question"]
-                )
-
-                print("🧠 QUESTION:")
-                print(q["question"])
-
-                print("🧠 REASONING SCORE:", reasoning_score)
-
+                print("📊 GPT GENERATED:", len(questions))
                 
                 
-                is_valid = await validate_question(
-                    q,
-                    style
+                
+                print("🚨 ABOUT TO ENTER VALIDATION LOOP")
+                if isinstance(data, dict):
+                    print("🔑 JSON KEYS:", data.keys())
+                else:
+                    print("🔑 JSON TYPE:", type(data))
+                 
+                
+                validated_questions = []
+                print(
+                    f"📊 VALIDATION START: {len(questions)} QUESTIONS"
                 )
+                if style == "exam":
 
-                if not is_valid:
+                    scenario_text = ""
 
-                    print("❌ QUESTION REJECTED")
+                    reasoning_chain = {
+                        "observable_change": "",
+                        "hidden_cause": "",
+                        "required_inference": "",
+                        "common_wrong_interpretation": "",
+                        "downstream_effect": ""
+                    }
 
-                    continue
+                    loop_items = range(n)
 
-                if style != "exam":
+                else:
 
-                    q["question"] = rewrite_question_opening(
+                    loop_items = scenarios[:n]
+                print("🚨 LOOP START")
+                
+                for q in questions:
+
+                    # Normalize GPT field variants
+                    if "question" not in q and "stem" in q:
+                        q["question"] = q["stem"]
+
+                    if "question" not in q:
+                        print("❌ QUESTION FIELD MISSING:", q)
+                        continue
+
+                    
+
+                    reasoning_score = score_reasoning_quality(
                         q["question"]
                     )
 
-                validated_questions.append(q)
+                    
 
-            
+                    print("🧠 REASONING SCORE:", reasoning_score)
 
-            seen = set()
-            unique_questions = []
+                    
+                    
+                    is_valid = await validate_question(
+                        q,
+                        style
+                    )
 
-            for q in validated_questions:
+                    if not is_valid:
 
-                text_q = q.get("question","").strip().lower()
+                        print("❌ QUESTION REJECTED")
 
-                if text_q not in seen:
-                    seen.add(text_q)
-                    unique_questions.append(q)
+                        continue
 
-            return unique_questions
+                    if style != "exam":
 
-        except Exception as e:
+                        q["question"] = rewrite_question_opening(
+                            q["question"]
+                        )
 
-            print("QUIZ JSON ERROR:", e)
-            print("RAW GPT OUTPUT:", content)
-            print("📊 AFTER VALIDATION:", len(validated_questions))
-            return []
+                        
 
-        
+                    validated_questions.append(q)
+                    print(
+                        f"📊 AFTER VALIDATION: {len(validated_questions)}"
+                    )                
+
+                seen = set()
+                unique_questions = []
+
+                for q in validated_questions:
+
+                    text_q = q.get("question","").strip().lower()
+
+                    if text_q not in seen:
+                        seen.add(text_q)
+                        unique_questions.append(q)
+
+                                    
+                print(
+                    f"📊 AFTER DEDUP: {len(unique_questions)}"
+                )
+                print("📋 UNIQUE QUESTIONS")
+
+                for q_idx, q in enumerate(unique_questions):
+                    print(
+                        f"{i+1}.",
+                        q.get("question", "")[:120]
+                    )
+                print(
+                    f"📦 SCENARIO PRODUCED {len(unique_questions)} QUESTIONS"
+                )
+                all_validated_questions.extend(unique_questions)
+
+                print(
+                    f"✅ SCENARIO {i+1}/{len(loop_items)} COMPLETED | "
+                    f"TOTAL COLLECTED: {len(all_validated_questions)}"
+                )
+           
+
+            except Exception as e:
+
+                print("QUIZ JSON ERROR:", e)
+                print("RAW GPT OUTPUT:", content)
+                print("📊 AFTER VALIDATION:", len(validated_questions))
+                continue
+                
+        print("LAST SCENARIO INDEX:", i)    
+        print("🏁 GENERATE_BATCH END") 
+        print("TOTAL SCENARIOS:", len(loop_items))
+        print(
+            "TOTAL QUESTIONS RETURNED:",
+            len(all_validated_questions)
+        )
+
+        for idx, q in enumerate(all_validated_questions):
+            print(
+                f"RETURN {idx+1}:",
+                q.get("question", "")[:100]
+            )
+        return all_validated_questions  
+    
 
     all_questions = []
-
     tasks = []
 
     if req.question_style == "balanced":
@@ -3069,9 +3160,27 @@ async def generate_quiz(
             )
 
     results = await asyncio.gather(*tasks)
+    print(
+        "📊 BEFORE DEDUP:",
+        sum(len(batch or []) for batch in results)
+    )
+    for idx, batch in enumerate(results):
 
-    for batch in results:
+        print(
+            f"📦 RESULT {idx}:",
+            type(batch)
+        )
+
+        if batch is None:
+            print(
+                f"❌ RESULT {idx} RETURNED NONE"
+            )
+            continue
+
         all_questions.extend(batch)
+        print(
+            f"📊 AFTER APPEND: {len(all_questions)}"
+        )
     
 
     # REMOVE DUPLICATES
@@ -3093,10 +3202,13 @@ async def generate_quiz(
 
     all_questions = unique_questions[:req.num_questions]
     print("📊 AFTER DEDUP:", len(all_questions))
+
+    print("📋 UNIQUE QUESTIONS")
+
     
     # REFILL MISSING QUESTIONS 😄
     retry_count = 0
-    max_retries = 3
+    max_retries = 10
 
     while (
         len(all_questions) < req.num_questions
@@ -3123,7 +3235,10 @@ async def generate_quiz(
             missing,
             refill_style
         )
-
+        print(
+            "🎲 REFILL STYLE:",
+            refill_style
+        )
         if not extra_batch:
             print("⚠️ Nessuna domanda extra generata, stop retry")
             break
@@ -3135,11 +3250,29 @@ async def generate_quiz(
 
             if key not in seen_questions:
 
+                print(
+                    "➕ ADDING:",
+                    q.get("question", "")[:120]
+                )
+
                 seen_questions.add(key)
                 all_questions.append(q)
 
+            else:
+
+                print(
+                    "🚫 DUPLICATE:",
+                    q.get("question", "")[:120]
+                )
+
             if len(all_questions) >= req.num_questions:
                 break
+
+        print(
+            "📦 EXTRA BATCH SIZE:",
+            len(extra_batch)
+        )
+
         print(
             f"📊 REFILL RESULT: {len(all_questions)}/{req.num_questions}"
         )
@@ -3213,7 +3346,10 @@ async def generate_quiz(
 
         for q in all_questions:
 
-            if "correct_answer" not in q:
+            if (
+                "correct_answer" not in q
+                or q.get("correct_answer") is None
+            ):
 
                 if "correct" in q:
                     q["correct_answer"] = q["correct"]
@@ -3302,6 +3438,18 @@ async def generate_quiz(
             )
 
         for i, q in enumerate(all_questions):
+            if not q.get("question"):
+                print("🚨 SKIP QUESTION WITHOUT question:", q)
+                continue
+
+            if q.get("correct_answer") is None:
+                print("🚨 SKIP QUESTION WITHOUT correct_answer:", q)
+                continue
+
+            if not q.get("options"):
+                print("🚨 SKIP QUESTION WITHOUT options:", q)
+                continue
+            print("🔑 KEYS:", list(q.keys()))
             print("💾 SAVING QUESTION")
             print("QUESTION:", q["question"])
             print("CORRECT_ANSWER SAVED:", q.get("correct_answer"))
@@ -3344,6 +3492,9 @@ async def generate_quiz(
         db_save.commit()
         print("✅ COMMIT FATTO")
         print("💾 QUIZ STYLE SAVED:", req.question_style)
+        
+
+        
 
     except Exception as e:
         db_save.rollback()
@@ -3351,7 +3502,15 @@ async def generate_quiz(
 
     finally:
         db_save.close()
-
+    print(
+        f"🚀 TOTAL QUIZ TIME: {time.time() - quiz_start:.1f}s"
+    )
+    print(
+        f"📊 FINAL COUNT: {len(all_questions)}/{req.num_questions}"
+    )
+    print("🚀 RETURNING QUIZ")
+    print("QUIZ ID:", quiz_id)
+    print("QUESTIONS:", len(all_questions))
     return {
         "quiz_id": quiz_id,
         "questions": all_questions
@@ -4508,7 +4667,7 @@ async def generate_flashcards(
         # =====================================
         # NEW LEARNING GRAPH RETRIEVAL
         # =====================================
-
+        retrieval_start = time.time()
         scope = resolve_learning_scope(
             project_id=project_id,
             topic_ids=req.get("topic_ids", []),
