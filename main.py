@@ -32,7 +32,7 @@ MAX_RECOMMENDED_PAGES = 150
 MAX_WARNING_PAGES = 100
 MAX_STRONG_WARNING_PAGES = 180
 
-MAX_TOPIC_PROCESSING_SECONDS = 240
+MAX_TOPIC_PROCESSING_SECONDS = 600
 MAX_ASSIGNMENT_MATCHES = 30000
 
 def normalize_string(s: str) -> str:
@@ -52,7 +52,10 @@ print("🚨 MAIN.PY LOADED 🚨")
 
 
 
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+import os
+
+if os.path.exists("/opt/homebrew/bin/tesseract"):
+    pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
 
 
 
@@ -339,6 +342,10 @@ def list_documents(
 
 def ocr_pdf_page(pdf_bytes, page_index):
 
+    print(
+        f"🖼️ OCR START PAGE {page_index+1}"
+    )
+
     try:
 
         images = convert_from_bytes(
@@ -460,9 +467,14 @@ def ingest(
 
                 if not page_text or not page_text.strip():
 
-                    print(f"OCR PAGE {page_index+1}")
+                    print(
+                        f"⚠️ OCR REQUIRED PAGE {page_index+1}"
+                    )
 
-                    page_text = ocr_pdf_page(pdf_bytes, page_index)
+                    page_text = ocr_pdf_page(
+                        pdf_bytes,
+                        page_index
+                    )
 
                     if not page_text:
                         continue
@@ -470,6 +482,9 @@ def ingest(
                 chunks = chunk_text(page_text)
                 chunks = [c for c in chunks if len(c) > 100]
                 print("CHUNKS CREATED:", len(chunks))
+                print(
+                    f"📄 PAGE {page_index+1} -> {len(chunks)} CHUNKS"
+                )
 
                 for chunk in chunks:
                     clean_topic = normalize_string(doc.title) if doc.title else "General"
@@ -499,6 +514,14 @@ def ingest(
                         }
                     )
                     
+                    
+                
+                if (page_index + 1) % 10 == 0:
+                    db.commit()
+                    print(
+                        f"💾 PARTIAL COMMIT PAGE {page_index+1}"
+                    )   
+                         
         print("START DOCUMENT:", doc.title)
         db.commit()
 
@@ -694,14 +717,31 @@ def process_topics_task(project_id: str):
                 STRICT RULES:
                 1. CATEGORY RULES:
 
-                - The provided DOCUMENT SECTION is the Category.
+                The provided DOCUMENT SECTION is contextual information only.
 
-                - You MUST reuse the exact DOCUMENT SECTION name as the Category.
+                Your task is to identify the most appropriate educational Category.
 
-                - Do NOT invent new Categories.
-                - Do NOT generalize Categories.
-                - Do NOT rename Categories.
-                - Do NOT merge Categories.
+                CATEGORY RULES:
+
+                - Categories should represent broad learning domains.
+                - Categories should group multiple related study topics.
+                - Categories should be stable across the entire document.
+                - Categories should not be derived directly from paragraph titles.
+                - Categories should not represent individual lessons, examples, or subtopics.
+                - Multiple document sections may belong to the same Category.
+                - Prefer fewer, stronger Categories over many fragmented Categories.
+
+                Good Categories:
+                - Broad educational domains
+                - Major areas of study
+                - Conceptual learning groups
+
+                Bad Categories:
+                - Individual definitions
+                - Single examples
+                - Paragraph titles
+                - Very narrow concepts
+                - Temporary document headings
 
                 - Categories should preserve the educational structure of the source material while grouping concepts into semantically coherent learning domains.
 
@@ -914,6 +954,8 @@ def process_topics_task(project_id: str):
         topics_text = ""
 
         MAX_TOPICS_FOR_CONSOLIDATION = 40
+        print("📊 SECTIONS:", len(section_map))
+
 
         for category, topics in section_map.items():
 
@@ -1009,6 +1051,15 @@ def process_topics_task(project_id: str):
         print("🚀 STARTING FINAL CONSOLIDATION CALL")
         print("🧠 CONSOLIDATION INPUT LENGTH:", len(topics_text))
         print("🧠 TOTAL CATEGORIES:", len(section_map))
+        total_candidate_topics = sum(
+            len(v)
+            for v in section_map.values()
+        )
+
+        print(
+            "📊 CANDIDATE TOPICS BEFORE CONSOLIDATION:",
+            total_candidate_topics
+        )
         print(
             "🚀 STARTING FINAL CONSOLIDATION GPT CALL"
         )
@@ -1067,7 +1118,15 @@ def process_topics_task(project_id: str):
 
             print("⚠️ USING FALLBACK TOPIC STRUCTURE")
         final_data = rebalance_taxonomy(final_data)        
-       
+        final_topics = sum(
+            len(cat.get("topics", []))
+            for cat in final_data.get("categories", [])
+        )
+
+        print(
+            "📊 TOPICS AFTER CONSOLIDATION:",
+            final_topics
+        )
         # 🔥 DELETE OLD TOPIC-CHUNK LINKS
 
         db.execute(
@@ -1338,6 +1397,13 @@ def assign_topics_to_chunks(project_id: str):
             topic_section = (row[6] or "").lower()
 
             similarity = row[7]
+            if processed_matches < 20:
+                print(
+                    "SIM:",
+                    similarity,
+                    "| TOPIC:",
+                    topic_name
+                )
             same_section = (
                 chunk_section == topic_section
             )
@@ -1370,8 +1436,19 @@ def assign_topics_to_chunks(project_id: str):
                 + section_bonus
                 + (keyword_overlap * 0.05)
             )
+            if processed_matches % 2000 == 0:
+                print(
+                    "📊 SCORE SAMPLE:",
+                    round(final_score, 3),
+                    "| similarity:",
+                    round(similarity, 3),
+                    "| overlap:",
+                    keyword_overlap,
+                    "| same_section:",
+                    same_section
+                )
 
-            if final_score > -0.35:
+            if final_score > -0.27:
 
                 key = (topic_id, chunk_id)
 
