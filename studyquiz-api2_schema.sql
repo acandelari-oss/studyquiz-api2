@@ -3226,7 +3226,9 @@ CREATE TABLE public.chunks (
     file_name text,
     page integer,
     topic text,
-    section text
+    section text,
+    chunk_role text,
+    CONSTRAINT chunks_chunk_role_check CHECK (((chunk_role IS NULL) OR (chunk_role = ANY (ARRAY['teaching'::text, 'intro'::text, 'outline'::text, 'bibliography'::text, 'administrative'::text, 'cover'::text]))))
 );
 
 
@@ -3333,11 +3335,56 @@ CREATE TABLE public.projects (
     name text NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
     user_id uuid,
-    topic_status text DEFAULT 'idle'::text
+    topic_status text DEFAULT 'idle'::text,
+    taxonomy_language text
 );
 
 
 ALTER TABLE public.projects OWNER TO postgres;
+
+--
+-- Name: hard_quiz_generation_runs; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.hard_quiz_generation_runs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid NOT NULL,
+    project_name text NOT NULL,
+    quiz_id uuid NOT NULL,
+    difficulty text NOT NULL,
+    question_style text NOT NULL,
+    requested_questions integer NOT NULL,
+    generated_questions integer NOT NULL,
+    accepted_questions integer NOT NULL,
+    rejected_questions integer NOT NULL,
+    acceptance_rate double precision NOT NULL,
+    rejection_reasons_breakdown jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.hard_quiz_generation_runs OWNER TO postgres;
+
+--
+-- Name: hard_quiz_generation_samples; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.hard_quiz_generation_samples (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    run_id uuid NOT NULL,
+    outcome text NOT NULL,
+    question_stem text NOT NULL,
+    rejection_reasons jsonb DEFAULT '[]'::jsonb NOT NULL,
+    question_type text,
+    topic text,
+    category text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT hard_quiz_generation_samples_outcome_check
+        CHECK ((outcome = ANY (ARRAY['accepted'::text, 'rejected'::text])))
+);
+
+
+ALTER TABLE public.hard_quiz_generation_samples OWNER TO postgres;
 
 --
 -- Name: quiz_answers; Type: TABLE; Schema: public; Owner: postgres
@@ -4023,6 +4070,22 @@ ALTER TABLE ONLY public.projects
 
 
 --
+-- Name: hard_quiz_generation_runs hard_quiz_generation_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.hard_quiz_generation_runs
+    ADD CONSTRAINT hard_quiz_generation_runs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: hard_quiz_generation_samples hard_quiz_generation_samples_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.hard_quiz_generation_samples
+    ADD CONSTRAINT hard_quiz_generation_samples_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: quiz_answers quiz_answers_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -4526,6 +4589,34 @@ COMMENT ON INDEX auth.users_email_partial_key IS 'Auth: A partial unique index t
 
 
 --
+-- Name: hard_quiz_generation_runs_created_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX hard_quiz_generation_runs_created_idx ON public.hard_quiz_generation_runs USING btree (created_at DESC);
+
+
+--
+-- Name: hard_quiz_generation_runs_project_created_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX hard_quiz_generation_runs_project_created_idx ON public.hard_quiz_generation_runs USING btree (project_id, created_at DESC);
+
+
+--
+-- Name: hard_quiz_generation_runs_quiz_id_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX hard_quiz_generation_runs_quiz_id_idx ON public.hard_quiz_generation_runs USING btree (quiz_id);
+
+
+--
+-- Name: hard_quiz_generation_samples_run_outcome_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX hard_quiz_generation_samples_run_outcome_idx ON public.hard_quiz_generation_samples USING btree (run_id, outcome);
+
+
+--
 -- Name: users_instance_id_email_idx; Type: INDEX; Schema: auth; Owner: supabase_auth_admin
 --
 
@@ -4842,6 +4933,22 @@ ALTER TABLE ONLY auth.webauthn_challenges
 
 ALTER TABLE ONLY auth.webauthn_credentials
     ADD CONSTRAINT webauthn_credentials_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: hard_quiz_generation_runs hard_quiz_generation_runs_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.hard_quiz_generation_runs
+    ADD CONSTRAINT hard_quiz_generation_runs_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: hard_quiz_generation_samples hard_quiz_generation_samples_run_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.hard_quiz_generation_samples
+    ADD CONSTRAINT hard_quiz_generation_samples_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.hard_quiz_generation_runs(id) ON DELETE CASCADE;
 
 
 --
@@ -7828,4 +7935,3 @@ ALTER EVENT TRIGGER pgrst_drop_watch OWNER TO supabase_admin;
 --
 
 \unrestrict x8YlVLfHswiTQkE8pjRig5oOJ2fwXuXNekHdSNnkVdz4d780IGEOwmomXth47fX
-

@@ -3,6 +3,10 @@ import os
 import uuid
 import base64
 import io
+import math
+import unicodedata
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import List, Optional
 import json
 import requests
@@ -25,6 +29,16 @@ from urllib.parse import unquote
 from fastapi import HTTPException
 from fastapi import Body
 from typing import Optional, List
+from language_registry import (
+    get_enabled_language,
+    get_enabled_languages,
+)
+from chunk_roles import (
+    classify_chunk_role,
+    is_assignment_eligible_chunk_role,
+    log_chunk_role_counts,
+    normalize_chunk_role,
+)
 import time
 import re
 
@@ -34,6 +48,32 @@ MAX_STRONG_WARNING_PAGES = 180
 
 MAX_TOPIC_PROCESSING_SECONDS = 600
 MAX_ASSIGNMENT_MATCHES = 30000
+HARD_ACCEPTED_DIAGNOSTIC_SAMPLE_SIZE = 10
+PRIMARY_ASSIGNMENT_THRESHOLD = 0.54
+MAX_TOPICS_PER_CHUNK = 3
+TOPIC_RESCUE_THRESHOLD = 0.46
+MIN_TAXONOMY_LANGUAGE_CONFIDENCE = 0.80
+
+CATEGORY_CONSOLIDATION_VERSION = "v1.1"
+CATEGORY_RECIPROCAL_NEIGHBORS = 2
+CATEGORY_MERGE_SCORE_THRESHOLD = 0.78
+CATEGORY_PAIR_CENTROID_THRESHOLD = 0.75
+CATEGORY_PAIR_AFFINITY_THRESHOLD = 0.60
+CATEGORY_MIN_COHESION = 0.80
+CATEGORY_MAX_COHESION_LOSS = 0.06
+CATEGORY_MAX_SEMANTIC_SPREAD = 0.58
+CATEGORY_MAX_PROJECT_FRACTION = 0.25
+CATEGORY_ABSOLUTE_TOPIC_LIMIT = 40
+CATEGORY_LEXICAL_ALIAS_THRESHOLD = 0.60
+CATEGORY_ALIAS_CENTROID_THRESHOLD = 0.82
+CATEGORY_ALIAS_AFFINITY_THRESHOLD = 0.65
+CATEGORY_QUALITY_ALIAS_LEXICAL_THRESHOLD = 0.40
+CATEGORY_QUALITY_ALIAS_CENTROID_THRESHOLD = 0.72
+CATEGORY_QUALITY_ALIAS_AFFINITY_THRESHOLD = 0.62
+CATEGORY_QUALITY_ALIAS_MAX_SIZE_RATIO = 2.0
+CATEGORY_QUALITY_BALANCED_ALIAS_MAX_SIZE_RATIO = 1.5
+CATEGORY_QUALITY_ALIAS_MAX_TOPICS = 12
+CATEGORY_QUALITY_ALIAS_MAX_COHESION_LOSS = 0.065
 
 def normalize_string(s: str) -> str:
     if not s: return ""
@@ -41,6 +81,80 @@ def normalize_string(s: str) -> str:
     s = str(s).replace('\xa0', ' ')
     # Riduce spazi multipli a uno solo
     return re.sub(r'\s+', ' ', s).strip()
+
+
+def calculate_topic_chunk_score(
+    chunk_text,
+    chunk_section,
+    topic_name,
+    topic_section,
+    negative_inner_product,
+):
+    if negative_inner_product is None:
+        return None
+
+    chunk_text = (chunk_text or "").lower()
+    chunk_section = (chunk_section or "").lower()
+    topic_name = (topic_name or "").lower()
+    topic_section = (topic_section or "").lower()
+
+    similarity = -negative_inner_product
+    same_section = chunk_section == topic_section
+    keyword_overlap = sum(
+        1
+        for word in topic_name.split()
+        if len(word) > 4 and word in chunk_text
+    )
+    section_bonus = 0.20 if same_section else 0
+
+    return (
+        similarity
+        + section_bonus
+        + (keyword_overlap * 0.05)
+    )
+
+
+def ensure_project_chunk_roles(db, project_id):
+    rows = db.execute(
+        text("""
+            select id, chunk_text, page, doc_title, chunk_role
+            from chunks
+            where project_id = :project_id
+            order by page, id
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    updates = []
+    roles = []
+
+    for row in rows:
+        role = normalize_chunk_role(
+            row[4],
+            row[1],
+            page_number=row[2],
+            doc_title=row[3],
+        )
+        roles.append(role)
+
+        if row[4] != role:
+            updates.append({
+                "chunk_id": row[0],
+                "chunk_role": role,
+            })
+
+    if updates:
+        db.execute(
+            text("""
+                update chunks
+                set chunk_role = :chunk_role
+                where id = :chunk_id
+            """),
+            updates
+        )
+
+    log_chunk_role_counts(roles)
+    return roles
 
 class ActiveRecallRequest(BaseModel):
     topics: Optional[List[str]] = None
@@ -450,6 +564,8 @@ def ingest(
         raise HTTPException(status_code=403, detail="Access denied")
 
     try:
+        total_chunks_document = 0
+        project_chunk_roles = []
         for doc in data.documents:
 
             pdf_bytes = base64.b64decode(doc.file_bytes)
@@ -481,13 +597,23 @@ def ingest(
 
                 chunks = chunk_text(page_text)
                 chunks = [c for c in chunks if len(c) > 100]
+
+                total_chunks_document += len(chunks)
+
                 print("CHUNKS CREATED:", len(chunks))
+
                 print(
                     f"📄 PAGE {page_index+1} -> {len(chunks)} CHUNKS"
                 )
 
                 for chunk in chunks:
                     clean_topic = normalize_string(doc.title) if doc.title else "General"
+                    chunk_role = classify_chunk_role(
+                        chunk,
+                        page_number=page_index + 1,
+                        doc_title=doc.title,
+                    )
+                    project_chunk_roles.append(chunk_role)
 
                     emb = client.embeddings.create(
                         model="text-embedding-3-small",
@@ -500,9 +626,23 @@ def ingest(
                     db.execute(
                         text("""
                             insert into chunks
-                            (project_id, doc_title, chunk_text, embedding, page)
+                            (
+                                project_id,
+                                doc_title,
+                                chunk_text,
+                                embedding,
+                                page,
+                                chunk_role
+                            )
                             values
-                            (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page)
+                            (
+                                :project_id,
+                                :doc_title,
+                                :chunk_text,
+                                CAST(:embedding AS vector),
+                                :page,
+                                :chunk_role
+                            )
                         """),
                         {
                             "project_id": project_id,
@@ -510,7 +650,8 @@ def ingest(
                             "chunk_text": chunk,
                             "embedding": embedding_str,
                             "page": page_index + 1,
-                            "topic": clean_topic
+                            "topic": clean_topic,
+                            "chunk_role": chunk_role,
                         }
                     )
                     
@@ -523,6 +664,12 @@ def ingest(
                     )   
                          
         print("START DOCUMENT:", doc.title)
+
+        print(
+            "📚 DOCUMENT TOTAL CHUNKS:",
+            total_chunks_document
+        )
+        log_chunk_role_counts(project_chunk_roles)
         db.commit()
 
     except Exception as e:
@@ -586,6 +733,1458 @@ def rebalance_taxonomy(final_data):
         "categories": strong_categories
     }
 
+
+@dataclass(frozen=True)
+class TaxonomyTopicLedgerEntry:
+    ledger_id: str
+    original_category: str
+    topic: str
+    description: str
+    importance: object
+    source_position: tuple
+    embedding: tuple
+
+
+def _taxonomy_dot(vector_a, vector_b):
+    return sum(
+        value_a * value_b
+        for value_a, value_b in zip(vector_a, vector_b)
+    )
+
+
+def _taxonomy_unit_vector(vector):
+    magnitude = math.sqrt(_taxonomy_dot(vector, vector))
+
+    if magnitude <= 0:
+        raise ValueError("Taxonomy consolidation received a zero embedding")
+
+    return tuple(value / magnitude for value in vector)
+
+
+def _taxonomy_centroid(vectors):
+    if not vectors:
+        raise ValueError("Cannot calculate a centroid without topic embeddings")
+
+    dimensions = len(vectors[0])
+    centroid = [
+        sum(vector[index] for vector in vectors) / len(vectors)
+        for index in range(dimensions)
+    ]
+
+    return _taxonomy_unit_vector(centroid)
+
+
+def _taxonomy_vector_metrics(vectors):
+    centroid = _taxonomy_centroid(vectors)
+    cohesion = sum(
+        _taxonomy_dot(vector, centroid)
+        for vector in vectors
+    ) / len(vectors)
+
+    if len(vectors) < 2:
+        minimum_pair_similarity = 1.0
+    else:
+        minimum_pair_similarity = min(
+            _taxonomy_dot(vectors[left], vectors[right])
+            for left in range(len(vectors))
+            for right in range(left + 1, len(vectors))
+        )
+
+    return {
+        "centroid": centroid,
+        "cohesion": cohesion,
+        "maximum_spread": 1.0 - minimum_pair_similarity,
+    }
+
+
+def _normalize_category_name(category_name):
+    normalized = "".join(
+        character
+        for character in unicodedata.normalize(
+            "NFKD",
+            (category_name or "").lower()
+        )
+        if not unicodedata.combining(character)
+    )
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
+
+    normalized_tokens = []
+    suffixes = (
+        "zioni",
+        "zione",
+        "iche",
+        "ici",
+        "ale",
+        "ali",
+        "ica",
+        "ico",
+        "i",
+        "e",
+        "s",
+    )
+
+    for token in normalized.split():
+        normalized_token = token
+
+        for suffix in suffixes:
+            if (
+                len(normalized_token) > len(suffix) + 3
+                and normalized_token.endswith(suffix)
+            ):
+                normalized_token = normalized_token[:-len(suffix)]
+                break
+
+        normalized_tokens.append(normalized_token)
+
+    return " ".join(normalized_tokens), set(normalized_tokens)
+
+
+def _category_lexical_similarity(category_a, category_b):
+    normalized_a, tokens_a = _normalize_category_name(category_a)
+    normalized_b, tokens_b = _normalize_category_name(category_b)
+    token_union = tokens_a | tokens_b
+    token_jaccard = (
+        len(tokens_a & tokens_b) / len(token_union)
+        if token_union
+        else 0.0
+    )
+    character_similarity = SequenceMatcher(
+        None,
+        normalized_a,
+        normalized_b
+    ).ratio()
+
+    return (
+        (0.60 * token_jaccard)
+        + (0.40 * character_similarity)
+    )
+
+
+_CATEGORY_NAME_NOISE_TOKENS = {
+    "a",
+    "an",
+    "and",
+    "case",
+    "cases",
+    "casi",
+    "dei",
+    "del",
+    "della",
+    "delle",
+    "dell",
+    "di",
+    "e",
+    "example",
+    "examples",
+    "general",
+    "generale",
+    "in",
+    "of",
+    "overview",
+    "panoramica",
+    "the",
+    "tipi",
+    "tipologie",
+    "type",
+    "types",
+}
+
+
+def _category_core_tokens(category_name):
+    _, normalized_tokens = _normalize_category_name(category_name)
+
+    return {
+        token
+        for token in normalized_tokens
+        if token not in _CATEGORY_NAME_NOISE_TOKENS
+    }
+
+
+def _category_name_quality(category_name):
+    normalized_name, normalized_tokens = _normalize_category_name(
+        category_name
+    )
+    core_tokens = _category_core_tokens(category_name)
+    noise_count = len(normalized_tokens - core_tokens)
+    token_count = len(normalized_tokens)
+    generic_penalty = 1 if any(
+        token in {
+            "general",
+            "generale",
+            "overview",
+            "panoramica",
+            "case",
+            "cases",
+            "casi",
+            "type",
+            "types",
+            "tipi",
+            "tipologie",
+        }
+        for token in normalized_tokens
+    ) else 0
+
+    return (
+        generic_penalty,
+        noise_count,
+        token_count,
+        len(normalized_name),
+        category_name,
+    )
+
+
+def _category_alias_token_match_count(tokens_a, tokens_b):
+    matched_tokens_b = set()
+    match_count = 0
+
+    for token_a in sorted(tokens_a):
+        best_token_b = None
+
+        for token_b in sorted(tokens_b - matched_tokens_b):
+            common_prefix_length = len(
+                os.path.commonprefix((token_a, token_b))
+            )
+
+            if (
+                token_a == token_b
+                or common_prefix_length >= 5
+            ):
+                best_token_b = token_b
+                break
+
+        if best_token_b is not None:
+            matched_tokens_b.add(best_token_b)
+            match_count += 1
+
+    return match_count
+
+
+def _is_category_alias(metrics, profiles):
+    category_a = metrics["category_a"]
+    category_b = metrics["category_b"]
+    profile_a = profiles[category_a]
+    profile_b = profiles[category_b]
+    topic_count_a = profile_a["topic_count"]
+    topic_count_b = profile_b["topic_count"]
+    combined_topic_count = topic_count_a + topic_count_b
+    size_ratio = (
+        max(topic_count_a, topic_count_b)
+        / min(topic_count_a, topic_count_b)
+    )
+    core_tokens_a = _category_core_tokens(category_a)
+    core_tokens_b = _category_core_tokens(category_b)
+    exact_core_alias = (
+        bool(core_tokens_a)
+        and core_tokens_a == core_tokens_b
+    )
+    core_token_matches = _category_alias_token_match_count(
+        core_tokens_a,
+        core_tokens_b,
+    )
+    normalized_core_alias = (
+        bool(core_tokens_a)
+        and len(core_tokens_a) == len(core_tokens_b)
+        and core_token_matches == len(core_tokens_a)
+    )
+    meaningful_containment = (
+        bool(core_tokens_a)
+        and bool(core_tokens_b)
+        and core_tokens_a != core_tokens_b
+        and (
+            core_tokens_a < core_tokens_b
+            or core_tokens_b < core_tokens_a
+        )
+    )
+
+    strict_alias = (
+        not meaningful_containment
+        and core_token_matches >= 2
+        and size_ratio
+        <= CATEGORY_QUALITY_BALANCED_ALIAS_MAX_SIZE_RATIO
+        and
+        metrics["lexical_similarity"]
+        >= CATEGORY_LEXICAL_ALIAS_THRESHOLD
+        and metrics["centroid_similarity"]
+        >= CATEGORY_ALIAS_CENTROID_THRESHOLD
+        and metrics["cross_topic_affinity"]
+        >= CATEGORY_ALIAS_AFFINITY_THRESHOLD
+    )
+    quality_alias = (
+        not meaningful_containment
+        and core_token_matches >= 2
+        and size_ratio
+        <= CATEGORY_QUALITY_BALANCED_ALIAS_MAX_SIZE_RATIO
+        and combined_topic_count
+        <= CATEGORY_QUALITY_ALIAS_MAX_TOPICS
+        and metrics["lexical_similarity"]
+        >= CATEGORY_QUALITY_ALIAS_LEXICAL_THRESHOLD
+        and metrics["centroid_similarity"]
+        >= CATEGORY_QUALITY_ALIAS_CENTROID_THRESHOLD
+        and metrics["cross_topic_affinity"]
+        >= CATEGORY_QUALITY_ALIAS_AFFINITY_THRESHOLD
+    )
+    core_alias = (
+        (exact_core_alias or normalized_core_alias)
+        and size_ratio <= CATEGORY_QUALITY_ALIAS_MAX_SIZE_RATIO
+        and combined_topic_count
+        <= CATEGORY_QUALITY_ALIAS_MAX_TOPICS
+        and metrics["centroid_similarity"] >= 0.68
+        and metrics["cross_topic_affinity"] >= 0.58
+    )
+
+    if strict_alias:
+        return "strict_lexical_semantic_alias"
+
+    if core_alias:
+        return "normalized_name_alias"
+
+    if quality_alias:
+        return "balanced_lexical_semantic_alias"
+
+    return None
+
+
+def _category_cross_topic_affinity(vectors_a, vectors_b):
+    forward_affinity = sum(
+        max(
+            _taxonomy_dot(vector_a, vector_b)
+            for vector_b in vectors_b
+        )
+        for vector_a in vectors_a
+    ) / len(vectors_a)
+
+    reverse_affinity = sum(
+        max(
+            _taxonomy_dot(vector_b, vector_a)
+            for vector_a in vectors_a
+        )
+        for vector_b in vectors_b
+    ) / len(vectors_b)
+
+    return 0.5 * (forward_affinity + reverse_affinity)
+
+
+def build_immutable_taxonomy_ledger(final_data):
+    ledger_entries = []
+
+    for category_index, category in enumerate(
+        final_data.get("categories", [])
+    ):
+        original_category = (
+            category.get("name") or "GENERAL"
+        ).strip().upper()
+
+        for topic_index, topic_object in enumerate(
+            category.get("topics", [])
+        ):
+            topic_title = (
+                topic_object.get("title")
+                or topic_object.get("topic")
+                or ""
+            ).strip()
+
+            if not topic_title:
+                continue
+
+            description = (
+                topic_object.get("description") or ""
+            ).strip()
+            importance = topic_object.get("importance", 5)
+            embedding_input = (
+                f"{original_category} - "
+                f"{topic_title}: "
+                f"{description}"
+            )
+            embedding_response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=embedding_input
+            )
+            embedding = tuple(
+                embedding_response.data[0].embedding
+            )
+
+            ledger_entries.append(
+                TaxonomyTopicLedgerEntry(
+                    ledger_id=f"T{len(ledger_entries) + 1:04d}",
+                    original_category=original_category,
+                    topic=topic_title,
+                    description=description,
+                    importance=importance,
+                    source_position=(category_index, topic_index),
+                    embedding=embedding,
+                )
+            )
+
+    if not ledger_entries:
+        raise ValueError("Cannot consolidate an empty taxonomy")
+
+    ledger_ids = [entry.ledger_id for entry in ledger_entries]
+
+    if len(ledger_ids) != len(set(ledger_ids)):
+        raise ValueError("Immutable topic ledger contains duplicate IDs")
+
+    return tuple(ledger_entries)
+
+
+def _build_category_profiles(topic_ledger):
+    category_entries = {}
+
+    for entry in topic_ledger:
+        category_entries.setdefault(
+            entry.original_category,
+            []
+        ).append(entry)
+
+    profiles = {}
+
+    for category_name, entries in category_entries.items():
+        vectors = [
+            _taxonomy_unit_vector(entry.embedding)
+            for entry in entries
+        ]
+        metrics = _taxonomy_vector_metrics(vectors)
+        profiles[category_name] = {
+            "name": category_name,
+            "entries": tuple(entries),
+            "vectors": tuple(vectors),
+            "topic_count": len(entries),
+            **metrics,
+        }
+
+    return profiles
+
+
+def _build_category_pair_metrics(profiles):
+    category_names = sorted(profiles)
+    pair_metrics = {}
+
+    for left_index, category_a in enumerate(category_names):
+        profile_a = profiles[category_a]
+
+        for category_b in category_names[left_index + 1:]:
+            profile_b = profiles[category_b]
+            centroid_similarity = _taxonomy_dot(
+                profile_a["centroid"],
+                profile_b["centroid"]
+            )
+            cross_topic_affinity = _category_cross_topic_affinity(
+                profile_a["vectors"],
+                profile_b["vectors"]
+            )
+            lexical_similarity = _category_lexical_similarity(
+                category_a,
+                category_b
+            )
+            combined_vectors = (
+                profile_a["vectors"]
+                + profile_b["vectors"]
+            )
+            merged_metrics = _taxonomy_vector_metrics(
+                combined_vectors
+            )
+            combined_topic_count = (
+                profile_a["topic_count"]
+                + profile_b["topic_count"]
+            )
+            weighted_source_cohesion = (
+                (
+                    profile_a["cohesion"]
+                    * profile_a["topic_count"]
+                )
+                + (
+                    profile_b["cohesion"]
+                    * profile_b["topic_count"]
+                )
+            ) / combined_topic_count
+            cohesion_loss = max(
+                0.0,
+                weighted_source_cohesion
+                - merged_metrics["cohesion"]
+            )
+            cohesion_retention = max(
+                0.0,
+                min(
+                    1.0,
+                    1.0
+                    - (
+                        cohesion_loss
+                        / CATEGORY_MAX_COHESION_LOSS
+                    )
+                )
+            )
+            merge_score = (
+                (0.45 * centroid_similarity)
+                + (0.30 * cross_topic_affinity)
+                + (0.15 * lexical_similarity)
+                + (0.10 * cohesion_retention)
+            )
+
+            pair_metrics[(category_a, category_b)] = {
+                "category_a": category_a,
+                "category_b": category_b,
+                "centroid_similarity": centroid_similarity,
+                "cross_topic_affinity": cross_topic_affinity,
+                "lexical_similarity": lexical_similarity,
+                "cohesion_retention": cohesion_retention,
+                "cohesion_loss": cohesion_loss,
+                "merged_cohesion": merged_metrics["cohesion"],
+                "maximum_spread": merged_metrics["maximum_spread"],
+                "merge_score": merge_score,
+            }
+
+    return pair_metrics
+
+
+def _category_pair_key(category_a, category_b):
+    return tuple(sorted((category_a, category_b)))
+
+
+def _calculate_category_size_limit(profiles):
+    total_topics = sum(
+        profile["topic_count"]
+        for profile in profiles.values()
+    )
+    largest_original_category = max(
+        profile["topic_count"]
+        for profile in profiles.values()
+    )
+    relative_limit = math.ceil(
+        total_topics * CATEGORY_MAX_PROJECT_FRACTION
+    )
+
+    return min(
+        max(largest_original_category, relative_limit),
+        CATEGORY_ABSOLUTE_TOPIC_LIMIT
+    )
+
+
+def _choose_canonical_category_name(group, profiles):
+    ordered_group = sorted(group)
+
+    if len(ordered_group) == 1:
+        return ordered_group[0]
+
+    ranked_names = []
+
+    for category_name in ordered_group:
+        other_names = [
+            other_name
+            for other_name in ordered_group
+            if other_name != category_name
+        ]
+        centrality = sum(
+            _taxonomy_dot(
+                profiles[category_name]["centroid"],
+                profiles[other_name]["centroid"]
+            )
+            for other_name in other_names
+        ) / len(other_names)
+        ranked_names.append(
+            (
+                _category_name_quality(category_name),
+                -centrality,
+                -profiles[category_name]["topic_count"],
+                category_name,
+            )
+        )
+
+    return min(ranked_names)[3]
+
+
+def consolidate_taxonomy_categories_v1(topic_ledger):
+    profiles = _build_category_profiles(topic_ledger)
+    category_names = sorted(profiles)
+
+    if len(category_names) < 2:
+        identity_mapping = {
+            category_name: category_name
+            for category_name in category_names
+        }
+        final_groups = [
+            {
+                "canonical_category": category_name,
+                "source_categories": [category_name],
+                "topic_count": profiles[category_name]["topic_count"],
+            }
+            for category_name in category_names
+        ]
+        diagnostics = build_taxonomy_quality_diagnostics(
+            topic_ledger=topic_ledger,
+            category_mapping=identity_mapping,
+            final_groups=final_groups,
+            accepted_merges=[],
+        )
+
+        return {
+            "mapping": identity_mapping,
+            "groups": final_groups,
+            "accepted_merges": [],
+            "rejected_merges": [],
+            "category_size_limit": (
+                profiles[category_names[0]]["topic_count"]
+                if category_names
+                else 0
+            ),
+            "diagnostics": diagnostics,
+        }
+
+    pair_metrics = _build_category_pair_metrics(profiles)
+    neighbor_count = min(
+        CATEGORY_RECIPROCAL_NEIGHBORS,
+        len(category_names) - 1
+    )
+    nearest_neighbors = {}
+
+    for category_name in category_names:
+        ranked_neighbors = sorted(
+            (
+                (
+                    -_taxonomy_dot(
+                        profiles[category_name]["centroid"],
+                        profiles[other_name]["centroid"]
+                    ),
+                    other_name,
+                )
+                for other_name in category_names
+                if other_name != category_name
+            )
+        )
+        nearest_neighbors[category_name] = {
+            other_name
+            for _, other_name in ranked_neighbors[:neighbor_count]
+        }
+
+    candidate_edges = []
+    rejected_merges = []
+
+    for pair_key, metrics in pair_metrics.items():
+        category_a, category_b = pair_key
+        reciprocal_neighbors = (
+            category_b in nearest_neighbors[category_a]
+            and category_a in nearest_neighbors[category_b]
+        )
+        alias_reason = _is_category_alias(
+            metrics,
+            profiles,
+        )
+        score_valid = (
+            metrics["merge_score"]
+            >= CATEGORY_MERGE_SCORE_THRESHOLD
+        )
+
+        if reciprocal_neighbors and (score_valid or alias_reason):
+            candidate_edges.append({
+                **metrics,
+                "candidate_reason": (
+                    alias_reason
+                    or "merge_score_above_threshold"
+                ),
+            })
+        elif reciprocal_neighbors:
+            rejected_merges.append({
+                **metrics,
+                "reason": "merge_score_below_threshold",
+            })
+
+    candidate_edges.sort(
+        key=lambda edge: (
+            -edge["merge_score"],
+            edge["category_a"],
+            edge["category_b"],
+        )
+    )
+
+    groups = {
+        category_name: {category_name}
+        for category_name in category_names
+    }
+    group_owner = {
+        category_name: category_name
+        for category_name in category_names
+    }
+    accepted_merges = []
+    category_size_limit = _calculate_category_size_limit(
+        profiles
+    )
+
+    for edge in candidate_edges:
+        category_a = edge["category_a"]
+        category_b = edge["category_b"]
+        owner_a = group_owner[category_a]
+        owner_b = group_owner[category_b]
+
+        if owner_a == owner_b:
+            continue
+
+        proposed_group = groups[owner_a] | groups[owner_b]
+        proposed_topic_count = sum(
+            profiles[category_name]["topic_count"]
+            for category_name in proposed_group
+        )
+
+        if proposed_topic_count > category_size_limit:
+            rejected_merges.append({
+                **edge,
+                "reason": "category_size_limit",
+                "proposed_topic_count": proposed_topic_count,
+            })
+            continue
+
+        incompatible_pair = None
+
+        for left_index, group_category_a in enumerate(
+            sorted(proposed_group)
+        ):
+            for group_category_b in sorted(proposed_group)[
+                left_index + 1:
+            ]:
+                group_pair_metrics = pair_metrics[
+                    _category_pair_key(
+                        group_category_a,
+                        group_category_b
+                    )
+                ]
+                group_pair_alias = _is_category_alias(
+                    group_pair_metrics,
+                    profiles,
+                )
+
+                if (
+                    not group_pair_alias
+                    and (
+                        group_pair_metrics["centroid_similarity"]
+                        < CATEGORY_PAIR_CENTROID_THRESHOLD
+                        or group_pair_metrics["cross_topic_affinity"]
+                        < CATEGORY_PAIR_AFFINITY_THRESHOLD
+                    )
+                ):
+                    incompatible_pair = (
+                        group_category_a,
+                        group_category_b,
+                    )
+                    break
+
+            if incompatible_pair:
+                break
+
+        if incompatible_pair:
+            rejected_merges.append({
+                **edge,
+                "reason": "complete_group_pair_incompatible",
+                "incompatible_pair": incompatible_pair,
+            })
+            continue
+
+        proposed_vectors = tuple(
+            vector
+            for category_name in sorted(proposed_group)
+            for vector in profiles[category_name]["vectors"]
+        )
+        proposed_metrics = _taxonomy_vector_metrics(
+            proposed_vectors
+        )
+        weighted_source_cohesion = sum(
+            (
+                profiles[category_name]["cohesion"]
+                * profiles[category_name]["topic_count"]
+            )
+            for category_name in proposed_group
+        ) / proposed_topic_count
+        proposed_cohesion_loss = max(
+            0.0,
+            weighted_source_cohesion
+            - proposed_metrics["cohesion"]
+        )
+
+        if proposed_metrics["cohesion"] < CATEGORY_MIN_COHESION:
+            rejected_merges.append({
+                **edge,
+                "reason": "merged_cohesion_below_minimum",
+                "proposed_cohesion": proposed_metrics["cohesion"],
+            })
+            continue
+
+        alias_candidate = (
+            edge["candidate_reason"]
+            != "merge_score_above_threshold"
+        )
+        maximum_cohesion_loss = (
+            CATEGORY_QUALITY_ALIAS_MAX_COHESION_LOSS
+            if alias_candidate
+            else CATEGORY_MAX_COHESION_LOSS
+        )
+
+        if proposed_cohesion_loss > maximum_cohesion_loss:
+            rejected_merges.append({
+                **edge,
+                "reason": "cohesion_loss_above_maximum",
+                "proposed_cohesion_loss": proposed_cohesion_loss,
+                "maximum_cohesion_loss": maximum_cohesion_loss,
+            })
+            continue
+
+        if (
+            proposed_metrics["maximum_spread"]
+            > CATEGORY_MAX_SEMANTIC_SPREAD
+        ):
+            rejected_merges.append({
+                **edge,
+                "reason": "semantic_spread_above_maximum",
+                "proposed_maximum_spread": (
+                    proposed_metrics["maximum_spread"]
+                ),
+            })
+            continue
+
+        new_owner = min(proposed_group)
+        del groups[owner_a]
+        del groups[owner_b]
+        groups[new_owner] = proposed_group
+
+        for category_name in proposed_group:
+            group_owner[category_name] = new_owner
+
+        accepted_merges.append({
+            **edge,
+            "source_categories": sorted(proposed_group),
+            "topic_count": proposed_topic_count,
+            "merged_cohesion": proposed_metrics["cohesion"],
+            "maximum_spread": proposed_metrics["maximum_spread"],
+            "cohesion_loss": proposed_cohesion_loss,
+            "rationale": (
+                "Categories are reciprocal semantic neighbors and passed "
+                f"the {edge['candidate_reason']} gate while preserving "
+                "merged size, cohesion, semantic spread, and complete-group "
+                "compatibility."
+            ),
+        })
+
+    category_mapping = {}
+    final_groups = []
+
+    for group in sorted(
+        groups.values(),
+        key=lambda item: sorted(item)
+    ):
+        canonical_name = _choose_canonical_category_name(
+            group,
+            profiles
+        )
+        topic_count = sum(
+            profiles[category_name]["topic_count"]
+            for category_name in group
+        )
+
+        for category_name in group:
+            category_mapping[category_name] = canonical_name
+
+        final_groups.append({
+            "canonical_category": canonical_name,
+            "source_categories": sorted(group),
+            "topic_count": topic_count,
+        })
+
+    validate_taxonomy_consolidation(
+        topic_ledger=topic_ledger,
+        category_mapping=category_mapping,
+        final_groups=final_groups,
+        category_size_limit=category_size_limit,
+    )
+    diagnostics = build_taxonomy_quality_diagnostics(
+        topic_ledger=topic_ledger,
+        category_mapping=category_mapping,
+        final_groups=final_groups,
+        accepted_merges=accepted_merges,
+    )
+
+    return {
+        "mapping": category_mapping,
+        "groups": final_groups,
+        "accepted_merges": accepted_merges,
+        "rejected_merges": rejected_merges,
+        "category_size_limit": category_size_limit,
+        "diagnostics": diagnostics,
+    }
+
+
+def build_taxonomy_quality_diagnostics(
+    topic_ledger,
+    category_mapping,
+    final_groups,
+    accepted_merges,
+):
+    before_counts = {}
+
+    for entry in topic_ledger:
+        before_counts[entry.original_category] = (
+            before_counts.get(entry.original_category, 0) + 1
+        )
+
+    after_counts = {}
+
+    for entry in topic_ledger:
+        final_category = category_mapping[entry.original_category]
+        after_counts[final_category] = (
+            after_counts.get(final_category, 0) + 1
+        )
+
+    rationale_by_group = {}
+
+    for merge in accepted_merges:
+        group_key = tuple(merge["source_categories"])
+        rationale_by_group[group_key] = merge["rationale"]
+
+    category_changes = []
+
+    for group in final_groups:
+        source_categories = group["source_categories"]
+        canonical_category = group["canonical_category"]
+
+        if len(source_categories) <= 1:
+            continue
+
+        group_key = tuple(source_categories)
+        renamed_categories = [
+            category_name
+            for category_name in source_categories
+            if category_name != canonical_category
+        ]
+        category_changes.append({
+            "source_categories": source_categories,
+            "canonical_category": canonical_category,
+            "renamed_categories": renamed_categories,
+            "topic_count": group["topic_count"],
+            "rationale": rationale_by_group.get(
+                group_key,
+                (
+                    "Categories were connected through validated reciprocal "
+                    "alias merges and passed complete-group integrity checks."
+                ),
+            ),
+        })
+
+    return {
+        "categories_before_review": [
+            {
+                "category": category_name,
+                "topic_count": before_counts[category_name],
+            }
+            for category_name in sorted(before_counts)
+        ],
+        "categories_after_review": [
+            {
+                "category": category_name,
+                "topic_count": after_counts[category_name],
+            }
+            for category_name in sorted(after_counts)
+        ],
+        "category_count_before": len(before_counts),
+        "category_count_after": len(after_counts),
+        "topic_count_before": len(topic_ledger),
+        "topic_count_after": sum(after_counts.values()),
+        "categories_merged_or_renamed": category_changes,
+    }
+
+
+def validate_taxonomy_consolidation(
+    topic_ledger,
+    category_mapping,
+    final_groups,
+    category_size_limit,
+):
+    original_categories = {
+        entry.original_category
+        for entry in topic_ledger
+    }
+
+    if set(category_mapping) != original_categories:
+        raise ValueError(
+            "Category mapping does not cover every original category"
+        )
+
+    ledger_ids = [entry.ledger_id for entry in topic_ledger]
+
+    if len(ledger_ids) != len(set(ledger_ids)):
+        raise ValueError(
+            "Topic integrity failed: duplicate ledger topic IDs"
+        )
+
+    mapped_topic_ids = []
+    final_category_counts = {}
+
+    for entry in topic_ledger:
+        final_category = category_mapping.get(
+            entry.original_category
+        )
+
+        if not final_category:
+            raise ValueError(
+                f"Topic {entry.ledger_id} has no final category"
+            )
+
+        mapped_topic_ids.append(entry.ledger_id)
+        final_category_counts[final_category] = (
+            final_category_counts.get(final_category, 0) + 1
+        )
+
+    if mapped_topic_ids != ledger_ids:
+        raise ValueError(
+            "Topic integrity failed: ledger ordering changed"
+        )
+
+    if len(mapped_topic_ids) != len(set(mapped_topic_ids)):
+        raise ValueError(
+            "Topic integrity failed: a topic was assigned more than once"
+        )
+
+    if sum(final_category_counts.values()) != len(topic_ledger):
+        raise ValueError(
+            "Topic integrity failed: topic count changed"
+        )
+
+    if any(
+        topic_count <= 0
+        for topic_count in final_category_counts.values()
+    ):
+        raise ValueError(
+            "Taxonomy consolidation produced an empty category"
+        )
+
+    if any(
+        topic_count > category_size_limit
+        for topic_count in final_category_counts.values()
+    ):
+        raise ValueError(
+            "Taxonomy consolidation exceeded the category size limit"
+        )
+
+    canonical_names = [
+        group["canonical_category"]
+        for group in final_groups
+    ]
+
+    if len(canonical_names) != len(set(canonical_names)):
+        raise ValueError(
+            "Taxonomy consolidation produced duplicate canonical names"
+        )
+
+    if len(final_category_counts) > len(original_categories):
+        raise ValueError(
+            "Taxonomy consolidation increased the category count"
+        )
+
+def sample_project_language_text(
+    all_chunks,
+    max_samples=24,
+    max_chars_per_sample=700
+):
+    usable_chunks = [
+        chunk
+        for chunk in all_chunks
+        if len((chunk.get("text") or "").strip()) >= 120
+    ]
+
+    if not usable_chunks:
+        return ""
+
+    sample_count = min(max_samples, len(usable_chunks))
+
+    if sample_count == 1:
+        selected_indexes = [0]
+    else:
+        selected_indexes = [
+            round(i * (len(usable_chunks) - 1) / (sample_count - 1))
+            for i in range(sample_count)
+        ]
+
+    selected_chunks = []
+    seen_indexes = set()
+
+    for index in selected_indexes:
+        if index in seen_indexes:
+            continue
+
+        seen_indexes.add(index)
+        chunk = usable_chunks[index]
+        text_value = (chunk.get("text") or "").strip()
+
+        selected_chunks.append(
+            text_value[:max_chars_per_sample]
+        )
+
+    return "\n\n---\n\n".join(selected_chunks)
+
+
+def detect_project_taxonomy_language(all_chunks):
+    sample_text = sample_project_language_text(all_chunks)
+
+    if not sample_text:
+        raise ValueError("No suitable source text for language detection")
+
+    enabled_languages = get_enabled_languages()
+    enabled_language_list = [
+        {
+            "code": language["code"],
+            "name": language["name"],
+            "native_name": language["native_name"],
+        }
+        for language in enabled_languages
+    ]
+
+    detection_prompt = f"""
+    Determine the dominant natural language of the explanatory prose in the
+    supplied project excerpts.
+
+    Select exactly one language from this enabled language registry:
+    {json.dumps(enabled_language_list, ensure_ascii=False)}
+
+    RULES:
+    - Judge the language of the explanatory prose.
+    - Ignore formulas, source code, citations, bibliography entries, proper
+      names, acronyms, and isolated foreign technical terminology.
+    - Do not infer language from the academic domain.
+    - If no enabled language clearly dominates, return the closest candidate
+      with a low confidence score rather than inventing another code.
+    - Return ONLY valid JSON.
+
+    JSON FORMAT:
+    {{
+      "language_code": "BCP47_CODE",
+      "confidence": 0.0
+    }}
+
+    PROJECT EXCERPTS:
+    {sample_text}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You classify the dominant language of educational source "
+                    "material."
+                )
+            },
+            {"role": "user", "content": detection_prompt}
+        ],
+        temperature=0,
+        response_format={"type": "json_object"}
+    )
+
+    detection_data = json.loads(
+        response.choices[0].message.content
+    )
+
+    language = get_enabled_language(
+        detection_data.get("language_code")
+    )
+    confidence = detection_data.get("confidence")
+
+    if not language:
+        raise ValueError(
+            "Language detector returned an unsupported or disabled code"
+        )
+
+    if not isinstance(confidence, (int, float)):
+        raise ValueError(
+            "Language detector returned an invalid confidence score"
+        )
+
+    confidence = float(confidence)
+
+    if confidence < 0 or confidence > 1:
+        raise ValueError(
+            "Language detector confidence must be between 0 and 1"
+        )
+
+    return {
+        "language": language,
+        "confidence": confidence
+    }
+
+
+def audit_taxonomy_reorganization(final_data, project_id: str):
+    """
+    Audit-only taxonomy reorganization.
+
+    This function never mutates final_data and its result is not used by
+    persistence, embeddings, or topic-chunk assignment.
+    """
+    audit_topics = []
+    current_category_counts = {}
+
+    for category_index, category in enumerate(final_data.get("categories", [])):
+        category_name = (
+            category.get("name") or "GENERAL"
+        ).strip().upper()
+
+        for topic_index, topic_obj in enumerate(category.get("topics", [])):
+            topic_title = (
+                topic_obj.get("title")
+                or topic_obj.get("topic")
+                or ""
+            ).strip()
+
+            if not topic_title:
+                continue
+
+            current_category_counts[category_name] = (
+                current_category_counts.get(category_name, 0) + 1
+            )
+
+            audit_topics.append({
+                "audit_id": f"T{len(audit_topics) + 1:04d}",
+                "current_category": category_name,
+                "topic": topic_title,
+                "description": (
+                    topic_obj.get("description") or ""
+                ).strip(),
+                "importance": topic_obj.get("importance", 5),
+                "source_position": {
+                    "category_index": category_index,
+                    "topic_index": topic_index
+                }
+            })
+
+    current_stats = {
+        "category_count": len(current_category_counts),
+        "topic_count": len(audit_topics),
+        "topics_per_category": current_category_counts
+    }
+
+    print("🔎 TAXONOMY AUDIT START:", project_id)
+    print(
+        "🔎 TAXONOMY AUDIT CURRENT STATS:",
+        json.dumps(current_stats, sort_keys=True)
+    )
+
+    if not audit_topics:
+        raise ValueError("Taxonomy audit received no topics")
+
+    immutable_payload = [
+        {
+            "audit_id": topic["audit_id"],
+            "current_category": topic["current_category"],
+            "topic": topic["topic"],
+            "description": topic["description"],
+            "importance": topic["importance"]
+        }
+        for topic in audit_topics
+    ]
+
+    audit_prompt = f"""
+    Act as a senior domain-agnostic educational taxonomy auditor.
+
+    You are reviewing a completed taxonomy. The study topics are immutable.
+    Your only task is to propose a cleaner category organization.
+
+    ALLOWED:
+    - Move an existing topic to another category.
+    - Merge overlapping categories.
+    - Rename categories.
+
+    FORBIDDEN:
+    - Do not modify topic titles.
+    - Do not modify descriptions.
+    - Do not modify importance.
+    - Do not delete topics.
+    - Do not create topics.
+    - Do not merge or split topics.
+
+    CATEGORY QUALITY RULES:
+    - Work across any academic domain, including medicine, law, engineering,
+      humanities, economics, and multidisciplinary material.
+    - Categories must be stable educational families that can contain multiple
+      meaningful study topics.
+    - Merge lexical variants and categories with the same educational scope.
+    - Reorganize topics out of generic umbrella categories when a more precise
+      educational family is supported by the supplied topics.
+    - Do not merge categories merely because they are related.
+    - Preserve meaningful disciplinary boundaries.
+    - Prefer fewer, stronger categories, but never target a fixed count.
+    - Base decisions on topic meaning and description, not word overlap alone.
+
+    OUTPUT RULES:
+    - Return ONLY valid JSON.
+    - Return each audit_id exactly once.
+    - Do not return topic titles or descriptions.
+    - Category names must be concise, professional, and uppercase.
+    - confidence_score must be a number from 0 to 1 representing confidence in
+      the overall category organization.
+
+    JSON FORMAT:
+    {{
+      "proposed_categories": [
+        {{
+          "name": "CANONICAL CATEGORY",
+          "topic_ids": ["T0001", "T0002"]
+        }}
+      ],
+      "confidence_score": 0.0
+    }}
+
+    IMMUTABLE TOPICS:
+    {json.dumps(immutable_payload, ensure_ascii=False)}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You audit educational category structure without "
+                    "changing any study topic."
+                )
+            },
+            {"role": "user", "content": audit_prompt}
+        ],
+        temperature=0.1,
+        response_format={"type": "json_object"}
+    )
+
+    audit_data = json.loads(
+        response.choices[0].message.content
+    )
+
+    proposed_categories = audit_data.get("proposed_categories")
+    if not isinstance(proposed_categories, list) or not proposed_categories:
+        raise ValueError("Taxonomy audit returned no proposed categories")
+
+    expected_ids = {topic["audit_id"] for topic in audit_topics}
+    assigned_ids = []
+    proposed_category_counts = {}
+    proposed_category_by_topic = {}
+
+    for category in proposed_categories:
+        proposed_name = str(category.get("name") or "").strip().upper()
+        topic_ids = category.get("topic_ids")
+
+        if not proposed_name:
+            raise ValueError("Taxonomy audit returned an empty category name")
+
+        if not isinstance(topic_ids, list) or not topic_ids:
+            raise ValueError(
+                f"Taxonomy audit category has no topics: {proposed_name}"
+            )
+
+        if proposed_name in proposed_category_counts:
+            raise ValueError(
+                f"Taxonomy audit returned duplicate category: {proposed_name}"
+            )
+
+        proposed_category_counts[proposed_name] = len(topic_ids)
+
+        for audit_id in topic_ids:
+            if not isinstance(audit_id, str):
+                raise ValueError("Taxonomy audit returned a non-string topic ID")
+
+            assigned_ids.append(audit_id)
+            proposed_category_by_topic[audit_id] = proposed_name
+
+    assigned_id_set = set(assigned_ids)
+
+    if len(assigned_ids) != len(assigned_id_set):
+        raise ValueError("Taxonomy audit assigned at least one topic more than once")
+
+    missing_ids = expected_ids - assigned_id_set
+    unknown_ids = assigned_id_set - expected_ids
+
+    if missing_ids or unknown_ids:
+        raise ValueError(
+            "Taxonomy audit topic coverage mismatch: "
+            f"missing={sorted(missing_ids)}, unknown={sorted(unknown_ids)}"
+        )
+
+    confidence_score = audit_data.get("confidence_score")
+    if not isinstance(confidence_score, (int, float)):
+        raise ValueError("Taxonomy audit returned an invalid confidence score")
+
+    confidence_score = max(0.0, min(1.0, float(confidence_score)))
+
+    source_to_targets = {}
+    target_to_sources = {}
+
+    for topic in audit_topics:
+        source = topic["current_category"]
+        target = proposed_category_by_topic[topic["audit_id"]]
+
+        source_to_targets.setdefault(source, {})
+        source_to_targets[source][target] = (
+            source_to_targets[source].get(target, 0) + 1
+        )
+
+        target_to_sources.setdefault(target, set()).add(source)
+
+    merged_categories = [
+        {
+            "proposed_category": target,
+            "source_categories": sorted(sources),
+            "source_category_count": len(sources),
+            "topic_count": proposed_category_counts[target]
+        }
+        for target, sources in sorted(target_to_sources.items())
+        if len(sources) > 1
+    ]
+
+    category_merge_map = {
+        "source_to_proposed_categories": source_to_targets,
+        "merged_categories": merged_categories
+    }
+
+    current_category_count = len(current_category_counts)
+    proposed_category_count = len(proposed_category_counts)
+    category_reduction = current_category_count - proposed_category_count
+    category_reduction_pct = (
+        round((category_reduction / current_category_count) * 100, 2)
+        if current_category_count
+        else 0.0
+    )
+
+    proposed_stats = {
+        "category_count": proposed_category_count,
+        "topic_count": len(assigned_ids),
+        "topics_per_category": proposed_category_counts
+    }
+
+    estimated_reduction = {
+        "current_category_count": current_category_count,
+        "proposed_category_count": proposed_category_count,
+        "category_reduction": category_reduction,
+        "category_reduction_percent": category_reduction_pct
+    }
+
+    print(
+        "🔎 TAXONOMY AUDIT PROPOSED STATS:",
+        json.dumps(proposed_stats, sort_keys=True)
+    )
+    print(
+        "🔎 TAXONOMY AUDIT CATEGORY MERGE MAP:",
+        json.dumps(category_merge_map, sort_keys=True)
+    )
+    print(
+        "🔎 TAXONOMY AUDIT ESTIMATED REDUCTION:",
+        json.dumps(estimated_reduction, sort_keys=True)
+    )
+    print(
+        "🔎 TAXONOMY AUDIT CONFIDENCE:",
+        confidence_score
+    )
+    print(
+        "✅ TAXONOMY AUDIT COMPLETE — "
+        "NO TAXONOMY, EMBEDDING, DATABASE, OR ASSIGNMENT CHANGES APPLIED"
+    )
+
+    return {
+        "current_statistics": current_stats,
+        "proposed_statistics": proposed_stats,
+        "category_merge_map": category_merge_map,
+        "estimated_category_reduction": estimated_reduction,
+        "confidence_score": confidence_score
+    }
+
 def process_topics_task(project_id: str):
     db = SessionLocal()
     try:
@@ -597,14 +2196,16 @@ def process_topics_task(project_id: str):
         # 1. Update status and clear old topics
         db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
         db.execute(text("delete from topics where project_id = :project_id"), {"project_id": project_id})
+        ensure_project_chunk_roles(db, project_id)
         db.commit()
 
         # Fetch chunks to analyze (up to 120 chunks)
         rows = db.execute(
             text("""
-                select chunk_text, section
+                select chunk_text, section, chunk_role
                 from chunks
                 where project_id = :project_id
+                and chunk_role = 'teaching'
                 order by page asc
                 limit 400
             """),
@@ -614,17 +2215,122 @@ def process_topics_task(project_id: str):
         all_chunks = [
             {
                 "text": r[0],
-                "section": r[1] or "GENERAL"
+                "section": r[1] or "GENERAL",
+                "chunk_role": r[2],
             }
             for r in rows
             if r[0]
         ]
+        chunk_eligibility_counts = db.execute(
+            text("""
+                select
+                    count(*) filter (
+                        where chunk_role = 'teaching'
+                    ) as eligible_chunks,
+                    count(*) filter (
+                        where chunk_role <> 'teaching'
+                    ) as excluded_chunks
+                from chunks
+                where project_id = :project_id
+            """),
+            {"project_id": project_id}
+        ).fetchone()
         print("📦 TOTAL CHUNKS:", len(all_chunks))
+        print(
+            "ELIGIBLE TEACHING CHUNKS:",
+            chunk_eligibility_counts[0]
+        )
+        print("EXCLUDED CHUNKS:", chunk_eligibility_counts[1])
         print(
             "⏱️ CHUNKS LOADED:",
             round(time.time() - topic_phase_timer, 1),
             "seconds"
         )
+
+        taxonomy_language = None
+        taxonomy_language_confidence = None
+        language_enforcement_applied = False
+        detected_language_code = None
+
+        try:
+            detection_result = detect_project_taxonomy_language(
+                all_chunks
+            )
+
+            detected_language = detection_result["language"]
+            detected_language_code = detected_language["code"]
+            taxonomy_language_confidence = detection_result["confidence"]
+
+            if (
+                taxonomy_language_confidence
+                >= MIN_TAXONOMY_LANGUAGE_CONFIDENCE
+            ):
+                db.execute(
+                    text("""
+                        UPDATE projects
+                        SET taxonomy_language = :taxonomy_language
+                        WHERE id = :project_id
+                    """),
+                    {
+                        "taxonomy_language": detected_language["code"],
+                        "project_id": project_id
+                    }
+                )
+                db.commit()
+
+                taxonomy_language = detected_language
+                language_enforcement_applied = True
+            else:
+                print(
+                    "⚠️ LANGUAGE DETECTION CONFIDENCE TOO LOW — "
+                    "CONTINUING EXISTING PIPELINE UNCHANGED"
+                )
+
+        except Exception as language_error:
+            db.rollback()
+            print(
+                "⚠️ LANGUAGE DETECTION FAILED — "
+                "CONTINUING EXISTING PIPELINE UNCHANGED:",
+                repr(language_error)
+            )
+
+        print(
+            "DETECTED LANGUAGE:",
+            detected_language_code
+        )
+        print(
+            "DETECTION CONFIDENCE:",
+            taxonomy_language_confidence
+        )
+        print(
+            "TAXONOMY LANGUAGE:",
+            taxonomy_language["code"] if taxonomy_language else None
+        )
+        print(
+            "LANGUAGE ENFORCEMENT APPLIED:",
+            language_enforcement_applied
+        )
+
+        language_instruction = ""
+
+        if taxonomy_language:
+            language_instruction = f"""
+                LANGUAGE REQUIREMENT:
+                - The authoritative language for this project is
+                  {taxonomy_language["name"]}
+                  ({taxonomy_language["code"]}).
+                - Generate ALL category names, topic titles, and topic
+                  descriptions exclusively in
+                  {taxonomy_language["name"]}.
+                - Do not switch to the language used by these instructions or
+                  by model defaults.
+                - Preserve proper names, formulas, symbols, abbreviations,
+                  citations, standards identifiers, and established technical
+                  terms when translating them would be academically incorrect
+                  or unnatural.
+                - Language consistency must not change topic selection,
+                  educational scope, granularity, or factual meaning.
+            """
 
         topic_phase_timer = time.time()
         # Group chunks into batches of 20
@@ -713,6 +2419,8 @@ def process_topics_task(project_id: str):
                 
                 GOAL:
                 Organize the information into a logical structure of Macro-Categories and robust Study Topics.
+
+                {language_instruction}
                 
                 STRICT RULES:
                 1. CATEGORY RULES:
@@ -760,20 +2468,6 @@ def process_topics_task(project_id: str):
                 -Topics must remain narrow enough to represent a focused retrievable study unit.
 
                 -Avoid placing unrelated concepts inside the same category.
-
-                GOOD CATEGORY EXAMPLES:
-                - KINEMATICS
-                - THERMODYNAMICS
-                - CELL BIOLOGY
-                - ORGANIC CHEMISTRY
-                - CONTRACT LAW
-                - DATA STRUCTURES
-                - MARKETING STRATEGY
-
-                BAD CATEGORY EXAMPLES:
-                - DEEP MUSCLES OF THE POSTERIOR COMPARTMENT
-                - ROTATOR CUFF MUSCLES
-                - ANTERIOR MUSCLES OF THE LEG
 
                 - Categories should describe a broad educational area, not a specific Study Topic.
 
@@ -982,6 +2676,8 @@ def process_topics_task(project_id: str):
 
         Your task is to CONSOLIDATE them into a SINGLE coherent educational taxonomy.
 
+        {language_instruction}
+
         GOALS:
         - Merge ONLY genuinely redundant or overlapping Topics.
         - NEVER merge Topics belonging to different Categories.
@@ -989,11 +2685,6 @@ def process_topics_task(project_id: str):
         - Topics from different Categories must always remain separated even if semantically related.
         - Preserve important educational subdomains as separate Topics.
         - Do NOT merge Topics that belong to different conceptual depths.
-        Examples:
-        - "Newton's Laws" and "Projectile Motion"
-        - "Contract Formation" and "Breach of Contract"
-        - "Data Structures" and "Sorting Algorithms"
-        - "Truth Tables" and "Sentential Logic" are different depths.
         - Only merge Topics representing the same pedagogical level.
         - Do NOT merge Topics that represent distinct study areas, even if related.
         - Remove redundant Topics
@@ -1119,14 +2810,159 @@ def process_topics_task(project_id: str):
             print("⚠️ USING FALLBACK TOPIC STRUCTURE")
         final_data = rebalance_taxonomy(final_data)        
         final_topics = sum(
-            len(cat.get("topics", []))
+            1
             for cat in final_data.get("categories", [])
+            for topic_object in cat.get("topics", [])
+            if (
+                topic_object.get("title")
+                or topic_object.get("topic")
+                or ""
+            ).strip()
         )
 
         print(
             "📊 TOPICS AFTER CONSOLIDATION:",
             final_topics
         )
+
+        print("🧬 PRECOMPUTING IMMUTABLE TOPIC LEDGER")
+        topic_ledger = build_immutable_taxonomy_ledger(
+            final_data
+        )
+
+        if len(topic_ledger) != final_topics:
+            raise Exception(
+                "Immutable topic ledger count mismatch: "
+                f"expected {final_topics}, got {len(topic_ledger)}"
+            )
+
+        print(
+            "✅ IMMUTABLE TOPIC LEDGER READY:",
+            len(topic_ledger),
+            "topics"
+        )
+
+        try:
+            audit_taxonomy_reorganization(
+                final_data=final_data,
+                project_id=project_id
+            )
+        except Exception as audit_error:
+            print(
+                "❌ TAXONOMY AUDIT FAILED — "
+                "CONTINUING EXISTING PIPELINE UNCHANGED:",
+                repr(audit_error)
+            )
+
+        original_category_mapping = {
+            entry.original_category: entry.original_category
+            for entry in topic_ledger
+        }
+        category_mapping = original_category_mapping
+
+        try:
+            consolidation_result = (
+                consolidate_taxonomy_categories_v1(
+                    topic_ledger
+                )
+            )
+            category_mapping = consolidation_result["mapping"]
+            quality_diagnostics = consolidation_result[
+                "diagnostics"
+            ]
+
+            print(
+                "🧭 TAXONOMY QUALITY PASS VERSION:",
+                CATEGORY_CONSOLIDATION_VERSION
+            )
+            print(
+                "🧭 CATEGORIES BEFORE REVIEW:",
+                json.dumps(
+                    quality_diagnostics[
+                        "categories_before_review"
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            print(
+                "🧭 CATEGORIES AFTER REVIEW:",
+                json.dumps(
+                    quality_diagnostics[
+                        "categories_after_review"
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            print(
+                "🧭 CATEGORY COUNT BEFORE REVIEW:",
+                quality_diagnostics["category_count_before"]
+            )
+            print(
+                "🧭 CATEGORY COUNT AFTER REVIEW:",
+                quality_diagnostics["category_count_after"]
+            )
+            print(
+                "🧭 CATEGORY SIZE LIMIT:",
+                consolidation_result["category_size_limit"]
+            )
+            print(
+                "🧭 ACCEPTED CATEGORY MERGES:",
+                len(consolidation_result["accepted_merges"])
+            )
+
+            for merge in consolidation_result[
+                "accepted_merges"
+            ]:
+                print(
+                    "✅ CATEGORY MERGE:",
+                    " + ".join(merge["source_categories"]),
+                    "->",
+                    category_mapping[
+                        merge["source_categories"][0]
+                    ],
+                    "| score:",
+                    round(merge["merge_score"], 4),
+                    "| topics:",
+                    merge["topic_count"],
+                    "| cohesion:",
+                    round(merge["merged_cohesion"], 4),
+                    "| spread:",
+                    round(merge["maximum_spread"], 4),
+                    "| rationale:",
+                    merge["rationale"]
+                )
+
+            print(
+                "🧭 CATEGORIES MERGED OR RENAMED:",
+                json.dumps(
+                    quality_diagnostics[
+                        "categories_merged_or_renamed"
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            print(
+                "🧭 REJECTED CATEGORY MERGES:",
+                len(consolidation_result["rejected_merges"])
+            )
+            print(
+                "✅ PRE-PERSISTENCE TAXONOMY QUALITY PASS COMPLETE"
+            )
+
+        except Exception as consolidation_error:
+            category_mapping = original_category_mapping
+            print(
+                "❌ DETERMINISTIC CATEGORY CONSOLIDATION FAILED:",
+                repr(consolidation_error)
+            )
+            print(
+                "✅ ORIGINAL TAXONOMY RESTORED — "
+                "NO PARTIAL CATEGORY MERGES APPLIED"
+            )
+
         # 🔥 DELETE OLD TOPIC-CHUNK LINKS
 
         db.execute(
@@ -1154,85 +2990,49 @@ def process_topics_task(project_id: str):
         db.commit()
 
         print("🧹 OLD TOPICS + TOPIC_CHUNKS REMOVED")
-        for cat in final_data.get("categories", []):
+        for ledger_entry in topic_ledger:
+            category_name = category_mapping[
+                ledger_entry.original_category
+            ]
+            embedding_str = "[" + ",".join(
+                map(str, ledger_entry.embedding)
+            ) + "]"
 
-            category_name = (
-                cat.get("name") or "GENERAL"
-            ).strip().upper()
-
-            for t_obj in cat.get("topics", []):
-
-                topic_title = (
-                    t_obj.get("title") or ""
-                ).strip()
-
-                description = (
-                    t_obj.get("description") or ""
-                ).strip()
-
-                importance = t_obj.get("importance", 5)
-
-                if not topic_title:
-                    continue
-
-                is_display_topic = True
-
-                #if should_hide_topic(topic_title):
-                    #is_display_topic = False
-
-                #if importance <= 4:
-                    #is_display_topic = False
-
-                emb_input = (
-                    f"{category_name} - "
-                    f"{topic_title}: "
-                    f"{description}"
-                )
-
-                emb = client.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=emb_input
-                )
-
-                embedding = emb.data[0].embedding
-
-                embedding_str = "[" + ",".join(
-                    map(str, embedding)
-                ) + "]"
-
-                db.execute(
-                    text("""
-                        insert into topics
-                        (
-                            project_id,
-                            category,
-                            topic,
-                            description,
-                            embedding,
-                            is_display_topic,
-                            source_section
-                        )
-                        values
-                        (
-                            :project_id,
-                            :category,
-                            :topic,
-                            :description,
-                            CAST(:embedding AS vector),
-                            :is_display_topic,
-                            :source_section
-                        )
-                    """),
-                    {
-                        "project_id": project_id,
-                        "category": category_name,
-                        "topic": topic_title,
-                        "description": description,
-                        "embedding": embedding_str,
-                        "is_display_topic": is_display_topic,
-                        "source_section": category_name
-                    }
-                )
+            db.execute(
+                text("""
+                    insert into topics
+                    (
+                        project_id,
+                        category,
+                        topic,
+                        description,
+                        embedding,
+                        is_display_topic,
+                        source_section
+                    )
+                    values
+                    (
+                        :project_id,
+                        :category,
+                        :topic,
+                        :description,
+                        CAST(:embedding AS vector),
+                        :is_display_topic,
+                        :source_section
+                    )
+                """),
+                {
+                    "project_id": project_id,
+                    "category": category_name,
+                    "topic": ledger_entry.topic,
+                    "description": ledger_entry.description,
+                    "embedding": embedding_str,
+                    "is_display_topic": True,
+                    "source_section": (
+                        ledger_entry.original_category
+                    )
+                }
+            )
 
         db.commit()
         print(
@@ -1254,6 +3054,28 @@ def process_topics_task(project_id: str):
         )
         except Exception as e:
             print("❌ TOPIC-CHUNK ASSIGNMENT FAILED:", e)
+            raise
+
+        output_valid = db.execute(
+            text("""
+                SELECT
+                    EXISTS (
+                        SELECT 1
+                        FROM topics
+                        WHERE project_id = :project_id
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM topic_chunks tc
+                        JOIN topics t ON t.id = tc.topic_id
+                        WHERE t.project_id = :project_id
+                    )
+            """),
+            {"project_id": project_id}
+        ).scalar()
+
+        if not output_valid:
+            raise Exception("Topic processing completed without topics or topic-chunk assignments")
 
         
         # ======================
@@ -1302,52 +3124,73 @@ def assign_topics_to_chunks(project_id: str):
 
     db = SessionLocal()
 
+    def build_in_clause(prefix, values):
+        placeholders = []
+        params = {}
+
+        for index, value in enumerate(values):
+            key = f"{prefix}_{index}"
+            placeholders.append(f":{key}")
+            params[key] = value
+
+        return ", ".join(placeholders), params
+
+    def calculate_final_score(row):
+        return calculate_topic_chunk_score(
+            row[1],
+            row[2],
+            row[4],
+            row[5],
+            row[6],
+        )
+
+    def get_coverage_stats():
+        return db.execute(
+            text("""
+                select
+                    (
+                        select count(*)
+                        from topic_chunks tc
+                        join topics t on t.id = tc.topic_id
+                        where t.project_id = :project_id
+                    ) as total_links,
+                    (
+                        select count(distinct tc.topic_id)
+                        from topic_chunks tc
+                        join topics t on t.id = tc.topic_id
+                        where t.project_id = :project_id
+                    ) as covered_topics,
+                    (
+                        select count(distinct tc.chunk_id)
+                        from topic_chunks tc
+                        join topics t on t.id = tc.topic_id
+                        where t.project_id = :project_id
+                    ) as covered_chunks,
+                    (
+                        select coalesce(max(topic_count), 0)
+                        from (
+                            select tc.chunk_id, count(*) as topic_count
+                            from topic_chunks tc
+                            join topics t on t.id = tc.topic_id
+                            where t.project_id = :project_id
+                            group by tc.chunk_id
+                        ) chunk_counts
+                    ) as max_topics_per_chunk
+            """),
+            {"project_id": project_id}
+        ).fetchone()
+
     try:
 
         print("🔗 START TOPIC ASSIGNMENT")
         print("🧪 ENTER assign_topics_to_chunks")
 
-        # pulizia link precedenti
-        db.execute(
-            text("""
-                delete from topic_chunks
-                where topic_id in (
-                    select id
-                    from topics
-                    where project_id = :project_id
-                )
-            """),
-            {"project_id": project_id}
+        project_chunk_roles = ensure_project_chunk_roles(
+            db,
+            project_id,
         )
+        db.commit()
 
-        # 🔥 RECUPERA MATCH CANDIDATI
-
-        matches = db.execute(
-            text("""
-                select
-                    c.id as chunk_id,
-                    c.chunk_text,
-                    c.section,
-
-                    t.id as topic_id,
-                    t.topic,
-                    t.category,
-                    t.source_section,
-
-                    (
-                        c.embedding <#> t.embedding
-                    ) as similarity
-
-                from chunks c
-                join topics t
-                    on c.project_id = t.project_id
-
-                where
-                    c.project_id = :project_id
-            """),
-            {"project_id": project_id}
-        ).fetchall()
-        print("🔢 TOPIC ASSIGNMENT MATCHES:", len(matches))
         topics_count = db.execute(
             text("""
                 select count(*)
@@ -1362,101 +3205,173 @@ def assign_topics_to_chunks(project_id: str):
                 select count(*)
                 from chunks
                 where project_id = :project_id
+                and chunk_role = 'teaching'
             """),
             {"project_id": project_id}
         ).fetchone()[0]
 
-        print("📊 CHUNKS:", chunks_count)
-        print("📊 TOPICS:", topics_count)
-        print("📊 MATCHES:", len(matches))
-        print("🧪 MATCH QUERY COMPLETED")
-        print("🧪 TOTAL MATCHES:", len(matches))
+        total_chunks_count = len(project_chunk_roles)
+        print("ELIGIBLE TEACHING CHUNKS:", chunks_count)
+        print(
+            "EXCLUDED CHUNKS:",
+            total_chunks_count - chunks_count
+        )
 
-        if len(matches) > MAX_ASSIGNMENT_MATCHES:
-            print("⚠️ TOO MANY MATCHES - applying safety cap")
-            matches = matches[:MAX_ASSIGNMENT_MATCHES]
+        if topics_count <= 0 or chunks_count <= 0:
+            raise Exception(
+                f"Topic assignment requires topics and chunks "
+                f"(topics={topics_count}, chunks={chunks_count})"
+            )
 
-        links_created = 0
-        assignments = set()
+        if topics_count > MAX_ASSIGNMENT_MATCHES:
+            raise Exception(
+                "Topic count exceeds the complete-ranking candidate budget "
+                f"({topics_count} > {MAX_ASSIGNMENT_MATCHES})"
+            )
 
-        processed_matches = 0
+        total_candidate_pairs = chunks_count * topics_count
+        phase_a_batch_size = max(
+            1,
+            min(
+                chunks_count,
+                MAX_ASSIGNMENT_MATCHES // topics_count
+            )
+        )
+        phase_a_total_batches = (
+            chunks_count + phase_a_batch_size - 1
+        ) // phase_a_batch_size
 
-        for row in matches:
-            processed_matches += 1
+        print("📊 ASSIGNMENT CHUNKS:", chunks_count)
+        print("📊 ASSIGNMENT TOPICS:", topics_count)
+        print("🔢 TOTAL CANDIDATE PAIRS:", total_candidate_pairs)
+        print("📦 CANDIDATE BUDGET PER BATCH:", MAX_ASSIGNMENT_MATCHES)
+        print("📦 PHASE A CHUNK BATCH SIZE:", phase_a_batch_size)
+        print("📦 PHASE A EXPECTED BATCHES:", phase_a_total_batches)
 
-            if processed_matches % 5000 == 0:
-                print("🧪 PROCESSED MATCHES:", processed_matches)
-
-            chunk_id = row[0]
-            chunk_text = (row[1] or "").lower()
-            chunk_section = (row[2] or "").lower()
-
-            topic_id = row[3]
-            topic_name = (row[4] or "").lower()
-            topic_category = (row[5] or "").lower()
-            topic_section = (row[6] or "").lower()
-
-            similarity = row[7]
-            if processed_matches < 20:
-                print(
-                    "SIM:",
-                    similarity,
-                    "| TOPIC:",
-                    topic_name
+        # Phase A is atomic with deletion so a failure preserves old links.
+        db.execute(
+            text("""
+                delete from topic_chunks
+                where topic_id in (
+                    select id
+                    from topics
+                    where project_id = :project_id
                 )
-            same_section = (
-                chunk_section == topic_section
-            )
+            """),
+            {"project_id": project_id}
+        )
 
-            # 🔥 KEYWORD OVERLAP
+        phase_a_links = 0
+        phase_a_pairs_processed = 0
+        last_chunk_id = 0
 
-            topic_words = [
-                w for w in topic_name.split()
-                if len(w) > 4
-            ]
+        for batch_number in range(1, phase_a_total_batches + 1):
+            chunk_rows = db.execute(
+                text("""
+                    select id
+                    from chunks
+                    where project_id = :project_id
+                    and chunk_role = 'teaching'
+                    and id > :last_chunk_id
+                    order by id
+                    limit :batch_size
+                """),
+                {
+                    "project_id": project_id,
+                    "last_chunk_id": last_chunk_id,
+                    "batch_size": phase_a_batch_size,
+                }
+            ).fetchall()
 
-            keyword_overlap = sum(
-                1 for w in topic_words
-                if w in chunk_text
-            )
-
-            # 🔥 SECTION BONUS
-
-            
-
-            section_bonus = 0
-
-            if same_section:
-                section_bonus += 0.20
-
-            # 🔥 FINAL SCORE
-
-            final_score = (
-                similarity
-                + section_bonus
-                + (keyword_overlap * 0.05)
-            )
-            if processed_matches % 2000 == 0:
-                print(
-                    "📊 SCORE SAMPLE:",
-                    round(final_score, 3),
-                    "| similarity:",
-                    round(similarity, 3),
-                    "| overlap:",
-                    keyword_overlap,
-                    "| same_section:",
-                    same_section
+            chunk_ids = [row[0] for row in chunk_rows]
+            if not chunk_ids:
+                raise Exception(
+                    f"Phase A batch {batch_number} returned no chunks"
                 )
 
-            if final_score > -0.27:
+            chunk_clause, chunk_params = build_in_clause(
+                "phase_a_chunk",
+                chunk_ids
+            )
+            candidate_params = {
+                "project_id": project_id,
+                **chunk_params,
+            }
+            matches = db.execute(
+                text(f"""
+                    select
+                        c.id as chunk_id,
+                        c.chunk_text,
+                        c.section,
+                        t.id as topic_id,
+                        t.topic,
+                        t.source_section,
+                        c.embedding <#> t.embedding as negative_inner_product
+                    from chunks c
+                    join topics t on t.project_id = c.project_id
+                    where c.project_id = :project_id
+                    and c.id in ({chunk_clause})
+                    order by c.id, t.id
+                """),
+                candidate_params
+            ).fetchall()
 
-                key = (topic_id, chunk_id)
+            expected_pairs = len(chunk_ids) * topics_count
+            actual_pairs = len(matches)
 
-                if key in assignments:
+            print(
+                f"📦 PHASE A BATCH: {batch_number}/{phase_a_total_batches}"
+            )
+            print("📦 PHASE A BATCH CHUNKS:", len(chunk_ids))
+            print("🔢 PHASE A EXPECTED PAIRS:", expected_pairs)
+            print("🔢 PHASE A ACTUAL PAIRS:", actual_pairs)
+
+            if actual_pairs != expected_pairs:
+                raise Exception(
+                    "Incomplete Phase A ranking: "
+                    f"expected {expected_pairs} pairs, got {actual_pairs}"
+                )
+
+            candidates_by_chunk = {
+                chunk_id: []
+                for chunk_id in chunk_ids
+            }
+
+            for row in matches:
+                final_score = calculate_final_score(row)
+                if final_score is None:
                     continue
 
-                assignments.add(key)
+                candidates_by_chunk[row[0]].append(
+                    {
+                        "topic_id": row[3],
+                        "chunk_id": row[0],
+                        "score": final_score,
+                    }
+                )
 
+            batch_assignments = []
+            for chunk_id in chunk_ids:
+                eligible = [
+                    candidate
+                    for candidate in candidates_by_chunk[chunk_id]
+                    if candidate["score"] >= PRIMARY_ASSIGNMENT_THRESHOLD
+                ]
+                eligible.sort(
+                    key=lambda candidate: (
+                        -candidate["score"],
+                        str(candidate["topic_id"]),
+                    )
+                )
+                batch_assignments.extend(
+                    {
+                        "topic_id": candidate["topic_id"],
+                        "chunk_id": candidate["chunk_id"],
+                    }
+                    for candidate in eligible[:MAX_TOPICS_PER_CHUNK]
+                )
+
+            if batch_assignments:
                 db.execute(
                     text("""
                         insert into topic_chunks
@@ -1464,59 +3379,343 @@ def assign_topics_to_chunks(project_id: str):
                         values
                         (:topic_id, :chunk_id)
                     """),
-                    {
-                        "topic_id": topic_id,
-                        "chunk_id": chunk_id
-                    }
+                    batch_assignments
                 )
 
-                links_created += 1
+            batch_links = len(batch_assignments)
+            phase_a_links += batch_links
+            phase_a_pairs_processed += actual_pairs
+            last_chunk_id = chunk_ids[-1]
+
+            print("🔗 PHASE A BATCH LINKS:", batch_links)
+
+        if phase_a_pairs_processed != total_candidate_pairs:
+            raise Exception(
+                "Incomplete Phase A candidate processing: "
+                f"expected {total_candidate_pairs}, "
+                f"processed {phase_a_pairs_processed}"
+            )
+
+        phase_a_max = db.execute(
+            text("""
+                select coalesce(max(topic_count), 0)
+                from (
+                    select tc.chunk_id, count(*) as topic_count
+                    from topic_chunks tc
+                    join topics t on t.id = tc.topic_id
+                    where t.project_id = :project_id
+                    group by tc.chunk_id
+                ) chunk_counts
+            """),
+            {"project_id": project_id}
+        ).scalar()
+
+        if phase_a_max > MAX_TOPICS_PER_CHUNK:
+            raise Exception(
+                "Phase A validation failed: "
+                f"max topics per chunk is {phase_a_max}"
+            )
+
+        phase_a_stats = get_coverage_stats()
+        phase_a_total_links = phase_a_stats[0]
+        phase_a_covered_topics = phase_a_stats[1]
+        phase_a_covered_chunks = phase_a_stats[2]
+
+        if phase_a_total_links != phase_a_links:
+            raise Exception(
+                "Phase A link-count validation failed: "
+                f"expected {phase_a_links}, found {phase_a_total_links}"
+            )
 
         db.commit()
-        print("🧪 FINAL ASSIGNMENT COMMIT DONE")
+        print("✅ PHASE A COMMIT COMPLETE")
+        print("🔗 PHASE A LINKS CREATED:", phase_a_links)
+        print(
+            "📊 PHASE A TOPIC COVERAGE:",
+            f"{phase_a_covered_topics}/{topics_count}"
+        )
+        print(
+            "📊 PHASE A CHUNK COVERAGE:",
+            f"{phase_a_covered_chunks}/{chunks_count}"
+        )
 
-        count = db.execute(
-            text("""
-                select count(*)
-                from topic_chunks tc
-                join topics t
-                    on tc.topic_id = t.id
-                where t.project_id = :project_id
-            """),
-            {"project_id": project_id}
-        ).fetchone()[0]
+        rescue_links = 0
+        lowest_rescue_score = None
 
-        print(f"✅ SAVED {links_created} TOPIC-CHUNK LINKS")
-        stats = db.execute(
-            text("""
-                select
-                    t.topic,
-                    count(*)
-                from topic_chunks tc
-                join topics t
-                    on tc.topic_id = t.id
-                where t.project_id = :project_id
-                group by t.topic
-                order by count(*) desc
-            """),
-            {"project_id": project_id}
-        ).fetchall()
+        try:
+            orphan_rows = db.execute(
+                text("""
+                    select t.id, t.topic
+                    from topics t
+                    where t.project_id = :project_id
+                    and not exists (
+                        select 1
+                        from topic_chunks tc
+                        where tc.topic_id = t.id
+                    )
+                    order by t.id
+                """),
+                {"project_id": project_id}
+            ).fetchall()
 
-        print()
-        print("📊 TOPIC DISTRIBUTION")
-        for row in stats:
-            print(row[0], "->", row[1])
-        print()
+            orphan_count = len(orphan_rows)
+            print("🛟 ORPHAN TOPICS DETECTED:", orphan_count)
+
+            if orphan_count:
+                if chunks_count > MAX_ASSIGNMENT_MATCHES:
+                    raise Exception(
+                        "Chunk count exceeds the complete-rescue candidate "
+                        f"budget ({chunks_count} > {MAX_ASSIGNMENT_MATCHES})"
+                    )
+
+                phase_b_batch_size = max(
+                    1,
+                    min(
+                        orphan_count,
+                        MAX_ASSIGNMENT_MATCHES // chunks_count
+                    )
+                )
+                phase_b_total_batches = (
+                    orphan_count + phase_b_batch_size - 1
+                ) // phase_b_batch_size
+
+                print(
+                    "📦 PHASE B TOPIC BATCH SIZE:",
+                    phase_b_batch_size
+                )
+                print(
+                    "📦 PHASE B EXPECTED BATCHES:",
+                    phase_b_total_batches
+                )
+
+                phase_b_pairs_processed = 0
+
+                for batch_index in range(phase_b_total_batches):
+                    start = batch_index * phase_b_batch_size
+                    end = start + phase_b_batch_size
+                    orphan_batch = orphan_rows[start:end]
+                    orphan_ids = [row[0] for row in orphan_batch]
+
+                    topic_clause, topic_params = build_in_clause(
+                        "phase_b_topic",
+                        orphan_ids
+                    )
+                    matches = db.execute(
+                        text(f"""
+                            select
+                                c.id as chunk_id,
+                                c.chunk_text,
+                                c.section,
+                                t.id as topic_id,
+                                t.topic,
+                                t.source_section,
+                                c.embedding <#> t.embedding
+                                    as negative_inner_product
+                            from topics t
+                            join chunks c on c.project_id = t.project_id
+                            where t.project_id = :project_id
+                            and t.id in ({topic_clause})
+                            and c.chunk_role = 'teaching'
+                            order by t.id, c.id
+                        """),
+                        {
+                            "project_id": project_id,
+                            **topic_params,
+                        }
+                    ).fetchall()
+
+                    expected_pairs = len(orphan_ids) * chunks_count
+                    actual_pairs = len(matches)
+                    batch_number = batch_index + 1
+
+                    print(
+                        f"📦 PHASE B BATCH: "
+                        f"{batch_number}/{phase_b_total_batches}"
+                    )
+                    print(
+                        "📦 PHASE B BATCH TOPICS:",
+                        len(orphan_ids)
+                    )
+                    print(
+                        "🔢 PHASE B EXPECTED PAIRS:",
+                        expected_pairs
+                    )
+                    print(
+                        "🔢 PHASE B ACTUAL PAIRS:",
+                        actual_pairs
+                    )
+
+                    if actual_pairs != expected_pairs:
+                        raise Exception(
+                            "Incomplete Phase B ranking: "
+                            f"expected {expected_pairs} pairs, "
+                            f"got {actual_pairs}"
+                        )
+
+                    best_by_topic = {}
+                    for row in matches:
+                        final_score = calculate_final_score(row)
+                        if final_score is None:
+                            continue
+
+                        topic_id = row[3]
+                        current_best = best_by_topic.get(topic_id)
+                        candidate_key = (
+                            final_score,
+                            -int(row[0]),
+                        )
+
+                        if (
+                            current_best is None
+                            or candidate_key > current_best["key"]
+                        ):
+                            best_by_topic[topic_id] = {
+                                "key": candidate_key,
+                                "topic_id": topic_id,
+                                "chunk_id": row[0],
+                                "score": final_score,
+                            }
+
+                    rescue_assignments = []
+                    batch_rescue_scores = []
+                    for topic_id in orphan_ids:
+                        best = best_by_topic.get(topic_id)
+                        if (
+                            best
+                            and best["score"] >= TOPIC_RESCUE_THRESHOLD
+                        ):
+                            rescue_assignments.append(
+                                {
+                                    "topic_id": best["topic_id"],
+                                    "chunk_id": best["chunk_id"],
+                                }
+                            )
+                            batch_rescue_scores.append(best["score"])
+
+                    if rescue_assignments:
+                        db.execute(
+                            text("""
+                                insert into topic_chunks
+                                (topic_id, chunk_id)
+                                values
+                                (:topic_id, :chunk_id)
+                            """),
+                            rescue_assignments
+                        )
+
+                    rescue_links += len(rescue_assignments)
+                    phase_b_pairs_processed += actual_pairs
+
+                    if batch_rescue_scores:
+                        batch_lowest = min(batch_rescue_scores)
+                        lowest_rescue_score = (
+                            batch_lowest
+                            if lowest_rescue_score is None
+                            else min(lowest_rescue_score, batch_lowest)
+                        )
+
+                    print(
+                        "🛟 PHASE B BATCH RESCUES:",
+                        len(rescue_assignments)
+                    )
+
+                expected_phase_b_pairs = orphan_count * chunks_count
+                if phase_b_pairs_processed != expected_phase_b_pairs:
+                    raise Exception(
+                        "Incomplete Phase B candidate processing: "
+                        f"expected {expected_phase_b_pairs}, "
+                        f"processed {phase_b_pairs_processed}"
+                    )
+
+                rescued_topic_count = db.execute(
+                    text("""
+                        select count(*)
+                        from topics t
+                        where t.project_id = :project_id
+                        and exists (
+                            select 1
+                            from topic_chunks tc
+                            where tc.topic_id = t.id
+                        )
+                    """),
+                    {"project_id": project_id}
+                ).scalar() - phase_a_covered_topics
+
+                if rescued_topic_count != rescue_links:
+                    raise Exception(
+                        "Phase B rescue-count validation failed: "
+                        f"expected {rescue_links}, "
+                        f"found {rescued_topic_count}"
+                    )
+
+                db.commit()
+                print("✅ PHASE B RESCUE COMMIT COMPLETE")
+
+            else:
+                db.rollback()
+
+        except Exception as rescue_error:
+            db.rollback()
+            rescue_links = 0
+            lowest_rescue_score = None
+            print("❌ TOPIC RESCUE FAILED:", rescue_error)
+            print("✅ PHASE A RESULTS PRESERVED")
+
+        final_stats = get_coverage_stats()
+        final_links = final_stats[0]
+        final_covered_topics = final_stats[1]
+        final_covered_chunks = final_stats[2]
+        final_max_topics_per_chunk = final_stats[3]
+        final_orphans = topics_count - final_covered_topics
+        topic_coverage = (
+            (final_covered_topics / topics_count) * 100
+        )
+        chunk_coverage = (
+            (final_covered_chunks / chunks_count) * 100
+        )
+
+        print("🛟 RESCUE LINKS CREATED:", rescue_links)
+        print(
+            "🛟 ORPHANS BELOW RESCUE THRESHOLD:",
+            final_orphans
+        )
+        print(
+            "🛟 LOWEST RESCUE SCORE USED:",
+            (
+                round(lowest_rescue_score, 4)
+                if lowest_rescue_score is not None
+                else "none"
+            )
+        )
+        print("🔗 FINAL TOPIC-CHUNK LINKS:", final_links)
+        print(
+            "📊 FINAL TOPIC COVERAGE:",
+            f"{final_covered_topics}/{topics_count} "
+            f"({topic_coverage:.1f}%)"
+        )
+        print(
+            "📊 FINAL CHUNK COVERAGE:",
+            f"{final_covered_chunks}/{chunks_count} "
+            f"({chunk_coverage:.1f}%)"
+        )
+        print("🛟 FINAL ORPHAN TOPICS:", final_orphans)
+        print(
+            "📊 FINAL MAX TOPICS PER CHUNK:",
+            final_max_topics_per_chunk
+        )
 
     except Exception as e:
 
         db.rollback()
         print("❌ TOPIC ASSIGNMENT ERROR:", e)
+        raise
 
     finally:
         db.close()
 
 def detect_section_title(text: str, current_section="GENERAL"):
+
+
 
     if not text:
         return current_section
@@ -1526,6 +3725,12 @@ def detect_section_title(text: str, current_section="GENERAL"):
         for l in text.split("\n")
         if l.strip()
     ]
+
+    print()
+    print("📑 FIRST LINES")
+    for x in lines[:5]:
+        print(">", x)
+    print()
 
     strong_candidates = []
 
@@ -1583,12 +3788,9 @@ def detect_section_title(text: str, current_section="GENERAL"):
 
     if strong_candidates:
 
-        best = max(
-            strong_candidates,
-            key=len
-        )
+        print("📚 CANDIDATES:", strong_candidates)
 
-        return best.upper()
+        return strong_candidates[0].upper()
 
     return current_section
 
@@ -1640,6 +3842,7 @@ async def ingest_stream(
             # ======================
             # SAVE CHUNKS
             # ======================
+            project_chunk_roles = []
             for doc in docs:
                 yield f"Processing document: {doc.title}\n"
 
@@ -1667,7 +3870,7 @@ async def ingest_stream(
                 )
                 for page_index, page in enumerate(reader.pages):
                     
-
+                    print(f"📄 PROCESSING PAGE {page_index+1}/{len(reader.pages)}")
                     yield f"Page {page_index+1}\n"
                     db.execute(
                         text("""
@@ -1683,16 +3886,17 @@ async def ingest_stream(
 
                     db.commit()
 
-                    page_text = page.extract_text()
+                    raw_page_text = page.extract_text()
 
-                    page_text = clean_text(page_text)
                     current_section = detect_section_title(
-                        page_text,
+                        raw_page_text,
                         current_section
                     )
 
                     section_title = current_section
                     print(f"📚 DETECTED SECTION: {section_title}")
+
+                    page_text = clean_text(raw_page_text)
 
                     if not page_text or not page_text.strip():
                         yield f"OCR page {page_index+1}\n"
@@ -1705,11 +3909,21 @@ async def ingest_stream(
                     chunks = [clean_text(c) for c in chunks]
                     chunks = [c for c in chunks if len(c) > 100]
 
+                    print(
+                        f"📦 PAGE {page_index+1} -> {len(chunks)} CHUNKS"
+                    )
+
                     yield f"{len(chunks)} chunks created\n"
 
                     for i, chunk in enumerate(chunks):
                         yield f"Embedding chunk {i+1}/{len(chunks)}\n"
                         await asyncio.sleep(0)
+                        chunk_role = classify_chunk_role(
+                            chunk,
+                            page_number=page_index + 1,
+                            doc_title=doc.title,
+                        )
+                        project_chunk_roles.append(chunk_role)
 
                         emb = await asyncio.to_thread(
                             client.embeddings.create,
@@ -1729,9 +3943,27 @@ async def ingest_stream(
                         db.execute(
                             text("""
                                 insert into chunks
-                                (project_id, doc_title, chunk_text, embedding, page, topic, section)
+                                (
+                                    project_id,
+                                    doc_title,
+                                    chunk_text,
+                                    embedding,
+                                    page,
+                                    topic,
+                                    section,
+                                    chunk_role
+                                )
                                 values
-                                (:project_id, :doc_title, :chunk_text, CAST(:embedding AS vector), :page, :topic, :section)
+                                (
+                                    :project_id,
+                                    :doc_title,
+                                    :chunk_text,
+                                    CAST(:embedding AS vector),
+                                    :page,
+                                    :topic,
+                                    :section,
+                                    :chunk_role
+                                )
                             """),
                             {
                                 "project_id": project_id,
@@ -1740,20 +3972,26 @@ async def ingest_stream(
                                 "embedding": embedding_str,
                                 "page": page_index + 1,      
                                 "topic": None,
-                                "section": section_title
+                                "section": section_title,
+                                "chunk_role": chunk_role,
                             }
                         )
                         db.commit()
                         print(f"CHUNK {i} SALVATO CON TOPIC: {doc.title}")
 
             
+            log_chunk_role_counts(project_chunk_roles)
+
+            background_tasks.add_task(process_topics_task, project_id)
+            print("✅ BACKGROUND TOPICS TASK SCHEDULED:", project_id)
 
             yield "Upload complete ✅\n"
 
-            background_tasks.add_task(process_topics_task, project_id)
-
         except Exception as e:
+            print("UPLOAD EXCEPTION:", repr(e))
             db.rollback()
+            db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
+            db.commit()
             yield f"Upload failed: {str(e)}\n"
         finally:
             db.close()
@@ -1824,7 +4062,6 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
             scope_type = "single_topic" if len(topic_ids) == 1 else "multi_topic"
 
             rows = db.execute(
-            
                 text("""
                     SELECT
                         c.id,
@@ -1832,7 +4069,12 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                         c.doc_title,
                         c.page,
                         t.topic,
-                        t.id as topic_id
+                        t.id as topic_id,
+                        c.chunk_role,
+                        c.section,
+                        t.source_section,
+                        c.embedding <#> t.embedding
+                            as negative_inner_product
                     FROM topic_chunks tc
                     JOIN chunks c
                         ON c.id = tc.chunk_id
@@ -1842,22 +4084,12 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                     AND tc.topic_id IN :topic_ids
                     AND c.chunk_text IS NOT NULL
                     AND length(c.chunk_text) > 100
-                    LIMIT :limit
                 """),
                 {
                     "project_id": project_id,
                     "topic_ids": tuple(topic_ids),
-                    "limit": limit
                 }
             ).fetchall()
-            print("🎯 TOPIC FILTER ACTIVE")
-
-            for r in rows[:20]:
-                print()
-                print("TOPIC:", r[4])
-                print("PAGE:", r[3])
-                print((r[1] or "")[:250])
-                print("-" * 80)
 
         else:
             print("🚨 ENTERING GLOBAL BRANCH")
@@ -1871,7 +4103,12 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                         c.doc_title,
                         c.page,
                         COALESCE(t.topic, 'General') as topic,
-                        t.id as topic_id
+                        t.id as topic_id,
+                        c.chunk_role,
+                        c.section,
+                        t.source_section,
+                        c.embedding <#> t.embedding
+                            as negative_inner_product
                     FROM chunks c
                     LEFT JOIN topic_chunks tc
                         ON tc.chunk_id = c.id
@@ -1880,26 +4117,117 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                     WHERE c.project_id = :project_id
                     AND c.chunk_text IS NOT NULL
                     AND length(c.chunk_text) > 100
-                    ORDER BY RANDOM()
-                    LIMIT :limit
                 """),
                 {
                     "project_id": project_id,
-                    "limit": limit
                 }
             ).fetchall()
 
-        chunks = []
-
+        eligible_candidates = []
+        excluded_chunk_ids = set()
         for r in rows:
-            chunks.append({
+            chunk_role = normalize_chunk_role(
+                r[6],
+                r[1],
+                page_number=r[3],
+                doc_title=r[2],
+            )
+
+            if not is_assignment_eligible_chunk_role(chunk_role):
+                excluded_chunk_ids.add(r[0])
+                continue
+
+            score = calculate_topic_chunk_score(
+                r[1],
+                r[7],
+                r[4],
+                r[8],
+                r[9],
+            )
+            eligible_candidates.append({
                 "chunk_id": str(r[0]),
                 "chunk_text": r[1],
                 "doc_title": r[2],
                 "page": r[3],
                 "topic": r[4],
-                "topic_id": str(r[5]) if r[5] else None
+                "topic_id": str(r[5]) if r[5] else None,
+                "chunk_role": chunk_role,
+                "_assignment_score": score,
             })
+
+        print(
+            "RETRIEVAL CANDIDATES BEFORE DEDUP:",
+            len(eligible_candidates)
+        )
+        print(
+            "ELIGIBLE TEACHING CHUNKS:",
+            len({
+                candidate["chunk_id"]
+                for candidate in eligible_candidates
+            })
+        )
+        print(
+            "RETRIEVAL EXCLUDED NON-TEACHING CHUNKS:",
+            len(excluded_chunk_ids)
+        )
+        print("EXCLUDED CHUNKS:", len(excluded_chunk_ids))
+
+        best_by_chunk = {}
+        for candidate in eligible_candidates:
+            chunk_id = candidate["chunk_id"]
+            current = best_by_chunk.get(chunk_id)
+            candidate_key = (
+                candidate["_assignment_score"]
+                if candidate["_assignment_score"] is not None
+                else float("-inf"),
+                candidate["topic_id"] or "",
+            )
+            current_key = (
+                current["_assignment_score"]
+                if (
+                    current
+                    and current["_assignment_score"] is not None
+                )
+                else float("-inf"),
+                current["topic_id"] or "" if current else "",
+            )
+
+            if current is None or candidate_key > current_key:
+                best_by_chunk[chunk_id] = candidate
+
+        chunks = list(best_by_chunk.values())
+        print(
+            "RETRIEVAL CANDIDATES AFTER DEDUP:",
+            len(chunks)
+        )
+
+        if topic_ids:
+            chunks.sort(
+                key=lambda candidate: (
+                    -(
+                        candidate["_assignment_score"]
+                        if candidate["_assignment_score"] is not None
+                        else float("-inf")
+                    ),
+                    candidate["chunk_id"],
+                )
+            )
+        else:
+            random.shuffle(chunks)
+
+        chunks = chunks[:limit]
+        for candidate in chunks:
+            candidate.pop("_assignment_score", None)
+
+        if topic_ids:
+            print("🎯 TOPIC FILTER ACTIVE")
+
+            for candidate in chunks[:20]:
+                print()
+                print("TOPIC:", candidate["topic"])
+                print("PAGE:", candidate["page"])
+                print((candidate["chunk_text"] or "")[:250])
+                print("-" * 80)
 
         topic_map = {
             c["chunk_id"]: c["topic"]
@@ -1939,6 +4267,580 @@ LOW_QUALITY_PATTERNS = [
                 "which process is",
                 "which pathway is",
             ]
+
+HARD_QUIZ_SPEC = {
+    "minimum_supported_propositions": 2,
+    "minimum_stem_words": 14,
+    "minimum_explanation_words": 16,
+    "reasoning_modes": (
+        "comparison between closely related concepts",
+        "distinction between mechanisms with shared features",
+        "identification of a subtle source-supported exception",
+        "synthesis of facts from multiple supplied statements",
+        (
+            "analysis of an implication explicitly established by the "
+            "supplied evidence"
+        ),
+    ),
+    "forbidden_question_forms": (
+        "simple definitions",
+        "identification of one named fact",
+        "direct mechanism lookup",
+        "keyword matching",
+        '"Which statement is true/false?"',
+        '"Which mutation/mechanism/process causes X?"',
+        "questions answerable from one isolated sentence",
+    ),
+    "forbidden_added_content": (
+        "invented cases",
+        "invented actors",
+        "invented events",
+        "invented processes",
+        "invented consequences",
+        "unstated premises",
+    ),
+    "direct_recall_openings": (
+        "what is ",
+        "what does ",
+        "which statement is true",
+        "which statement is false",
+        "which of the following is true",
+        "which of the following is false",
+        "which mutation ",
+        "which mechanism causes",
+        "which mechanism is",
+        "which process ",
+        "which enzyme ",
+        "which molecule ",
+        "che cos'è ",
+        "che cosa è ",
+        "quale affermazione è vera",
+        "quale affermazione è falsa",
+        "quale affermazione è corretta",
+        "quale affermazione non è corretta",
+        "quale mutazione ",
+        "quale meccanismo causa",
+        "quale meccanismo è",
+        "quale processo ",
+        "quale enzima ",
+        "quale molecola ",
+    ),
+    "relational_markers": (
+        "although",
+        "both ",
+        "by combining",
+        "compare",
+        "compared to",
+        "compared with",
+        "comparison",
+        "considering",
+        "contrast",
+        "contrasted",
+        "contrasting",
+        "distinct",
+        "distinction",
+        "difference",
+        "different",
+        "differ ",
+        "differ from",
+        "differentiate",
+        "distinguish",
+        "except",
+        "exception",
+        "given that",
+        "however",
+        "if both",
+        "in contrast",
+        "integrate",
+        "integrating",
+        "integration",
+        "relate",
+        "relation between",
+        "relationship",
+        "relationship between",
+        "synthesize",
+        "synthesizes",
+        "synthesized",
+        "synthesizing",
+        "synthesis",
+        "unless",
+        "unlike",
+        "whereas",
+        "while",
+        "a differenza",
+        "combinando",
+        "comparando",
+        "confrontando",
+        "considerando",
+        "contrasto",
+        "distinto",
+        "distinzione",
+        "differire",
+        "differisce",
+        "differiscono",
+        "differenza",
+        "distinguere",
+        "eccezione",
+        "eccetto",
+        "entrambi",
+        "integrare",
+        "integrando",
+        "integrazione",
+        "mentre",
+        "mettendo in relazione",
+        "rapporto tra",
+        "relazionare",
+        "relazione tra",
+        "rispetto a",
+        "se entrambi",
+        "sintetizzare",
+        "sintetizza",
+        "sintetizzando",
+        "sintesi",
+        "salvo che",
+        "a meno che",
+        "tuttavia",
+    ),
+    "explanation_connectors": (
+        "because",
+        "since",
+        "therefore",
+        "thus",
+        "consequently",
+        "hence",
+        "thereby",
+        "whereas",
+        "while",
+        "which means",
+        "which explains",
+        "as a result",
+        "in contrast",
+        "unlike",
+        "poiché",
+        "perché",
+        "dato che",
+        "dal momento che",
+        "quindi",
+        "pertanto",
+        "dunque",
+        "di conseguenza",
+        "ne consegue",
+        "in tal modo",
+        "mentre",
+        "ciò significa",
+        "ciò spiega",
+        "a differenza",
+        "invece",
+    ),
+}
+
+
+def render_hard_quiz_specification(spec=HARD_QUIZ_SPEC):
+    reasoning_modes = "\n".join(
+        f"- {mode}"
+        for mode in spec["reasoning_modes"]
+    )
+    forbidden_question_forms = "\n".join(
+        f"- {question_form}"
+        for question_form in spec["forbidden_question_forms"]
+    )
+    forbidden_added_content = ", ".join(
+        spec["forbidden_added_content"]
+    )
+
+    return f"""
+HARD COGNITIVE-DIFFICULTY SPECIFICATION:
+
+- Every question must require at least
+  {spec["minimum_supported_propositions"]} explicitly supported propositions.
+- The stem must contain at least {spec["minimum_stem_words"]} words.
+- The explanation must contain at least
+  {spec["minimum_explanation_words"]} words.
+- The stem must explicitly express comparison, distinction, exception
+  handling, synthesis, or another listed relational reasoning mode.
+- Comparison and distinction are intermediate reasoning operations, not
+  sufficient HARD outcomes by themselves. The student must use them to
+  determine an explicitly supported implication, consequence, outcome,
+  exception, applicable rule, or conclusion. If the question can be answered
+  by independently recalling fact A and fact B, it is not HARD.
+- The explanation must explicitly connect the supporting propositions and
+  show the reasoning needed to reach the answer.
+- Direct-recall openings are invalid unless the stem itself clearly expresses
+  one of the allowed relational reasoning modes.
+- Use explicit relational wording in the stem and an explicit logical
+  connector in the explanation so compliance is unambiguous.
+
+ALLOWED REASONING MODES:
+{reasoning_modes}
+
+HARD EXAMPLE:
+- Given the supported differences between A and B, which implication follows
+  when both are considered together?
+
+FORBIDDEN QUESTION FORMS:
+{forbidden_question_forms}
+
+FORBIDDEN ADDED CONTENT:
+{forbidden_added_content}.
+
+Difficulty must come from reasoning over retrieved evidence. It must not come
+from invented context or external knowledge.
+"""
+
+
+def render_hard_context_specification(spec=HARD_QUIZ_SPEC):
+    reasoning_modes = ", ".join(spec["reasoning_modes"])
+
+    return f"""
+HARD CONTEXT REQUIREMENT:
+
+Each context must place at least
+{spec["minimum_supported_propositions"]} explicitly supported source
+propositions into one of these reasoning relationships:
+{reasoning_modes}.
+
+Do not return a single definition, isolated mechanism, or standalone fact.
+The context may remain conceptual and must not add invented content.
+"""
+
+
+def render_hard_exam_formats(spec=HARD_QUIZ_SPEC):
+    minimum_propositions = spec["minimum_supported_propositions"]
+
+    return f"""
+- Considering {minimum_propositions} supported principles, which conclusion
+  follows only when they are applied together?
+- Which distinction between the supported mechanisms explains their different
+  outcomes?
+- Which source-supported exception changes the otherwise applicable rule?
+- Which interpretation synthesizes the supplied propositions?
+"""
+
+
+def evaluate_hard_question_reasoning(
+    question,
+    spec=HARD_QUIZ_SPEC,
+):
+    question_text = normalize_string(
+        question.get("question", "")
+    ).lower()
+    explanation_candidates = [
+        normalize_string(question.get(field_name) or "").lower()
+        for field_name in ("explanation", "explanation_long")
+    ]
+    stem_relational_reasoning = any(
+        marker in question_text
+        for marker in spec["relational_markers"]
+    )
+    direct_recall_opening = any(
+        question_text.startswith(pattern)
+        for pattern in spec["direct_recall_openings"]
+    )
+    explanation_evaluations = [
+        {
+            "text": explanation,
+            "word_count": len(explanation.split()),
+            "connector_present": any(
+                connector in explanation
+                for connector in spec["explanation_connectors"]
+            ),
+        }
+        for explanation in explanation_candidates
+        if explanation
+    ]
+    compliant_explanations = [
+        evaluation
+        for evaluation in explanation_evaluations
+        if (
+            evaluation["word_count"]
+            >= spec["minimum_explanation_words"]
+        )
+    ]
+    best_explanation = max(
+        explanation_evaluations,
+        key=lambda evaluation: (
+            evaluation["word_count"],
+            evaluation["connector_present"],
+        ),
+        default={
+            "text": "",
+            "word_count": 0,
+            "connector_present": False,
+        },
+    )
+    rejection_reasons = []
+
+    if direct_recall_opening and not stem_relational_reasoning:
+        rejection_reasons.append("direct_recall_opening")
+
+    if (
+        len(question_text.split())
+        < spec["minimum_stem_words"]
+    ):
+        rejection_reasons.append("stem_too_short_for_hard_reasoning")
+
+    if not compliant_explanations:
+        rejection_reasons.append(
+            "explanation_does_not_show_two_step_reasoning"
+        )
+
+    return {
+        "valid": not rejection_reasons,
+        "reasons": rejection_reasons,
+        "relational_reasoning": stem_relational_reasoning,
+        "explanation_word_count": best_explanation["word_count"],
+        "explanation_connector_present": any(
+            evaluation["connector_present"]
+            for evaluation in explanation_evaluations
+        ),
+        "source_chunk_count": len(
+            set(question.get("source_chunk_ids") or [])
+        ),
+    }
+
+
+def build_hard_generation_metrics(
+    requested_questions,
+    generated_questions,
+    rejected_questions,
+    rejection_reasons,
+):
+    rejected_questions = min(
+        max(rejected_questions, 0),
+        generated_questions,
+    )
+    accepted_questions = max(
+        generated_questions - rejected_questions,
+        0,
+    )
+    rejection_reasons_breakdown = {}
+
+    for reason in rejection_reasons:
+        rejection_reasons_breakdown[reason] = (
+            rejection_reasons_breakdown.get(reason, 0) + 1
+        )
+
+    acceptance_rate = (
+        round(
+            accepted_questions / generated_questions,
+            4,
+        )
+        if generated_questions
+        else 0.0
+    )
+
+    return {
+        "requested_questions": requested_questions,
+        "generated_questions": generated_questions,
+        "accepted_questions": accepted_questions,
+        "rejected_questions": rejected_questions,
+        "acceptance_rate": acceptance_rate,
+        "rejection_reasons_breakdown": dict(
+            sorted(rejection_reasons_breakdown.items())
+        ),
+    }
+
+
+def resolve_quiz_question_topic(
+    question,
+    chunk_topic_map,
+    canonical_project_topics,
+):
+    source_chunk_ids = question.get("source_chunk_ids") or []
+    if not isinstance(source_chunk_ids, list):
+        source_chunk_ids = [source_chunk_ids]
+
+    resolved_topics = []
+    seen_chunk_ids = set()
+    normalized_source_chunk_ids = []
+
+    for source_chunk_id in source_chunk_ids:
+        normalized_chunk_id = str(source_chunk_id).strip()
+        if (
+            not normalized_chunk_id
+            or normalized_chunk_id in seen_chunk_ids
+        ):
+            continue
+
+        seen_chunk_ids.add(normalized_chunk_id)
+        normalized_source_chunk_ids.append(normalized_chunk_id)
+        resolved_topic = chunk_topic_map.get(normalized_chunk_id)
+        if resolved_topic:
+            resolved_topics.append(resolved_topic)
+
+    resolution = "unattributed"
+    resolved_topic = None
+
+    if resolved_topics:
+        topic_counts = {}
+        for topic in resolved_topics:
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+
+        if len(topic_counts) == 1:
+            resolved_topic = resolved_topics[0]
+            resolution = "source_same_topic"
+        else:
+            majority_topic = next(
+                (
+                    topic
+                    for topic, count in topic_counts.items()
+                    if count > len(resolved_topics) / 2
+                ),
+                None,
+            )
+
+            if majority_topic:
+                resolved_topic = majority_topic
+                resolution = "source_majority_topic"
+            else:
+                resolved_topic = resolved_topics[0]
+                resolution = "source_first_topic_tiebreak"
+    else:
+        model_topic = question.get("topic")
+        if isinstance(model_topic, str):
+            model_topic = model_topic.strip()
+            if model_topic in canonical_project_topics:
+                resolved_topic = model_topic
+                resolution = "canonical_model_fallback"
+
+    return {
+        "topic": resolved_topic,
+        "resolution": resolution,
+        "source_chunk_ids": normalized_source_chunk_ids,
+        "resolved_source_topics": resolved_topics,
+    }
+
+
+def build_hard_question_diagnostic_sample(
+    question,
+    outcome,
+    question_type,
+    rejection_reasons=None,
+    topic_category_by_name=None,
+):
+    topic = question.get("topic")
+    topic_text = str(topic).strip() if topic else None
+    category = question.get("category")
+
+    if not category and topic_text and topic_category_by_name:
+        category = topic_category_by_name.get(
+            normalize_string(topic_text).lower()
+        )
+
+    return {
+        "outcome": outcome,
+        "question_stem": str(
+            question.get("question") or ""
+        ).strip(),
+        "rejection_reasons": list(rejection_reasons or []),
+        "question_type": question_type,
+        "topic": topic_text,
+        "category": str(category).strip() if category else None,
+    }
+
+
+def persist_hard_generation_diagnostics(metrics, samples):
+    diagnostics_db = SessionLocal()
+
+    try:
+        run_id = diagnostics_db.execute(
+            text("""
+                insert into hard_quiz_generation_runs (
+                    project_id,
+                    project_name,
+                    quiz_id,
+                    difficulty,
+                    question_style,
+                    requested_questions,
+                    generated_questions,
+                    accepted_questions,
+                    rejected_questions,
+                    acceptance_rate,
+                    rejection_reasons_breakdown
+                )
+                values (
+                    :project_id,
+                    :project_name,
+                    :quiz_id,
+                    :difficulty,
+                    :question_style,
+                    :requested_questions,
+                    :generated_questions,
+                    :accepted_questions,
+                    :rejected_questions,
+                    :acceptance_rate,
+                    CAST(:rejection_reasons_breakdown AS jsonb)
+                )
+                returning id
+            """),
+            {
+                **metrics,
+                "rejection_reasons_breakdown": json.dumps(
+                    metrics["rejection_reasons_breakdown"]
+                ),
+            },
+        ).scalar()
+
+        if samples:
+            diagnostics_db.execute(
+                text("""
+                    insert into hard_quiz_generation_samples (
+                        run_id,
+                        outcome,
+                        question_stem,
+                        rejection_reasons,
+                        question_type,
+                        topic,
+                        category
+                    )
+                    values (
+                        :run_id,
+                        :outcome,
+                        :question_stem,
+                        CAST(:rejection_reasons AS jsonb),
+                        :question_type,
+                        :topic,
+                        :category
+                    )
+                """),
+                [
+                    {
+                        **sample,
+                        "run_id": run_id,
+                        "rejection_reasons": json.dumps(
+                            sample["rejection_reasons"]
+                        ),
+                    }
+                    for sample in samples
+                ],
+            )
+
+        diagnostics_db.commit()
+        print("HARD GENERATION DIAGNOSTICS STORED:", run_id)
+        return str(run_id)
+
+    except Exception as diagnostic_error:
+        diagnostics_db.rollback()
+        print(
+            "HARD GENERATION DIAGNOSTICS STORAGE FAILED:",
+            repr(diagnostic_error),
+        )
+        return None
+
+    finally:
+        diagnostics_db.close()
+
+
+def validate_quiz_requested_count(requested_count, questions):
+    accepted_count = len(questions)
+
+    if accepted_count != requested_count:
+        raise ValueError(
+            "Quiz assembly incomplete: "
+            f"requested {requested_count}, accepted {accepted_count}"
+        )
+
+
 @app.post("/projects/{project_id}/generate_quiz")
 async def generate_quiz(
     
@@ -1973,7 +4875,7 @@ async def generate_quiz(
 
     project = db.execute(
         text("""
-            select id from projects
+            select id, name from projects
             where id = :project_id
             and user_id = :user_id
         """),
@@ -1987,6 +4889,8 @@ async def generate_quiz(
         db.close()
         raise HTTPException(status_code=403, detail="Access denied")
 
+    project_name = project[1]
+    quiz_id = str(uuid.uuid4())
 
     # ======================
     # RETRIEVAL (UNA SOLA VOLTA)
@@ -2117,6 +5021,20 @@ async def generate_quiz(
         active_topics = ["General"]
 
     print("🎯 ACTIVE TOPICS (CLEANED):", active_topics)
+
+    topic_category_rows = db.execute(
+        text("""
+            select topic, category
+            from topics
+            where project_id = :project_id
+        """),
+        {"project_id": project_id},
+    ).fetchall()
+    topic_category_by_name = {
+        normalize_string(row[0]).lower(): row[1]
+        for row in topic_category_rows
+        if row[0]
+    }
     
 
     if not retrieved_chunks:
@@ -2215,6 +5133,10 @@ async def generate_quiz(
 
         return score
 
+    hard_rejection_reasons = []
+    hard_rejection_samples = []
+    hard_question_type_by_object_id = {}
+
     async def validate_question(
         question,
         style
@@ -2256,6 +5178,36 @@ async def generate_quiz(
             "📝 EXPLANATION:",
             question.get("explanation")
         )
+
+        if (req.difficulty or "").strip().lower() == "hard":
+            hard_evaluation = evaluate_hard_question_reasoning(
+                question
+            )
+            print(
+                "🧠 HARD REASONING VALIDATION:",
+                hard_evaluation
+            )
+
+            if not hard_evaluation["valid"]:
+                print(
+                    "🚫 HARD QUESTION REJECTED:",
+                    hard_evaluation["reasons"]
+                )
+                hard_rejection_reasons.extend(
+                    hard_evaluation["reasons"]
+                )
+                hard_rejection_samples.append(
+                    build_hard_question_diagnostic_sample(
+                        question=question,
+                        outcome="rejected",
+                        question_type=style,
+                        rejection_reasons=hard_evaluation["reasons"],
+                        topic_category_by_name=(
+                            topic_category_by_name
+                        ),
+                    )
+                )
+                return False
 
         scenario_indicators = [
 
@@ -2313,6 +5265,23 @@ async def generate_quiz(
             if heuristic_score <= -2:
 
                 print("🚫 HEURISTIC REJECTION")
+                if (req.difficulty or "").strip().lower() == "hard":
+                    hard_rejection_reasons.append(
+                        "heuristic_score_rejection"
+                    )
+                    hard_rejection_samples.append(
+                        build_hard_question_diagnostic_sample(
+                            question=question,
+                            outcome="rejected",
+                            question_type=style,
+                            rejection_reasons=[
+                                "heuristic_score_rejection"
+                            ],
+                            topic_category_by_name=(
+                                topic_category_by_name
+                            ),
+                        )
+                    )
                 
                 return False
 
@@ -2322,6 +5291,23 @@ async def generate_quiz(
 
                 print("🚫 BASIC FILTER REJECTED")
                 print("❌ REJECT REASON: heuristic")
+                if (req.difficulty or "").strip().lower() == "hard":
+                    hard_rejection_reasons.append(
+                        "basic_reasoning_filter_rejection"
+                    )
+                    hard_rejection_samples.append(
+                        build_hard_question_diagnostic_sample(
+                            question=question,
+                            outcome="rejected",
+                            question_type=style,
+                            rejection_reasons=[
+                                "basic_reasoning_filter_rejection"
+                            ],
+                            topic_category_by_name=(
+                                topic_category_by_name
+                            ),
+                        )
+                    )
                 return False
         print("✅ QUESTION ACCEPTED")
         return True
@@ -2372,40 +5358,56 @@ async def generate_quiz(
     ):
 
         reasoning_prompt = f"""
-    You MUST analyze the following biological/metabolic scenario.
+    Analyze the following proposed learning scenario against the retrieved
+    evidence.
 
     SCENARIO:
     {scenario_text}
 
-    Using ONLY the supporting material below,
-    extract the DIAGNOSTIC REASONING BLUEPRINT
-    behind the scenario.
+    The RETRIEVED MATERIAL is the authoritative factual source.
+    The scenario is only a proposed restatement of that material.
+
+    Use ONLY facts explicitly stated in the retrieved material.
+    Do not use general knowledge to complete, enrich, or repair the scenario.
+    If the scenario contains an actor, institution, object, event,
+    relationship, process, condition, or consequence that is not supported
+    by the retrieved material, exclude that detail from the reasoning
+    blueprint.
+
+    Extract an EVIDENCE-GROUNDED REASONING BLUEPRINT.
 
     
 
     Focus on:
-    - what is OBSERVED
-    - what must be INFERRED
-    - what hidden mechanism explains the situation
+    - what is explicitly established by the retrieved material
+    - what comparison, distinction, or inference the material supports
+    - what mechanism or rule the material explicitly describes
     - what incorrect interpretation a weak student might make
-    - what downstream consequence follows logically
+    - what consequence is explicitly supported by the material
 
     Focus on:
     - the condition
-    - the hidden mechanism
-    - the downstream consequence
+    - the supported mechanism or rule
+    - the supported consequence
     - the key reasoning target
+
+    A valid inference may connect multiple retrieved statements, but every
+    premise and the resulting relationship must be present in the material.
+
+    If the material is primarily definitional or conceptual, use comparison,
+    classification, distinction, exception handling, or synthesis. Do not
+    invent a fictional event to make it scenario-based.
 
     DO NOT generate a question yet.
 
     Return STRICT JSON:
 
     {{
-        "observable_change": "...",
-        "hidden_cause": "...",
+        "observable_change": "supported evidence or condition",
+        "hidden_cause": "supported rule, mechanism, or relationship",
         "required_inference": "...",
         "common_wrong_interpretation": "...",
-        "downstream_effect": "..."
+        "downstream_effect": "explicitly supported consequence or empty string"
     }}
 
     SUPPORTING MATERIAL:
@@ -2463,74 +5465,67 @@ async def generate_quiz(
             retrieved_chunks,
             min(30, len(retrieved_chunks))
         )
+        hard_context_instruction = ""
+
+        if (req.difficulty or "").strip().lower() == "hard":
+            hard_context_instruction = (
+                render_hard_context_specification()
+            )
+
         print(
             "🎲 SCENARIO CHUNKS:",
             len(scenario_chunks)
         )
 
         scenario_prompt = f"""
-        You MUST use ONLY the provided material.
+        The provided material is the authoritative factual source.
 
-        Create {n} short applied learning scenarios.
+        Create {n} evidence-grounded learning contexts.
 
-        The scenario MUST describe a CONCRETE observable situation
-        derived from the provided material.
+        Every factual element in each context MUST be explicitly supported
+        by one or more provided chunks.
 
-        The scenario may involve:
+        You may use only:
 
-        - measurable changes
-        - cause and effect relationships
-        - system behavior
-        - interactions between variables
-        - changes over time
-        - observable consequences
-        - comparisons between conditions
-        - real-world applications
+        - concepts stated in the material
+        - entities stated in the material
+        - objects stated in the material
+        - events or processes stated in the material
+        - relationships stated in the material
+        - consequences stated in the material
 
-        The scenario MUST be grounded in the domain of the material.
+        Do NOT introduce a new actor, institution, object, event, process,
+        condition, relationship, consequence, proper name, location,
+        motivation, measurement, or causal link.
 
-        Examples:
+        Do NOT make assumptions from general knowledge, even when they seem
+        plausible in the academic domain.
 
-        Physics:
-        - changes in velocity, acceleration, force, energy, trajectory
+        Preserve the source's level of specificity. Do not turn a general
+        rule or definition into a detailed fictional case.
 
-        Biology:
-        - physiological changes, cellular responses, regulation
+        If the source explicitly describes a concrete situation, you may
+        restate that situation without adding details.
 
-        Economics:
-        - market changes, incentives, outcomes
+        If the source is primarily definitional or conceptual, create a
+        conceptual context based on:
 
-        Law:
-        - legal situations, obligations, consequences
+        - comparison
+        - distinction
+        - classification
+        - an explicitly stated exception
+        - synthesis of two or more provided statements
 
-        Computer Science:
-        - system behavior, algorithm performance, data flow
+        In that case, do not create a fictional narrative.
 
-        The scenario MUST include:
-        - a condition
-        - at least TWO changing variables
-        - at least ONE consequence or adaptation
+        Difficulty must come from reasoning over the supplied evidence, not
+        from adding facts.
 
-        The scenario should feel like a realistic event,
-        observation, process, experiment,
-        or real-world situation relevant to the material.
+        {hard_context_instruction}
 
-        IMPORTANT:
-
-        The scenario MUST stay within the academic domain
-        of the provided material.
-
-        If the material is about physics,
-        the scenario MUST describe physical phenomena.
-
-        If the material is about biology,
-        the scenario MUST describe biological phenomena.
-
-        If the material is about law,
-        the scenario MUST describe legal situations.
-
-        Never introduce concepts that are absent
-        from the provided material.
+        Before returning each context, verify that every noun, event,
+        relationship, and consequence can be traced to the provided chunks.
+        If it cannot, remove it.
 
         LANGUAGE REQUIREMENT:
 
@@ -2550,7 +5545,9 @@ async def generate_quiz(
         {{
         "scenarios": [
             {{
-            "scenario": "..."
+            "scenario": "...",
+            "source_chunk_ids": ["..."],
+            "evidence_facts": ["..."]
             }}
         ]
         }}
@@ -2598,10 +5595,38 @@ async def generate_quiz(
 
             return []
 
-    async def generate_batch(n, style):
+    generation_diagnostics = {
+        "requested_question_count": req.num_questions,
+        "initial_generated": 0,
+        "initial_rejected": 0,
+        "initial_accepted": 0,
+        "refill_attempts": 0,
+        "refill_generated": 0,
+        "refill_rejected": 0,
+        "refill_accepted": 0,
+        "final_accepted": 0,
+    }
+
+    async def generate_batch(n, style, phase="initial"):
         batch_start = time.time()
+        hard_question_contract = ""
+
+        if (req.difficulty or "").strip().lower() == "hard":
+            hard_question_contract = (
+                render_hard_quiz_specification()
+            )
+            exam_preferred_formats = render_hard_exam_formats()
+        else:
+            exam_preferred_formats = """
+                - Which conclusion follows from the supplied principles?
+                - Which distinction best explains the difference?
+                - Which exception applies under the stated source conditions?
+                - Which statement is TRUE?
+                - Which statement is FALSE?
+            """
 
         print("📦 BATCH START")
+        print("📦 BATCH PHASE:", phase)
         if style == "exam":
             scenarios = []
         else:
@@ -2612,6 +5637,8 @@ async def generate_quiz(
         print("STYLE:", style)
         print("N:", n)
         
+        i = -1
+
         for i, s in enumerate(scenarios):
             print(
                 f"📄 SCENARIO {i+1}:",
@@ -2650,7 +5677,13 @@ async def generate_quiz(
 
             if style == "exam":
 
-                style_instruction = """
+                if (req.difficulty or "").strip().lower() == "hard":
+                    style_instruction = """
+                Follow the shared HARD COGNITIVE-DIFFICULTY SPECIFICATION.
+                Keep the university-exam format concise and non-narrative.
+                """
+                else:
+                    style_instruction = """
                 Generate questions that resemble real university exams.
 
                 DO NOT use:
@@ -2669,8 +5702,8 @@ async def generate_quiz(
                 Questions should assess:
 
                 - definitions
-                - pathways
-                - enzymes
+                - distinctions
+                - rules and exceptions
                 - mechanisms
                 - direct applications
 
@@ -2682,17 +5715,23 @@ async def generate_quiz(
             elif style == "reasoning":
 
                 style_instruction = """
-                Prioritize causal reasoning.
+                Prioritize evidence-grounded reasoning.
 
-                Use downstream effects.
+                Use comparisons, distinctions, exceptions, mechanisms,
+                relationships, and cause-effect links that are explicitly
+                present in the retrieved material.
 
-                Use compensatory mechanisms.
+                Synthesize multiple retrieved statements when useful.
 
                 Require logical inference.
 
                 Require students to connect multiple concepts.
 
                 Avoid pure recall questions whenever possible.
+
+                If the material is definitional or conceptual, create a
+                higher-order conceptual question. Do not invent a fictional
+                scenario merely to make the question appear difficult.
                 """
 
             
@@ -2702,9 +5741,26 @@ async def generate_quiz(
             if style == "exam":
 
                 prompt = f"""
-                You MUST use ONLY the material provided below.
+                The SUPPORTING MATERIAL is the authoritative factual source.
 
                 Generate EXACTLY {n} university-style multiple choice questions.
+
+                STRICT GROUNDING CONTRACT:
+
+                - Every fact needed to understand or answer a question must
+                  be explicitly supported by the supplied chunks.
+                - Do not introduce new actors, institutions, objects, events,
+                  processes, relationships, conditions, or consequences.
+                - Do not use general knowledge to extend the source.
+                - A plausible statement is not permitted unless the material
+                  supports it.
+                - Difficulty must come from comparison, distinction,
+                  inference, mechanism analysis, exception handling, or
+                  synthesis across supplied chunks.
+                - If the material is definitional, ask a higher-order
+                  conceptual question instead of inventing a scenario.
+
+                {hard_question_contract}
 
                 IMPORTANT:
                 Each question MUST contain EXACTLY 5 answer options.
@@ -2729,11 +5785,14 @@ async def generate_quiz(
                 - application of knowledge
                 - interpretation of mechanisms
                 - cause-effect relationships
-                - metabolic consequences
-                - pathway interactions
+                - distinctions and exceptions
+                - synthesis across related concepts
 
-                Definitions, enzyme names and pathway names
-                should only be tested when educationally relevant.
+                Use a mechanism, relationship, or consequence only when it is
+                explicitly described in the material.
+
+                Definitions and technical terms should only be tested when
+                educationally relevant.
 
                 Questions should resemble real university exams.
 
@@ -2742,10 +5801,10 @@ async def generate_quiz(
                 Each question must focus on a different concept.
 
                 Do not generate multiple questions
-                about the same enzyme,
-                the same pathway,
-                the same deficiency,
-                or the same regulatory mechanism.
+                about the same concept,
+                the same rule,
+                the same distinction,
+                or the same mechanism.
 
                 Max one question per major concept.
 
@@ -2761,11 +5820,7 @@ async def generate_quiz(
 
                 Preferred question formats:
 
-                - Which consequence would most directly occur?
-                - Which mechanism best explains the observed outcome?
-                - Which process would be most affected?
-                - Which statement is TRUE?
-                - Which statement is FALSE?
+                {exam_preferred_formats}
 
                 
 
@@ -2776,8 +5831,8 @@ async def generate_quiz(
                 EASY:
                 - direct factual recall
                 - definitions
-                - enzymes
-                - pathways
+                - terminology
+                - single rules
                 - single concept questions
 
                 
@@ -2792,21 +5847,13 @@ async def generate_quiz(
 
                 - Which statement is TRUE?
                 - Which statement is FALSE?
-                - Which consequence would most directly occur?
-                - Which mechanism best explains...?
-                - Which process would be impaired?
+                - Which conclusion follows from these statements?
+                - Which distinction best explains...?
+                - Which exception applies?
 
                 HARD:
-                - multi-step reasoning
-                - interactions between pathways
-                - interpretation of metabolic consequences
-                - hidden mechanisms
-                - integration of multiple concepts
-                - questions should require at least TWO reasoning steps
-                - For HARD difficulty:
-                Questions should not be answerable through direct memorization alone.
-
-                The student should need to integrate at least two concepts before identifying the correct answer.
+                - Follow the shared HARD COGNITIVE-DIFFICULTY SPECIFICATION
+                  above.
 
 
                 LANGUAGE REQUIREMENT:
@@ -2826,6 +5873,12 @@ async def generate_quiz(
 
                 Generate EXACTLY {n} questions.
 
+                For each question, include "source_chunk_ids" containing the
+                chunk IDs that support the stem and correct answer.
+
+                Before returning, verify that "correct" or "correct_answer"
+                points to the option justified by the explanation.
+
                 SUPPORTING MATERIAL:
                 {json.dumps(retrieved_chunks[:10], indent=2)}
                 """
@@ -2833,9 +5886,29 @@ async def generate_quiz(
             else:
 
                 prompt = f"""
-                You MUST use ONLY the material provided below.
+                The SUPPORTING MATERIAL is the authoritative factual source.
+                The proposed scenario and reasoning blueprint are subordinate
+                aids and may not add facts.
 
-                Use the provided material as the ONLY factual source.
+                STRICT GROUNDING CONTRACT:
+
+                - Every entity, actor, institution, object, event, process,
+                  condition, relationship, and consequence in the question
+                  must be explicitly supported by the supporting material.
+                - Do not use general knowledge to enrich the question.
+                - Do not introduce plausible but unstated facts.
+                - If any scenario detail is unsupported, omit that detail and
+                  build the question directly from the supporting material.
+                - Every premise needed for the correct answer must be
+                  traceable to the supporting material.
+                - Difficulty must come from comparison, distinction,
+                  inference, mechanism analysis, exception handling, or
+                  synthesis—not from invented context.
+                - If the material is primarily definitional or conceptual,
+                  generate a higher-order conceptual question without a
+                  fictional scenario.
+
+                {hard_question_contract}
 
                 IMPORTANT:
                 Each question MUST contain EXACTLY 5 answer options.
@@ -2848,41 +5921,40 @@ async def generate_quiz(
 
                 {style_instruction}
 
-                Scenario Diversity Rules:
+                Question Diversity Rules:
 
                 - Each question must test a DIFFERENT inference.
-                - Each question must focus on a DIFFERENT mechanism,
-                consequence,
-                adaptation,
-                compensation,
-                or causal relationship.
+                - Each question must focus on a DIFFERENT supported
+                  distinction, mechanism, consequence, exception,
+                  or relationship.
                 - Do NOT generate multiple questions that can be answered
                 using the same reasoning process.
                 - Do NOT paraphrase the same question multiple times.
                 - If multiple questions are generated, they should explore
-                different aspects of the scenario.
+                  different aspects of the retrieved evidence.
 
-                You may infer:
-                - mechanisms
-                - consequences
-                - relationships
-                - adaptations
-                - compensations
-                - downstream effects
+                You may connect:
+                - explicitly stated mechanisms or rules
+                - explicitly stated consequences
+                - explicitly stated relationships
+                - comparisons and distinctions supported by the material
+                - statements from multiple supplied chunks
 
-                ONLY if they are logically supported by the material.
+                Do not infer a new factual premise. A conclusion is valid only
+                when every premise and relationship required for it appears
+                in the supporting material.
 
-                PRIMARY SCENARIO CONTEXT:
+                PROPOSED SCENARIO CONTEXT:
 
                 {scenario_text}
 
 
                 DIAGNOSTIC REASONING BLUEPRINT:
 
-                Observable Change:
+                Supported Evidence or Condition:
                 {reasoning_chain.get("observable_change", "")}
 
-                Hidden Cause:
+                Supported Rule, Mechanism, or Relationship:
                 {reasoning_chain.get("hidden_cause", "")}
 
                 Required Inference:
@@ -2891,82 +5963,29 @@ async def generate_quiz(
                 Common Wrong Interpretation:
                 {reasoning_chain.get("common_wrong_interpretation", "")}
 
-                Downstream Effect:
+                Explicitly Supported Consequence:
                 {reasoning_chain.get("downstream_effect", "")}
 
                 IMPORTANT:
 
-                The ENTIRE question MUST be built around this scenario.
+                First verify the proposed scenario against the supporting
+                material. Retain only supported details.
 
-                The scenario is the PRIMARY source for the question.
+                If the verified scenario is fully supported and educationally
+                useful, it may be used as the question context.
 
-                The provided material is ONLY supporting context.
+                If the scenario contains unsupported detail, discard that
+                detail. If removing it leaves no useful scenario, ask a
+                conceptual reasoning question directly from the material.
 
-                If the scenario is removed,
-                the question MUST become impossible to answer correctly.
+                Do not force a narrative opening. A precise comparison,
+                distinction, exception, or synthesis question is preferable
+                to an embellished scenario.
 
-                The question MUST directly depend on:
-                - the observed changes
-                - the described condition
-                - the adaptation
-                - the consequence
-                - the comparison
-                
-
-                contained in the scenario.
-
-                DO NOT generate generic textbook questions.
-
-                DO NOT ask about isolated definitions,
-                rules,
-                pathways,
-                or static facts
-                unless they are REQUIRED to interpret the scenario itself.
-
-                Transform the scenario into an applied reasoning question.
-
-                The FIRST sentence of the question MUST describe:
-                - a condition
-                - a system change
-                - a dysfunction
-                - a compensation
-                - an adaptation
-                - a metabolic transition
-                or
-                - an observed consequence
-
-                derived directly from the scenario.
-
-                The scenario itself MUST become the question stem.
-
-                ONLY AFTER describing the situation,
-                ask the reasoning question.
-
-                The question MUST NOT start with:
-                - What
-                - Which
-                - During which
-                - In which
-                - How does
-
-                The question MUST start with a concrete situation, for example:
-                - During...
-                - When...
-                - After...
-                - If...
-                - Following...
-                - A system...
-                - An observed change...
-                - A prolonged condition...
-
-                If the question starts with What, Which, During which, In which, or How does, it is INVALID.
-
-                The student should need to:
                 The question MUST specifically test the REQUIRED INFERENCE
                 from the diagnostic reasoning blueprint above.
 
-                The correct answer should ONLY become obvious
-                after interpreting the observable change correctly.
+                The correct answer must follow from the supplied evidence.
 
                 The wrong answers should reflect:
                 - common misconceptions
@@ -2975,57 +5994,39 @@ async def generate_quiz(
                 or
                 - confusion between related mechanisms.
 
-                situation
-                → interpretation
-                → mechanism
-                → consequence
+                evidence
+                → comparison or interpretation
+                → supported rule or mechanism
                 → answer
 
                 NOT:
 
-                keyword
-                → memorized fact
+                source concept
+                → invented scenario facts
                 → answer
 
                 The question MUST require reasoning about:
-                - a change
-                - a consequence
                 - a comparison
-                - a system response
-                - a failure
-                - a dependency
-                or
-                - a downstream effect
+                - a distinction
+                - an explicitly stated consequence
+                - a supported mechanism or rule
+                - an exception
+                - a dependency explicitly described by the source
+                - synthesis across multiple supplied statements
 
                 Questions solvable through direct factual recall alone
                 are LOW QUALITY.
 
                 Avoid:
-                - direct definitions
                 - glossary-style questions
                 - isolated factual recall
-                - textbook-style prompts
                 - single-step recognition questions
-
-                BAD:
-                "What is the role of glucagon?"
-
-                BAD:
-                "Which pathway produces NADPH?"
-
-                GOOD:
-                "During prolonged fasting, glucose utilization decreases in peripheral tissues while fatty acid oxidation increases.
-
-                Which downstream metabolic adaptation would MOST likely occur?"
-
-                GOOD:
-                "A compensatory metabolic response temporarily stabilizes energy production after a regulatory pathway becomes less effective.
-
-                Which mechanism BEST explains the observed adaptation?"
+                - fictional details absent from the source
+                - consequences supported only by general knowledge
 
                 IMPORTANT:
                 - Each question MUST focus on a DIFFERENT concept
-                - Do NOT repeat mechanisms or pathways
+                - Do NOT repeat the same rule or mechanism
                 - Cover different parts of the material
                 - Exactly ONE answer must be correct
                 - Do NOT use "All of the above"
@@ -3035,20 +6036,17 @@ async def generate_quiz(
 
                 EASY:
                 - basic understanding
-                - direct mechanisms
+                - direct supported mechanisms or rules
                 - limited reasoning
 
                 MEDIUM:
-                - cause-effect reasoning
-                - interactions between processes
+                - supported cause-effect reasoning
+                - comparison or interaction of supplied concepts
                 - moderate interpretation
 
                 HARD:
-                - applied reasoning
-                - hidden mechanisms
-                - interpretation of consequences
-                - at least TWO reasoning steps
-                - scenario-driven reasoning
+                - Follow the shared HARD COGNITIVE-DIFFICULTY SPECIFICATION
+                  above.
 
                 LANGUAGE REQUIREMENT:
 
@@ -3072,6 +6070,9 @@ async def generate_quiz(
 
                 Returning fewer than 1 question is INVALID.
 
+                Before returning, verify that "correct" or "correct_answer"
+                points to the option justified by the explanation.
+
                 Example structure:
 
                 {{
@@ -3084,7 +6085,8 @@ async def generate_quiz(
                         "explanation": "Short explanation",
                         "explanation_long": "2-3 sentences maximum",
                         "source_document": "Exact file name",
-                        "source_page": "Page number"
+                        "source_page": "Page number",
+                        "source_chunk_ids": ["Supporting chunk ID"]
                     }},
                     {{
                         "question": "...",
@@ -3094,7 +6096,8 @@ async def generate_quiz(
                         "explanation": "Short explanation",
                         "explanation_long": "2-3 sentences maximum",
                         "source_document": "Exact file name",
-                        "source_page": "Page number"
+                        "source_page": "Page number",
+                        "source_chunk_ids": ["Supporting chunk ID"]
                     }},
                     {{
                         "question": "...",
@@ -3104,7 +6107,8 @@ async def generate_quiz(
                         "explanation": "Short explanation",
                         "explanation_long": "2-3 sentences maximum",
                         "source_document": "Exact file name",
-                        "source_page": "Page number"
+                        "source_page": "Page number",
+                        "source_chunk_ids": ["Supporting chunk ID"]
                     }}
                 ]
             }}
@@ -3180,6 +6184,14 @@ async def generate_quiz(
                         questions = [data["question"]]
 
                 print("📊 GPT GENERATED:", len(questions))
+                generated_key = (
+                    "refill_generated"
+                    if phase == "refill"
+                    else "initial_generated"
+                )
+                generation_diagnostics[generated_key] += len(
+                    questions
+                )
                 
                 
                 
@@ -3221,6 +6233,32 @@ async def generate_quiz(
 
                     if "question" not in q:
                         print("❌ QUESTION FIELD MISSING:", q)
+                        if (
+                            (req.difficulty or "").strip().lower()
+                            == "hard"
+                        ):
+                            hard_rejection_reasons.append(
+                                "missing_question_field"
+                            )
+                            hard_rejection_samples.append(
+                                build_hard_question_diagnostic_sample(
+                                    question=q,
+                                    outcome="rejected",
+                                    question_type=style,
+                                    rejection_reasons=[
+                                        "missing_question_field"
+                                    ],
+                                    topic_category_by_name=(
+                                        topic_category_by_name
+                                    ),
+                                )
+                            )
+                        rejected_key = (
+                            "refill_rejected"
+                            if phase == "refill"
+                            else "initial_rejected"
+                        )
+                        generation_diagnostics[rejected_key] += 1
                         continue
 
                     
@@ -3243,6 +6281,12 @@ async def generate_quiz(
                     if not is_valid:
 
                         print("❌ QUESTION REJECTED")
+                        rejected_key = (
+                            "refill_rejected"
+                            if phase == "refill"
+                            else "initial_rejected"
+                        )
+                        generation_diagnostics[rejected_key] += 1
 
                         continue
 
@@ -3252,7 +6296,7 @@ async def generate_quiz(
                             q["question"]
                         )
 
-                        
+                    hard_question_type_by_object_id[id(q)] = style
 
                     validated_questions.append(q)
                     print(
@@ -3365,10 +6409,17 @@ async def generate_quiz(
                 )
             )
 
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(
+        *tasks,
+        return_exceptions=True,
+    )
     print(
         "📊 BEFORE DEDUP:",
-        sum(len(batch or []) for batch in results)
+        sum(
+            len(batch or [])
+            for batch in results
+            if not isinstance(batch, Exception)
+        )
     )
     for idx, batch in enumerate(results):
 
@@ -3376,6 +6427,13 @@ async def generate_quiz(
             f"📦 RESULT {idx}:",
             type(batch)
         )
+
+        if isinstance(batch, Exception):
+            print(
+                f"❌ INITIAL BATCH {idx} FAILED:",
+                repr(batch)
+            )
+            continue
 
         if batch is None:
             print(
@@ -3407,7 +6465,14 @@ async def generate_quiz(
             unique_questions.append(q)
 
     all_questions = unique_questions[:req.num_questions]
+    generation_diagnostics["initial_accepted"] = len(
+        all_questions
+    )
     print("📊 AFTER DEDUP:", len(all_questions))
+    print(
+        "📊 ACCEPTED AFTER INITIAL GENERATION:",
+        generation_diagnostics["initial_accepted"]
+    )
 
     print("📋 UNIQUE QUESTIONS")
 
@@ -3422,6 +6487,7 @@ async def generate_quiz(
     ):
 
         retry_count += 1
+        generation_diagnostics["refill_attempts"] = retry_count
 
         missing = req.num_questions - len(all_questions)
 
@@ -3437,17 +6503,30 @@ async def generate_quiz(
 
             refill_style = req.question_style
 
-        extra_batch = await generate_batch(
-            missing,
-            refill_style
-        )
+        try:
+            extra_batch = await generate_batch(
+                missing,
+                refill_style,
+                phase="refill",
+            )
+        except Exception as refill_error:
+            print(
+                "❌ REFILL BATCH FAILED — "
+                "CONTINUING WITH REMAINING RETRIES:",
+                repr(refill_error)
+            )
+            continue
+
         print(
             "🎲 REFILL STYLE:",
             refill_style
         )
         if not extra_batch:
-            print("⚠️ Nessuna domanda extra generata, stop retry")
-            break
+            print(
+                "⚠️ ZERO-YIELD REFILL — "
+                "CONTINUING WITH REMAINING RETRIES"
+            )
+            continue
 
         for q in extra_batch:
 
@@ -3463,6 +6542,7 @@ async def generate_quiz(
 
                 seen_questions.add(key)
                 all_questions.append(q)
+                generation_diagnostics["refill_accepted"] += 1
 
             else:
 
@@ -3520,9 +6600,138 @@ async def generate_quiz(
                 print(q.get("explanation"))
 
                 print("-" * 80)
-    db.close()
-    quiz_id = str(uuid.uuid4())
 
+    generation_diagnostics["final_accepted"] = len(
+        all_questions
+    )
+    generation_diagnostics["total_rejected"] = (
+        generation_diagnostics["initial_rejected"]
+        + generation_diagnostics["refill_rejected"]
+    )
+
+    canonical_project_topics = {
+        row[0]
+        for row in topic_category_rows
+        if row[0]
+    }
+    for question in all_questions:
+        attribution = resolve_quiz_question_topic(
+            question,
+            chunk_topic_map,
+            canonical_project_topics,
+        )
+        question["topic"] = attribution["topic"]
+
+        if len(set(attribution["resolved_source_topics"])) > 1:
+            print(
+                "MULTI-TOPIC QUIZ ATTRIBUTION:",
+                json.dumps(
+                    {
+                        "source_chunk_ids": attribution[
+                            "source_chunk_ids"
+                        ],
+                        "resolved_source_topics": attribution[
+                            "resolved_source_topics"
+                        ],
+                        "selected_topic": attribution["topic"],
+                        "resolution": attribution["resolution"],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+        elif attribution["topic"] is None:
+            print(
+                "UNRESOLVED QUIZ TOPIC ATTRIBUTION:",
+                question.get("source_chunk_ids") or [],
+            )
+
+    print(
+        "📊 QUIZ ASSEMBLY DIAGNOSTICS:",
+        json.dumps(
+            generation_diagnostics,
+            sort_keys=True,
+        )
+    )
+
+    if (req.difficulty or "").strip().lower() == "hard":
+        hard_generation_metrics = build_hard_generation_metrics(
+            requested_questions=req.num_questions,
+            generated_questions=(
+                generation_diagnostics["initial_generated"]
+                + generation_diagnostics["refill_generated"]
+            ),
+            rejected_questions=(
+                generation_diagnostics["initial_rejected"]
+                + generation_diagnostics["refill_rejected"]
+            ),
+            rejection_reasons=hard_rejection_reasons,
+        )
+        hard_generation_metrics.update({
+            "project_id": project_id,
+            "project_name": project_name,
+            "quiz_id": quiz_id,
+            "difficulty": (
+                req.difficulty or "hard"
+            ).strip().lower(),
+            "question_style": req.question_style or "balanced",
+        })
+        accepted_sample_count = min(
+            HARD_ACCEPTED_DIAGNOSTIC_SAMPLE_SIZE,
+            len(all_questions),
+        )
+        accepted_questions_sample = (
+            random.SystemRandom().sample(
+                all_questions,
+                accepted_sample_count,
+            )
+            if accepted_sample_count
+            else []
+        )
+        hard_accepted_samples = [
+            build_hard_question_diagnostic_sample(
+                question=question,
+                outcome="accepted",
+                question_type=hard_question_type_by_object_id.get(
+                    id(question),
+                    req.question_style or "balanced",
+                ),
+                topic_category_by_name=topic_category_by_name,
+            )
+            for question in accepted_questions_sample
+        ]
+        print(
+            "HARD GENERATION METRICS:",
+            json.dumps(
+                hard_generation_metrics,
+                sort_keys=True,
+            ),
+        )
+        persist_hard_generation_diagnostics(
+            hard_generation_metrics,
+            hard_rejection_samples + hard_accepted_samples,
+        )
+
+    try:
+        validate_quiz_requested_count(
+            req.num_questions,
+            all_questions,
+        )
+    except ValueError as incomplete_quiz_error:
+        db.close()
+        print(
+            "❌ QUIZ REQUESTED-COUNT INVARIANT FAILED:",
+            str(incomplete_quiz_error)
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Unable to generate the requested number of "
+                "quality-approved questions. No partial quiz was saved."
+            ),
+        )
+
+    db.close()
     db_save = SessionLocal()
     try:
         print("🔥 STO PER FARE INSERT QUIZ")
@@ -3538,7 +6747,7 @@ async def generate_quiz(
                 "id": quiz_id,
                 "project_id": project_id,
                 "user_id": user_id,
-                "num_questions": len(all_questions),
+                "num_questions": req.num_questions,
                 "difficulty": req.difficulty or "medium",
                 "question_style": req.question_style or "balanced"
             }
@@ -3565,7 +6774,9 @@ async def generate_quiz(
 
                 else:
                     print("❌ MISSING CORRECT ANSWER:", q)
-                    continue
+                    raise ValueError(
+                        "Accepted quiz question is missing a correct answer"
+                    )
 
             # NORMALIZE correct_answer TO INTEGER INDEX
             if isinstance(q["correct_answer"], str):
@@ -3643,18 +6854,23 @@ async def generate_quiz(
                 len(q.get("explanation", ""))
             )
 
+        saved_question_count = 0
+
         for i, q in enumerate(all_questions):
             if not q.get("question"):
-                print("🚨 SKIP QUESTION WITHOUT question:", q)
-                continue
+                raise ValueError(
+                    "Accepted quiz question is missing question text"
+                )
 
             if q.get("correct_answer") is None:
-                print("🚨 SKIP QUESTION WITHOUT correct_answer:", q)
-                continue
+                raise ValueError(
+                    "Accepted quiz question is missing correct_answer"
+                )
 
             if not q.get("options"):
-                print("🚨 SKIP QUESTION WITHOUT options:", q)
-                continue
+                raise ValueError(
+                    "Accepted quiz question is missing answer options"
+                )
             print("🔑 KEYS:", list(q.keys()))
             print("💾 SAVING QUESTION")
             print("QUESTION:", q["question"])
@@ -3695,6 +6911,31 @@ async def generate_quiz(
 
             new_id = result.fetchone()[0]
             q["id"] = str(new_id)   # 👈 QUESTO È IL FIX CRITICO
+            saved_question_count += 1
+
+        if saved_question_count != req.num_questions:
+            raise ValueError(
+                "Quiz persistence invariant failed: "
+                f"requested {req.num_questions}, "
+                f"inserted {saved_question_count}"
+            )
+
+        persisted_question_count = db_save.execute(
+            text("""
+                select count(*)
+                from quiz_questions
+                where quiz_id = :quiz_id
+            """),
+            {"quiz_id": quiz_id}
+        ).scalar()
+
+        if persisted_question_count != req.num_questions:
+            raise ValueError(
+                "Quiz persistence verification failed: "
+                f"requested {req.num_questions}, "
+                f"found {persisted_question_count}"
+            )
+
         db_save.commit()
         print("✅ COMMIT FATTO")
         print("💾 QUIZ STYLE SAVED:", req.question_style)
@@ -3705,6 +6946,13 @@ async def generate_quiz(
     except Exception as e:
         db_save.rollback()
         print("❌ ERRORE SALVATAGGIO QUIZ:", e)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Unable to persist the complete quiz. "
+                "No partial quiz was saved."
+            ),
+        )
 
     finally:
         db_save.close()
@@ -6075,7 +9323,7 @@ async def get_quiz(quiz_id: str):
     rows = db.execute(
         text("""
             select question, options, correct, explanation, explanation_long,
-                   source_document, source_page
+                   source_document, source_page, topic
             from quiz_questions
             where quiz_id = :quiz_id
             order by question_order
@@ -6095,7 +9343,8 @@ async def get_quiz(quiz_id: str):
             "explanation": r[3],
             "explanation_long": r[4],
             "source_document": r[5],
-            "source_page": r[6]
+            "source_page": r[6],
+            "topic": r[7],
         })
 
     return {"questions": questions}
@@ -6327,6 +9576,10 @@ async def ask_documents(req: AskRequest):
     - You MUST use previous conversation context to refine and expand your answers.
     - Do NOT restart explanations from scratch if the question is a follow-up.
     - Stay focused on the SAME concept unless the student changes topic.
+    - If the Current question contains a quiz question under "Question:",
+      identify the language of that quiz question and answer entirely in that
+      same language. Do not infer the response language from UI labels or these
+      prompt instructions.
 
     Rules:
     - If relevant info exists, explain it clearly
@@ -6416,11 +9669,31 @@ async def active_recall_question(project_id: str, req: ActiveRecallRequest, user
 
     query_embedding = emb.data[0].embedding
 
+    active_recall_roles = ensure_project_chunk_roles(
+        db,
+        project_id,
+    )
+    db.commit()
+    active_recall_teaching_count = sum(
+        1
+        for role in active_recall_roles
+        if is_assignment_eligible_chunk_role(role)
+    )
+    print(
+        "ELIGIBLE TEACHING CHUNKS:",
+        active_recall_teaching_count
+    )
+    print(
+        "EXCLUDED CHUNKS:",
+        len(active_recall_roles) - active_recall_teaching_count
+    )
+
     rows = db.execute(
         text("""
             SELECT chunk_text, doc_title, page, topic
             FROM chunks
             WHERE project_id = :project_id
+            AND chunk_role = 'teaching'
             AND (
                 topic ILIKE :full_focus             -- Esempio: %Block Actions%
                 OR topic ILIKE :keyword_focus       -- Esempio: %Block%
@@ -6522,6 +9795,24 @@ async def generate_recovery_flashcards(req: dict):
     print("🧠 RECOVERY TOPICS:", topics)
 
     db = SessionLocal()
+    recovery_roles = ensure_project_chunk_roles(
+        db,
+        project_id,
+    )
+    db.commit()
+    recovery_teaching_count = sum(
+        1
+        for role in recovery_roles
+        if is_assignment_eligible_chunk_role(role)
+    )
+    print(
+        "ELIGIBLE TEACHING CHUNKS:",
+        recovery_teaching_count
+    )
+    print(
+        "EXCLUDED CHUNKS:",
+        len(recovery_roles) - recovery_teaching_count
+    )
 
     # prendi chunk random ma piccoli (focus)
     if topics and len(topics) > 0:
@@ -6530,6 +9821,7 @@ async def generate_recovery_flashcards(req: dict):
                 select chunk_text
                 from chunks
                 where project_id = :project_id
+                and chunk_role = 'teaching'
                 and topic = :topic
                 order by random()
                 limit 5
@@ -6547,6 +9839,7 @@ async def generate_recovery_flashcards(req: dict):
                     select chunk_text
                     from chunks
                     where project_id = :project_id
+                    and chunk_role = 'teaching'
                     order by random()
                     limit 5
                 """),
@@ -6559,6 +9852,7 @@ async def generate_recovery_flashcards(req: dict):
                 select chunk_text
                 from chunks
                 where project_id = :project_id
+                and chunk_role = 'teaching'
                 order by random()
                 limit 5
             """),
