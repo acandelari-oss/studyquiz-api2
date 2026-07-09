@@ -5,7 +5,7 @@ import base64
 import io
 import math
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from typing import List, Optional
 import json
@@ -39,10 +39,27 @@ from chunk_roles import (
     log_chunk_role_counts,
     normalize_chunk_role,
 )
+from planner.context_builder import build_real_planner_context
+from planner.planner_engine import PlannerEngine
+from planner.planner_models import PlannerContext, PlannerPreferences
+from planner.planner_repository import PlannerRepository, build_planning_parameters
+from planner.planner_serializers import serialize_planner_domain
+from planner.planner_state import PlannerState
+from planner.planner_state_evaluator import (
+    PlannerStateEvaluator,
+    serialize_planner_state_evaluation,
+)
 import time
 import re
 
 MAX_RECOMMENDED_PAGES = 150
+DEFAULT_MAX_VISIBLE_PLANNER_MODULES = 12
+MAX_VISIBLE_PLANNER_MODULES = int(
+    os.getenv(
+        "MAX_VISIBLE_PLANNER_MODULES",
+        str(DEFAULT_MAX_VISIBLE_PLANNER_MODULES),
+    )
+)
 MAX_WARNING_PAGES = 100
 MAX_STRONG_WARNING_PAGES = 180
 
@@ -271,6 +288,19 @@ class IngestRequest(BaseModel):
     documents: List[IngestDocument]
 
 
+class PlannerGenerationPreferences(BaseModel):
+    studyDurationMinutes: int
+    questionPaceSeconds: int
+    sessionsPerWeek: Optional[int] = None
+    questionStyle: str
+
+
+class PlannerGenerationConfiguration(BaseModel):
+    survey: Optional[dict] = None
+    preferences: PlannerGenerationPreferences
+    study_language: Optional[str] = "English"
+
+
 # ======================
 # HEALTH
 # ======================
@@ -278,6 +308,206 @@ class IngestRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/planner/week")
+def get_planner_week_without_project():
+    raise HTTPException(
+        status_code=400,
+        detail="project_id is required for Study Planner.",
+    )
+
+
+@app.get("/projects/{project_id}/planner/week")
+def get_project_planner_week(project_id: str):
+    db = SessionLocal()
+    try:
+        context = build_real_planner_context(db, project_id=project_id)
+
+        if not context.project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found for Study Planner.",
+            )
+
+        resolved_project_id = str(context.project["id"])
+        repository = PlannerRepository(db)
+        evaluation = PlannerStateEvaluator(
+            db,
+            repository=repository,
+        ).evaluate(project_id=resolved_project_id)
+
+        response = serialize_planner_state_evaluation(evaluation)
+
+        if evaluation.state == PlannerState.ACTIVE_WEEK:
+            response["week"] = serialize_planner_domain(evaluation.active_week)
+
+        return response
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/week/generate")
+def generate_project_planner_week(
+    project_id: str,
+    req: PlannerGenerationConfiguration,
+):
+    db = SessionLocal()
+    try:
+        context = build_real_planner_context(db, project_id=project_id)
+
+        if not context.project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found for Study Planner.",
+            )
+
+        resolved_project_id = str(context.project["id"])
+        repository = PlannerRepository(db)
+        evaluation = PlannerStateEvaluator(
+            db,
+            repository=repository,
+        ).evaluate(project_id=resolved_project_id)
+
+        if evaluation.state == PlannerState.ACTIVE_WEEK:
+            response = serialize_planner_state_evaluation(evaluation)
+            response["week"] = serialize_planner_domain(evaluation.active_week)
+            return response
+
+        _validate_planner_generation_configuration(
+            req=req,
+            project_categories=set(context.categories),
+            planner_state=evaluation.state,
+        )
+
+        generation_context = PlannerContext(
+            project=context.project,
+            categories=context.categories,
+            topics_by_category=context.topics_by_category,
+            analytics=context.analytics,
+            preferences=PlannerPreferences(
+                question_pace_seconds=req.preferences.questionPaceSeconds,
+                question_style=req.preferences.questionStyle,
+            ),
+            study_language=req.study_language or context.study_language,
+            number_of_sessions=MAX_VISIBLE_PLANNER_MODULES,
+            planning_budget_minutes=req.preferences.studyDurationMinutes,
+            week_start_date=context.week_start_date,
+            week_id=context.week_id,
+        )
+        week = PlannerEngine().generate_week(generation_context)
+        additional_modules_remain = _planner_additional_modules_remain(
+            context=context,
+            week=week,
+        )
+        week = replace(
+            week,
+            weekly_statistics=replace(
+                week.weekly_statistics,
+                metadata={
+                    **dict(week.weekly_statistics.metadata or {}),
+                    "max_visible_modules": MAX_VISIBLE_PLANNER_MODULES,
+                    "additional_modules_remain": additional_modules_remain,
+                },
+            ),
+        )
+        planning_parameters = {
+            **build_planning_parameters(generation_context),
+            "studyDurationMinutes": req.preferences.studyDurationMinutes,
+            "questionPaceSeconds": req.preferences.questionPaceSeconds,
+            "maxVisibleModules": MAX_VISIBLE_PLANNER_MODULES,
+            "additionalModulesRemain": additional_modules_remain,
+            "questionStyle": req.preferences.questionStyle,
+            "studyLanguage": req.study_language or context.study_language,
+            "survey": req.survey,
+        }
+        week = repository.save_active_week(
+            project_id=resolved_project_id,
+            week=week,
+            planning_parameters=planning_parameters,
+        )
+
+        response = serialize_planner_state_evaluation(
+            PlannerStateEvaluator(
+                db,
+                repository=repository,
+            ).evaluate(project_id=resolved_project_id)
+        )
+        response["week"] = serialize_planner_domain(week)
+        return response
+    finally:
+        db.close()
+
+
+def _validate_planner_generation_configuration(
+    req: PlannerGenerationConfiguration,
+    project_categories: set,
+    planner_state: PlannerState,
+):
+    if req.preferences.studyDurationMinutes not in {30, 45, 60}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid study duration.",
+        )
+
+    if req.preferences.questionPaceSeconds not in {30, 60, 90, 120}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid question pace.",
+        )
+
+    if req.preferences.questionStyle not in {"exam", "balanced", "reasoning"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid quiz style.",
+        )
+
+    survey = req.survey or {}
+    survey_categories = set(survey.keys())
+    invalid_categories = survey_categories - project_categories
+
+    if invalid_categories:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid survey category.",
+        )
+
+    if planner_state == PlannerState.NEW_PROJECT:
+        missing_categories = project_categories - survey_categories
+
+        if missing_categories:
+            raise HTTPException(
+                status_code=400,
+                detail="Survey is required for every project category.",
+            )
+
+    valid_survey_values = {"confident", "practice", "unsure"}
+
+    if any(value not in valid_survey_values for value in survey.values()):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid survey answer.",
+        )
+
+
+def _planner_additional_modules_remain(context: PlannerContext, week) -> bool:
+    """Return whether project topics remain outside the visible Study Plan."""
+
+    all_topic_ids = {
+        str(topic.id)
+        for topics in context.topics_by_category.values()
+        for topic in topics
+        if getattr(topic, "id", None)
+    }
+    planned_topic_ids = {
+        str(topic.id)
+        for daily_plan in week.daily_plans
+        for allocation in daily_plan.planned_allocations
+        for topic in allocation.selected_topics
+        if getattr(topic, "id", None)
+    }
+
+    return bool(all_topic_ids - planned_topic_ids)
 
 
 # ======================
@@ -5595,6 +5825,121 @@ async def generate_quiz(
 
             return []
 
+    async def generate_missing_explanation(question):
+        """Generate only a missing explanation for an already accepted question."""
+
+        def resolve_correct_answer_text():
+            answer_key = (
+                question.get("correct_answer")
+                if question.get("correct_answer") is not None
+                else question.get("correct", question.get("answer"))
+            )
+            options = question.get("options") or []
+
+            try:
+                if isinstance(answer_key, int):
+                    return options[answer_key]
+
+                if isinstance(answer_key, str):
+                    answer_key = answer_key.strip()
+
+                    if answer_key.isdigit():
+                        return options[int(answer_key)]
+
+                    if len(answer_key) == 1 and answer_key.upper() in "ABCDE":
+                        return options[ord(answer_key.upper()) - ord("A")]
+
+                    return answer_key
+            except Exception:
+                return str(answer_key or "")
+
+            return str(answer_key or "")
+
+        source_chunk_ids = {
+            str(chunk_id)
+            for chunk_id in question.get("source_chunk_ids", [])
+        }
+        explanation_chunks = [
+            chunk
+            for chunk in retrieved_chunks
+            if str(chunk.get("chunk_id")) in source_chunk_ids
+        ] or retrieved_chunks[:10]
+
+        explanation_prompt = f"""
+        Generate ONLY the missing explanation for an existing multiple-choice
+        quiz question.
+
+        Do NOT rewrite the question.
+        Do NOT rewrite answer options.
+        Do NOT change the correct answer.
+        Do NOT add unsupported facts.
+
+        Use the supporting material as the authoritative source.
+
+        LANGUAGE REQUIREMENT:
+        Write the explanation exclusively in {req.language}.
+
+        Return STRICT JSON:
+
+        {{
+            "explanation": "..."
+        }}
+
+        QUESTION:
+        {question.get("question", "")}
+
+        OPTIONS:
+        {json.dumps(question.get("options", []), ensure_ascii=False)}
+
+        CORRECT ANSWER:
+        {resolve_correct_answer_text()}
+
+        SUPPORTING MATERIAL:
+        {json.dumps(explanation_chunks, ensure_ascii=False, indent=2)}
+        """
+
+        for attempt in range(2):
+            try:
+                response = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": explanation_prompt,
+                        }
+                    ],
+                    temperature=0.2,
+                )
+
+                content = (
+                    response
+                    .choices[0]
+                    .message.content
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .strip()
+                )
+
+                data = json.loads(content)
+                explanation = str(data.get("explanation", "")).strip()
+
+                if explanation:
+                    print(
+                        "✅ GENERATED MISSING EXPLANATION "
+                        f"ON ATTEMPT {attempt + 1}"
+                    )
+                    return explanation
+
+            except Exception as explanation_error:
+                print(
+                    "⚠️ MISSING EXPLANATION GENERATION FAILED "
+                    f"ATTEMPT {attempt + 1}:",
+                    repr(explanation_error),
+                )
+
+        return ""
+
     generation_diagnostics = {
         "requested_question_count": req.num_questions,
         "initial_generated": 0,
@@ -6836,7 +7181,7 @@ async def generate_quiz(
                 q["correct_answer"] = int(q["correct_answer"])
             # 🔥 EXPLANATION FALLBACK
 
-            if not q.get("explanation"):
+            if not str(q.get("explanation") or "").strip():
 
                 q["explanation"] = (
                     q.get("explanation_long")
@@ -6844,7 +7189,11 @@ async def generate_quiz(
                     or q.get("rationale")
                     or ""
                 )
-            if not q.get("explanation"):
+
+            if not str(q.get("explanation") or "").strip():
+                q["explanation"] = await generate_missing_explanation(q)
+
+            if not str(q.get("explanation") or "").strip():
 
                 print("⚠️ MISSING EXPLANATION:")
                 print(q.get("question"))
