@@ -89,15 +89,20 @@ class PlannerRepository:
 
         daily_plans = self._load_daily_plans(week_id=week_id)
 
+        planning_parameters = self._json_value(
+            week_row[4],
+            default={},
+        )
+
         return Week(
             id=str(week_row[0]),
             start_date=self._as_date(week_row[1]),
             end_date=self._as_date(week_row[2]),
             status=WeekStatus(str(week_row[3])),
-            study_language=self._json_value(
-                week_row[4],
-                default={},
-            ).get("study_language"),
+            study_language=(
+                planning_parameters.get("study_language")
+                or planning_parameters.get("studyLanguage")
+            ),
             weekly_briefing=week_row[5] or "",
             weekly_statistics=self._build_weekly_statistics(
                 self._json_value(week_row[6], default={})

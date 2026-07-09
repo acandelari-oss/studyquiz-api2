@@ -49,6 +49,8 @@ from planner.planner_state_evaluator import (
     PlannerStateEvaluator,
     serialize_planner_state_evaluation,
 )
+from planner.professor_knowledge import ProfessorKnowledgeBuilder
+from planner.professor_voice import ProfessorVoiceService
 import time
 import re
 
@@ -301,6 +303,23 @@ class PlannerGenerationConfiguration(BaseModel):
     study_language: Optional[str] = "English"
 
 
+class PlannerProfessorActivityDebriefRequest(BaseModel):
+    module_index: int
+    activity_result: dict
+    study_language: Optional[str] = None
+
+
+class PlannerProfessorModuleDebriefRequest(BaseModel):
+    module_index: int
+    module_results: dict
+    study_language: Optional[str] = None
+
+
+class PlannerProfessorStudyPlanDebriefRequest(BaseModel):
+    study_plan_results: dict
+    study_language: Optional[str] = None
+
+
 # ======================
 # HEALTH
 # ======================
@@ -437,6 +456,123 @@ def generate_project_planner_week(
         return response
     finally:
         db.close()
+
+
+@app.post("/projects/{project_id}/planner/professor/activity-debrief")
+def generate_project_planner_activity_debrief(
+    project_id: str,
+    req: PlannerProfessorActivityDebriefRequest,
+):
+    db = SessionLocal()
+    try:
+        knowledge = _build_active_planner_professor_knowledge(
+            db,
+            project_id,
+            study_language=req.study_language,
+        )
+        debrief = ProfessorVoiceService().generate_activity_debrief(
+            knowledge,
+            req.module_index,
+            req.activity_result,
+        )
+        return {"debrief": debrief}
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/professor/module-debrief")
+def generate_project_planner_module_debrief(
+    project_id: str,
+    req: PlannerProfessorModuleDebriefRequest,
+):
+    db = SessionLocal()
+    try:
+        knowledge = _build_active_planner_professor_knowledge(
+            db,
+            project_id,
+            study_language=req.study_language,
+        )
+        debrief = ProfessorVoiceService().generate_module_debrief(
+            knowledge,
+            req.module_index,
+            req.module_results,
+        )
+        return {"debrief": debrief}
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/professor/study-plan-debrief")
+def generate_project_planner_study_plan_debrief(
+    project_id: str,
+    req: PlannerProfessorStudyPlanDebriefRequest,
+):
+    db = SessionLocal()
+    try:
+        knowledge = _build_active_planner_professor_knowledge(
+            db,
+            project_id,
+            study_language=req.study_language,
+        )
+        debrief = ProfessorVoiceService().generate_study_plan_debrief(
+            knowledge,
+            req.study_plan_results,
+        )
+        return {"debrief": debrief}
+    finally:
+        db.close()
+
+
+def _build_active_planner_professor_knowledge(
+    db,
+    project_id: str,
+    study_language: Optional[str] = None,
+):
+    context = build_real_planner_context(db, project_id=project_id)
+
+    if not context.project:
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found for Study Planner.",
+        )
+
+    resolved_project_id = str(context.project["id"])
+    week = PlannerRepository(db).load_active_week(project_id=resolved_project_id)
+
+    if not week:
+        raise HTTPException(
+            status_code=404,
+            detail="No active Study Plan found for this project.",
+        )
+
+    metadata = dict(week.weekly_statistics.metadata or {})
+    max_visible_modules = metadata.get("max_visible_modules")
+    resolved_study_language = (
+        study_language
+        or week.study_language
+        or _json_value(metadata, "study_language")
+        or _json_value(metadata, "studyLanguage")
+        or context.study_language
+    )
+    context = replace(context, study_language=resolved_study_language)
+    week = replace(week, study_language=resolved_study_language)
+
+    return ProfessorKnowledgeBuilder().build(
+        context=context,
+        week=week,
+        max_visible_modules=(
+            int(max_visible_modules)
+            if isinstance(max_visible_modules, int)
+            else None
+        ),
+        additional_modules_remain=metadata.get("additional_modules_remain"),
+    )
+
+
+def _json_value(value, key: str):
+    if isinstance(value, dict):
+        return value.get(key)
+    return None
 
 
 def _validate_planner_generation_configuration(
