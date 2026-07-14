@@ -45,7 +45,7 @@ def calculate_priority_score(
     if coverage is not None:
         coverage_score = (1.0 - _clamp(coverage)) * COVERAGE_WEIGHT
 
-    manual_priority_score = max(priority_weight - 1.0, 0.0) * MANUAL_PRIORITY_WEIGHT
+    manual_priority_score = (priority_weight - 1.0) * MANUAL_PRIORITY_WEIGHT
 
     return round(
         performance_score + recency_score + coverage_score + manual_priority_score,
@@ -57,4 +57,3 @@ def _clamp(value: float) -> float:
     """Clamp a normalized analytics value to the 0.0-1.0 range."""
 
     return min(max(value, 0.0), 1.0)
-

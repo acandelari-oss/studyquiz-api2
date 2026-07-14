@@ -214,7 +214,10 @@ class ProfessorModuleComposer:
                 * self.SECONDS_PER_MINUTE
                 / question_pace_seconds
             )
-            estimated_questions = min(estimated_questions, max_questions)
+            estimated_questions = min(
+                max(estimated_questions, minimum_count),
+                max_questions,
+            )
 
             if estimated_questions < minimum_count:
                 return None
@@ -228,7 +231,10 @@ class ProfessorModuleComposer:
                 * self.SECONDS_PER_MINUTE
                 / self.FLASHCARD_SECONDS
             )
-            estimated_flashcards = min(estimated_flashcards, max_flashcards)
+            estimated_flashcards = min(
+                max(estimated_flashcards, minimum_count),
+                max_flashcards,
+            )
 
             if estimated_flashcards < minimum_count:
                 return None

@@ -161,6 +161,7 @@ class Week:
     id: str
     start_date: date
     end_date: date
+    plan_type: str = "study_plan"
     study_language: Optional[str] = None
     status: WeekStatus = WeekStatus.PLANNED
     weekly_briefing: str = ""

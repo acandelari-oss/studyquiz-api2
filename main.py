@@ -51,6 +51,10 @@ from planner.planner_state_evaluator import (
 )
 from planner.professor_knowledge import ProfessorKnowledgeBuilder
 from planner.professor_voice import ProfessorVoiceService
+from planner.survey_bootstrap import (
+    apply_survey_bootstrap_bias,
+    should_apply_survey_bootstrap,
+)
 import time
 import re
 
@@ -315,6 +319,25 @@ class PlannerProfessorModuleDebriefRequest(BaseModel):
     study_language: Optional[str] = None
 
 
+class PlannerProfessorHomeworkRecommendationRequest(BaseModel):
+    module_index: int
+    module_results: dict
+    study_language: Optional[str] = None
+
+
+class PlannerProfessorModuleQuestionMessage(BaseModel):
+    role: str
+    content: str
+
+
+class PlannerProfessorModuleQuestionRequest(BaseModel):
+    module_index: int
+    question: str
+    module_results: dict
+    conversation: Optional[List[PlannerProfessorModuleQuestionMessage]] = None
+    study_language: Optional[str] = None
+
+
 class PlannerProfessorStudyPlanDebriefRequest(BaseModel):
     study_plan_results: dict
     study_language: Optional[str] = None
@@ -399,11 +422,28 @@ def generate_project_planner_week(
             planner_state=evaluation.state,
         )
 
+        analytics = context.analytics
+        if should_apply_survey_bootstrap(
+            survey=req.survey,
+            is_first_study_plan=not _project_has_planner_week_history(
+                db,
+                resolved_project_id,
+            ),
+            has_objective_learning_evidence=_project_has_objective_learning_evidence(
+                db,
+                resolved_project_id,
+            ),
+        ):
+            analytics = apply_survey_bootstrap_bias(
+                analytics=context.analytics,
+                survey=req.survey,
+            )
+
         generation_context = PlannerContext(
             project=context.project,
             categories=context.categories,
             topics_by_category=context.topics_by_category,
-            analytics=context.analytics,
+            analytics=analytics,
             preferences=PlannerPreferences(
                 question_pace_seconds=req.preferences.questionPaceSeconds,
                 question_style=req.preferences.questionStyle,
@@ -432,6 +472,12 @@ def generate_project_planner_week(
         )
         planning_parameters = {
             **build_planning_parameters(generation_context),
+            "plan_type": "study_plan",
+            "onboarding_mode": (
+                "self_assessment"
+                if req.survey
+                else "planner_configuration"
+            ),
             "studyDurationMinutes": req.preferences.studyDurationMinutes,
             "questionPaceSeconds": req.preferences.questionPaceSeconds,
             "maxVisibleModules": MAX_VISIBLE_PLANNER_MODULES,
@@ -454,6 +500,124 @@ def generate_project_planner_week(
         )
         response["week"] = serialize_planner_domain(week)
         return response
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/assessment/generate")
+def generate_project_planner_assessment(
+    project_id: str,
+    req: PlannerGenerationConfiguration,
+):
+    db = SessionLocal()
+    try:
+        context = build_real_planner_context(db, project_id=project_id)
+
+        if not context.project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found for Study Planner.",
+            )
+
+        resolved_project_id = str(context.project["id"])
+        repository = PlannerRepository(db)
+        evaluation = PlannerStateEvaluator(
+            db,
+            repository=repository,
+        ).evaluate(project_id=resolved_project_id)
+
+        if evaluation.state == PlannerState.ACTIVE_WEEK:
+            response = serialize_planner_state_evaluation(evaluation)
+            response["week"] = serialize_planner_domain(evaluation.active_week)
+            return response
+
+        validation_req = req.model_copy(update={"survey": None})
+        _validate_planner_generation_configuration(
+            req=validation_req,
+            project_categories=set(context.categories),
+            planner_state=PlannerState.READY_FOR_FIRST_PLAN,
+        )
+
+        generation_context = PlannerContext(
+            project=context.project,
+            categories=context.categories,
+            topics_by_category=context.topics_by_category,
+            analytics=context.analytics,
+            preferences=PlannerPreferences(
+                question_pace_seconds=req.preferences.questionPaceSeconds,
+                question_style=req.preferences.questionStyle,
+            ),
+            study_language=req.study_language or context.study_language,
+            number_of_sessions=0,
+            planning_budget_minutes=req.preferences.studyDurationMinutes,
+            week_start_date=context.week_start_date,
+            week_id=f"{context.project['id']}-assessment-{context.week_start_date.isoformat()}",
+        )
+        week = PlannerEngine().generate_assessment_week(generation_context)
+        planning_parameters = {
+            **build_planning_parameters(generation_context),
+            "plan_type": "assessment",
+            "onboarding_mode": "professor_assessment",
+            "studyDurationMinutes": req.preferences.studyDurationMinutes,
+            "questionPaceSeconds": req.preferences.questionPaceSeconds,
+            "questionStyle": req.preferences.questionStyle,
+            "studyLanguage": req.study_language or context.study_language,
+            "survey": None,
+        }
+        week = repository.save_active_week(
+            project_id=resolved_project_id,
+            week=week,
+            planning_parameters=planning_parameters,
+        )
+
+        response = serialize_planner_state_evaluation(
+            PlannerStateEvaluator(
+                db,
+                repository=repository,
+            ).evaluate(project_id=resolved_project_id)
+        )
+        response["week"] = serialize_planner_domain(week)
+        return response
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/assessment/complete")
+def complete_project_planner_assessment(project_id: str):
+    db = SessionLocal()
+    try:
+        context = build_real_planner_context(db, project_id=project_id)
+
+        if not context.project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found for Study Planner.",
+            )
+
+        repository = PlannerRepository(db)
+        active_week = repository.load_active_week(project_id=str(context.project["id"]))
+
+        if not active_week:
+            return serialize_planner_state_evaluation(
+                PlannerStateEvaluator(
+                    db,
+                    repository=repository,
+                ).evaluate(project_id=str(context.project["id"]))
+            )
+
+        if active_week.plan_type != "assessment":
+            raise HTTPException(
+                status_code=400,
+                detail="Active Planner plan is not an assessment.",
+            )
+
+        repository.complete_active_week(project_id=str(context.project["id"]))
+        return serialize_planner_state_evaluation(
+            PlannerStateEvaluator(
+                db,
+                repository=repository,
+            ).evaluate(project_id=str(context.project["id"]))
+        )
     finally:
         db.close()
 
@@ -498,6 +662,65 @@ def generate_project_planner_module_debrief(
             req.module_results,
         )
         return {"debrief": debrief}
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/professor/homework-recommendation")
+def generate_project_planner_homework_recommendation(
+    project_id: str,
+    req: PlannerProfessorHomeworkRecommendationRequest,
+):
+    db = SessionLocal()
+    try:
+        knowledge = _build_active_planner_professor_knowledge(
+            db,
+            project_id,
+            study_language=req.study_language,
+        )
+        homework = ProfessorVoiceService().generate_homework_recommendation(
+            knowledge,
+            req.module_index,
+            req.module_results,
+        )
+        return {
+            "homework_recommendation": {
+                "text": homework,
+                "rationale": "",
+                "related_categories": [],
+                "estimated_effort": 10,
+            }
+        }
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/professor/module-question")
+def answer_project_planner_module_question(
+    project_id: str,
+    req: PlannerProfessorModuleQuestionRequest,
+):
+    db = SessionLocal()
+    try:
+        knowledge = _build_active_planner_professor_knowledge(
+            db,
+            project_id,
+            study_language=req.study_language,
+        )
+        answer = ProfessorVoiceService().generate_module_question_answer(
+            knowledge,
+            req.module_index,
+            req.module_results,
+            req.question,
+            [
+                {
+                    "role": message.role,
+                    "content": message.content,
+                }
+                for message in (req.conversation or [])
+            ],
+        )
+        return {"answer": answer}
     finally:
         db.close()
 
@@ -624,6 +847,51 @@ def _validate_planner_generation_configuration(
             status_code=400,
             detail="Invalid survey answer.",
         )
+
+
+def _project_has_planner_week_history(db, project_id: str) -> bool:
+    return bool(
+        db.execute(
+            text("""
+                select 1
+                from planner_weeks
+                where project_id = :project_id
+                limit 1
+            """),
+            {"project_id": project_id},
+        ).fetchone()
+    )
+
+
+def _project_has_objective_learning_evidence(db, project_id: str) -> bool:
+    quiz_evidence = db.execute(
+        text("""
+            select 1
+            from quiz_answers qa
+            join quiz_questions qq
+                on qq.id = qa.question_id
+            join quizzes q
+                on q.id = qq.quiz_id
+            where q.project_id = :project_id
+            limit 1
+        """),
+        {"project_id": project_id},
+    ).fetchone()
+
+    if quiz_evidence:
+        return True
+
+    flashcard_evidence = db.execute(
+        text("""
+            select 1
+            from flashcard_reviews
+            where project_id = :project_id
+            limit 1
+        """),
+        {"project_id": project_id},
+    ).fetchone()
+
+    return bool(flashcard_evidence)
 
 
 def _planner_additional_modules_remain(context: PlannerContext, week) -> bool:

@@ -152,7 +152,9 @@ class PlannerApiTests(unittest.TestCase):
                 ('project-low', 'Low Coverage', '2026-06-28', 'user-1', 'completed', 'en'),
                 ('project-ready', 'Ready Coverage', '2026-06-29', 'user-1', 'completed', 'en'),
                 ('project-active', 'Active Week', '2026-06-30', 'user-1', 'completed', 'en'),
-                ('project-generated-only', 'Generated Only', '2026-07-01', 'user-1', 'completed', 'en')
+                ('project-generated-only', 'Generated Only', '2026-07-01', 'user-1', 'completed', 'en'),
+                ('project-survey-only', 'Survey Only', '2026-07-02', 'user-1', 'completed', 'en'),
+                ('project-assessment', 'Assessment Project', '2026-07-03', 'user-1', 'completed', 'en')
             """))
             db.execute(text("""
                 insert into topics
@@ -170,7 +172,13 @@ class PlannerApiTests(unittest.TestCase):
                 ('active-topic-1', 'project-active', 'ACTIVE', 'Active 1', true),
                 ('active-topic-2', 'project-active', 'ACTIVE', 'Active 2', true),
                 ('generated-topic-1', 'project-generated-only', 'GENERATED', 'Generated 1', true),
-                ('generated-topic-2', 'project-generated-only', 'GENERATED', 'Generated 2', true)
+                ('generated-topic-2', 'project-generated-only', 'GENERATED', 'Generated 2', true),
+                ('survey-topic-1', 'project-survey-only', 'A_CONFIDENT', 'A Topic', true),
+                ('survey-topic-2', 'project-survey-only', 'B_PRACTICE', 'B Topic', true),
+                ('survey-topic-3', 'project-survey-only', 'C_UNSURE', 'C Topic', true),
+                ('assessment-topic-1', 'project-assessment', 'A', 'A Topic 1', true),
+                ('assessment-topic-2', 'project-assessment', 'A', 'A Topic 2', true),
+                ('assessment-topic-3', 'project-assessment', 'B', 'B Topic 1', true)
             """))
             db.execute(text("""
                 insert into quizzes (id, project_id, user_id)
@@ -418,6 +426,41 @@ class PlannerApiTests(unittest.TestCase):
             )
         )
 
+    def test_generate_week_uses_survey_as_first_plan_bootstrap_bias(self):
+        client = TestClient(app)
+
+        payload = {
+            "survey": {
+                "A_CONFIDENT": "confident",
+                "B_PRACTICE": "practice",
+                "C_UNSURE": "unsure",
+            },
+            "preferences": {
+                "studyDurationMinutes": 45,
+                "questionPaceSeconds": 90,
+                "questionStyle": "balanced",
+            },
+        }
+
+        with patch.object(main, "SessionLocal", self._session):
+            response = client.post(
+                "/projects/project-survey-only/planner/week/generate",
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        scheduled_categories = [
+            allocation["category"]
+            for daily_plan in data["week"]["daily_plans"]
+            for allocation in daily_plan["planned_allocations"]
+        ]
+
+        self.assertEqual(
+            scheduled_categories,
+            ["B_PRACTICE", "C_UNSURE", "A_CONFIDENT"],
+        )
+
     def test_generate_week_rejects_invalid_survey_category(self):
         client = TestClient(app)
 
@@ -450,6 +493,127 @@ class PlannerApiTests(unittest.TestCase):
                 """)).scalar(),
                 0,
             )
+
+    def test_generate_assessment_ignores_survey_and_persists_plan_type(self):
+        client = TestClient(app)
+
+        payload = {
+            "survey": {
+                "NOT USED": "practice",
+            },
+            "study_language": "Italian",
+            "preferences": {
+                "studyDurationMinutes": 30,
+                "questionPaceSeconds": 60,
+                "questionStyle": "exam",
+            },
+        }
+
+        with patch.object(main, "SessionLocal", self._session):
+            response = client.post(
+                "/projects/project-assessment/planner/assessment/generate",
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["state"], "ACTIVE_WEEK")
+        self.assertEqual(data["week"]["plan_type"], "assessment")
+
+        activities = [
+            activity
+            for daily_plan in data["week"]["daily_plans"]
+            for activity in daily_plan["activities"]
+        ]
+        self.assertTrue(activities)
+        self.assertTrue(all(activity["type"] == "QUIZ" for activity in activities))
+        self.assertTrue(
+            all(
+                activity["configuration"]["num_questions"]
+                >= len(activity["configuration"]["selected_topics"])
+                for activity in activities
+            )
+        )
+
+        selected_topic_titles = [
+            topic["title"]
+            for daily_plan in data["week"]["daily_plans"]
+            for allocation in daily_plan["planned_allocations"]
+            for topic in allocation["selected_topics"]
+        ]
+        self.assertEqual(
+            selected_topic_titles,
+            ["A Topic 1", "A Topic 2", "B Topic 1"],
+        )
+
+        with self.engine.connect() as db:
+            row = db.execute(text("""
+                select planning_parameters
+                from planner_weeks
+                where project_id = 'project-assessment'
+            """)).fetchone()
+            planning_parameters = json.loads(row[0])
+
+        self.assertEqual(planning_parameters["plan_type"], "assessment")
+        self.assertEqual(
+            planning_parameters["onboarding_mode"],
+            "professor_assessment",
+        )
+        self.assertIsNone(planning_parameters["survey"])
+
+        with patch.object(main, "SessionLocal", self._session):
+            reload_response = client.get(
+                "/projects/project-assessment/planner/week",
+            )
+
+        self.assertEqual(reload_response.status_code, 200)
+        self.assertEqual(reload_response.json()["week"]["plan_type"], "assessment")
+
+    def test_completed_assessment_no_longer_blocks_normal_generation(self):
+        client = TestClient(app)
+        assessment_payload = {
+            "survey": None,
+            "preferences": {
+                "studyDurationMinutes": 30,
+                "questionPaceSeconds": 60,
+                "questionStyle": "balanced",
+            },
+        }
+
+        with patch.object(main, "SessionLocal", self._session):
+            create_response = client.post(
+                "/projects/project-assessment/planner/assessment/generate",
+                json=assessment_payload,
+            )
+            complete_response = client.post(
+                "/projects/project-assessment/planner/assessment/complete",
+            )
+
+        self.assertEqual(create_response.status_code, 200)
+        self.assertEqual(complete_response.status_code, 200)
+
+        study_plan_payload = {
+            "survey": {
+                "A": "practice",
+                "B": "unsure",
+            },
+            "preferences": {
+                "studyDurationMinutes": 30,
+                "questionPaceSeconds": 60,
+                "questionStyle": "balanced",
+            },
+        }
+
+        with patch.object(main, "SessionLocal", self._session):
+            response = client.post(
+                "/projects/project-assessment/planner/week/generate",
+                json=study_plan_payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["state"], "ACTIVE_WEEK")
+        self.assertEqual(data["week"]["plan_type"], "study_plan")
 
     def test_generate_week_rejects_invalid_quiz_style(self):
         client = TestClient(app)

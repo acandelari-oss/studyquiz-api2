@@ -11,7 +11,15 @@ from .professor_bridge import ProfessorBridge
 from .professor_daily_strategy import ProfessorDailyStrategyBuilder
 from .professor_knowledge import ProfessorKnowledge, ProfessorKnowledgeBuilder
 from .professor_module_composer import ProfessorModule, ProfessorModuleComposer
-from .professor_strategy import ProfessorWeeklyStrategyBuilder
+from .professor_strategy import (
+    ProfessorCategoryStrategy,
+    ProfessorCategoryStrategyCode,
+    ProfessorDepthCode,
+    ProfessorReasoningCode,
+    ProfessorWeeklyGoalCode,
+    ProfessorWeeklyStrategy,
+    ProfessorWeeklyStrategyBuilder,
+)
 from .professor_voice import ProfessorVoiceService
 from .session_allocator import CategoryAllocation, SessionAllocator
 from .weekly_scheduler import WeeklyScheduler
@@ -98,6 +106,53 @@ class PlannerEngine:
             knowledge=self.last_professor_knowledge,
         )
 
+    def generate_assessment_week(self, context: PlannerContext) -> Week:
+        """Generate a quiz-only assessment plan in Topic View order.
+
+        Assessment is evidence collection. It deliberately bypasses category
+        priority scoring and Professor strategy decisions while reusing the
+        existing allocator, activity planner, domain shape, and persistence.
+        """
+
+        category_allocations = self._allocate_categories(
+            context=context,
+            ordered_categories=context.categories,
+        )
+        modules = self.professor_module_composer.compose_modules(
+            context=context,
+            weekly_strategy=self._assessment_weekly_strategy(context),
+            allocations=category_allocations,
+            max_visible_modules=None,
+        )
+        daily_plans = tuple(
+            self._build_daily_plan(
+                week_id=context.week_id or self._assessment_week_id(context),
+                week_start_date=context.week_start_date or date.today(),
+                module=module,
+            )
+            for module in modules
+        )
+        daily_plans = tuple(
+            self.activity_planner.plan_daily_plans(
+                context=context,
+                daily_plans=daily_plans,
+                daily_strategies=tuple(module.daily_strategy for module in modules),
+            )
+        )
+        start_date = context.week_start_date or date.today()
+        week = Week(
+            id=context.week_id or self._assessment_week_id(context),
+            start_date=start_date,
+            end_date=start_date + timedelta(days=6),
+            plan_type="assessment",
+            study_language=context.study_language,
+            status=WeekStatus.PLANNED,
+            daily_plans=daily_plans,
+            weekly_briefing="",
+        )
+        self.last_professor_knowledge = None
+        return week
+
     def _add_professor_voice(
         self,
         week: Week,
@@ -150,6 +205,37 @@ class PlannerEngine:
             )
 
         return tuple(allocations)
+
+    def _assessment_weekly_strategy(
+        self,
+        context: PlannerContext,
+    ) -> ProfessorWeeklyStrategy:
+        """Return a neutral quiz-only strategy for assessment evidence collection."""
+
+        category_strategies = tuple(
+            ProfessorCategoryStrategy(
+                category=category,
+                strategy=ProfessorCategoryStrategyCode.EXPLORE,
+                depth=ProfessorDepthCode.DEEP,
+                reasoning_code=ProfessorReasoningCode.INSUFFICIENT_EVIDENCE,
+            )
+            for category in context.categories
+        )
+        return ProfessorWeeklyStrategy(
+            weekly_goal_code=ProfessorWeeklyGoalCode.CALIBRATE_COVERAGE,
+            category_strategies=category_strategies,
+            priority_categories=(),
+            secondary_categories=tuple(context.categories),
+        )
+
+    def _assessment_week_id(self, context: PlannerContext) -> str:
+        start_date = context.week_start_date or date.today()
+        project_id = None
+        if isinstance(context.project, Mapping):
+            project_id = context.project.get("id")
+        else:
+            project_id = getattr(context.project, "id", None)
+        return f"{project_id or 'project'}-assessment-{start_date.isoformat()}"
 
     def _build_week(
         self,

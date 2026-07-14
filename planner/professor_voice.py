@@ -23,6 +23,8 @@ COMMUNICATION_TYPE_MODULE_OBJECTIVE = "MODULE_OBJECTIVE"
 COMMUNICATION_TYPE_ACTIVITY_DEBRIEF = "ACTIVITY_DEBRIEF"
 COMMUNICATION_TYPE_MODULE_DEBRIEF = "MODULE_DEBRIEF"
 COMMUNICATION_TYPE_STUDY_PLAN_DEBRIEF = "STUDY_PLAN_DEBRIEF"
+COMMUNICATION_TYPE_HOMEWORK_RECOMMENDATION = "HOMEWORK_RECOMMENDATION"
+COMMUNICATION_TYPE_MODULE_QUESTION = "MODULE_QUESTION"
 
 
 class ProfessorVoiceValidator:
@@ -106,6 +108,30 @@ class ProfessorVoiceValidator:
         r"\bcompletare il modulo\b",
         r"\bstudieremo\b",
         r"\btratteremo\b",
+    )
+    GENERIC_HOMEWORK_PATTERNS = (
+        r"\breview\b",
+        r"\bstudy again\b",
+        r"\bstudy the material\b",
+        r"\blearn more\b",
+        r"\bgo over\b",
+        r"\bripassa\b",
+        r"\brivedi\b",
+        r"\bstudia di nuovo\b",
+        r"\bstudia il materiale\b",
+        r"\bapprofondisci\b",
+    )
+    MULTI_TASK_HOMEWORK_PATTERNS = (
+        r"\bin addition\b",
+        r"\balso complete\b",
+        r"\balso do\b",
+        r"\bseparate task\b",
+        r"\bsecond task\b",
+        r"\bthen do another\b",
+        r"\binoltre\b",
+        r"\bfai anche\b",
+        r"\bsecondo compito\b",
+        r"\bun compito separato\b",
     )
     INSTITUTIONAL_OBJECTIVE_PATTERNS = (
         r"\bstudents? should\b",
@@ -456,6 +482,95 @@ class ProfessorVoiceValidator:
 
         return True
 
+    def validate_homework_recommendation(
+        self,
+        homework: str,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_debrief: str = "",
+    ) -> bool:
+        """Return whether a Homework recommendation respects Professor Voice constraints."""
+
+        text = " ".join(str(homework or "").split())
+
+        if not text:
+            return False
+
+        if len(text.split()) > 80:
+            return False
+
+        lower_text = text.lower()
+
+        if any(term in lower_text for term in self.FORBIDDEN_TERMS):
+            return False
+
+        if self._looks_like_category_list(lower_text, knowledge):
+            return False
+
+        if self._looks_like_visible_statistics(lower_text):
+            return False
+
+        if self._looks_like_topic_list(lower_text):
+            return False
+
+        if self._sounds_like_documentation(lower_text):
+            return False
+
+        if self._looks_like_module_category_enumeration(lower_text, knowledge, module_index):
+            return False
+
+        if self._looks_like_module_topic_enumeration(lower_text, knowledge, module_index):
+            return False
+
+        if self._repeats_score(lower_text):
+            return False
+
+        if not self._addresses_learner_directly(lower_text):
+            return False
+
+        if self._is_generic_homework(lower_text):
+            return False
+
+        if self._contains_multiple_unrelated_homework_tasks(lower_text):
+            return False
+
+        if module_debrief and self._substantially_repeats(lower_text, module_debrief):
+            return False
+
+        return True
+
+    def validate_module_question_answer(
+        self,
+        answer: str,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+    ) -> bool:
+        """Return whether an Ask-the-Professor answer respects Voice constraints."""
+
+        text = " ".join(str(answer or "").split())
+
+        if not text:
+            return False
+
+        if len(text.split()) > 180:
+            return False
+
+        lower_text = text.lower()
+
+        if any(term in lower_text for term in self.FORBIDDEN_TERMS):
+            return False
+
+        if self._looks_like_visible_statistics(lower_text):
+            return False
+
+        if self._repeats_score(lower_text):
+            return False
+
+        if not self._addresses_learner_directly(lower_text):
+            return False
+
+        return True
+
     def _mentions_quiz(self, lower_text: str) -> bool:
         return any(term in lower_text for term in ("quiz", "questionari"))
 
@@ -567,6 +682,18 @@ class ProfessorVoiceValidator:
             for pattern in self.GENERIC_OBJECTIVE_PATTERNS
         )
 
+    def _is_generic_homework(self, lower_text: str) -> bool:
+        return any(
+            re.search(pattern, lower_text)
+            for pattern in self.GENERIC_HOMEWORK_PATTERNS
+        )
+
+    def _contains_multiple_unrelated_homework_tasks(self, lower_text: str) -> bool:
+        return any(
+            re.search(pattern, lower_text)
+            for pattern in self.MULTI_TASK_HOMEWORK_PATTERNS
+        )
+
     def _is_institutional_objective(self, lower_text: str) -> bool:
         return any(
             re.search(pattern, lower_text)
@@ -602,6 +729,26 @@ class ProfessorVoiceValidator:
             re.search(pattern, lower_text)
             for pattern in self.MODULE_ENUMERATION_PATTERNS
         )
+
+    def _substantially_repeats(
+        self,
+        lower_text: str,
+        comparison_text: str,
+    ) -> bool:
+        comparison_words = {
+            word
+            for word in re.findall(r"\b[\wÀ-ÿ']{5,}\b", str(comparison_text or "").lower())
+        }
+        homework_words = {
+            word
+            for word in re.findall(r"\b[\wÀ-ÿ']{5,}\b", lower_text)
+        }
+
+        if len(homework_words) < 6 or len(comparison_words) < 6:
+            return False
+
+        overlap = homework_words.intersection(comparison_words)
+        return len(overlap) / len(homework_words) >= 0.65
 
     def _looks_like_module_category_enumeration(
         self,
@@ -899,6 +1046,81 @@ class ProfessorVoiceService:
 
         return debrief or fallback
 
+    def generate_homework_recommendation(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+    ) -> str:
+        """Generate one Professor Homework recommendation after a module debrief."""
+
+        fallback = self._fallback_homework_recommendation(
+            knowledge,
+            module_index,
+            module_results,
+        )
+
+        try:
+            homework = self._generate_homework_recommendation_with_llm(
+                knowledge,
+                module_index,
+                module_results,
+            ).strip()
+        except Exception as error:
+            print("⚠️ PROFESSOR HOMEWORK FALLBACK:", repr(error))
+            return fallback
+
+        module_debrief = self._activity_result_value(module_results, "professor_debrief") or ""
+
+        if not self.validator.validate_homework_recommendation(
+            homework,
+            knowledge,
+            module_index,
+            module_debrief,
+        ):
+            print("⚠️ PROFESSOR HOMEWORK VALIDATION FAILED — USING FALLBACK")
+            return fallback
+
+        return homework or fallback
+
+    def generate_module_question_answer(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+        question: str,
+        conversation: Optional[list[dict[str, str]]] = None,
+    ) -> str:
+        """Answer an optional learner question about a completed module."""
+
+        fallback = self._fallback_module_question_answer(
+            knowledge,
+            module_index,
+            question,
+        )
+
+        try:
+            answer = self._generate_module_question_answer_with_llm(
+                knowledge,
+                module_index,
+                module_results,
+                question,
+                conversation or [],
+            ).strip()
+        except Exception as error:
+            print("⚠️ PROFESSOR MODULE QUESTION FALLBACK:", repr(error))
+            return fallback
+
+        if not self.validator.validate_module_question_answer(
+            answer,
+            knowledge,
+            module_index,
+        ):
+            print("⚠️ PROFESSOR MODULE QUESTION VALIDATION FAILED — USING FALLBACK")
+            return fallback
+
+        return answer or fallback
+
     def generate_study_plan_debrief(
         self,
         knowledge: ProfessorKnowledge,
@@ -979,6 +1201,38 @@ class ProfessorVoiceService:
         )
         raw_output = self._generate_raw_output(prompt)
         return self._extract_json_field(raw_output, "debrief")
+
+    def _generate_homework_recommendation_with_llm(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+    ) -> str:
+        prompt = self._build_homework_recommendation_prompt(
+            knowledge,
+            module_index,
+            module_results,
+        )
+        raw_output = self._generate_raw_output(prompt)
+        return self._extract_json_field(raw_output, "homework")
+
+    def _generate_module_question_answer_with_llm(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+        question: str,
+        conversation: list[dict[str, str]],
+    ) -> str:
+        prompt = self._build_module_question_prompt(
+            knowledge,
+            module_index,
+            module_results,
+            question,
+            conversation,
+        )
+        raw_output = self._generate_raw_output(prompt)
+        return self._extract_json_field(raw_output, "answer")
 
     def _generate_study_plan_debrief_with_llm(
         self,
@@ -1381,6 +1635,138 @@ INPUT:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """
 
+    def _build_homework_recommendation_prompt(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+    ) -> str:
+        module_context = self._module_context(knowledge, module_index)
+        homework_context = self._homework_recommendation_context(
+            knowledge,
+            module_index,
+            module_results,
+        )
+        payload = {
+            "communication_type": COMMUNICATION_TYPE_HOMEWORK_RECOMMENDATION,
+            "module_index": module_index,
+            "professor_identity": self._to_jsonable(self.identity),
+            "professor_knowledge": self._to_jsonable(knowledge),
+            "current_module": self._to_jsonable(module_context),
+            "homework_context": self._to_jsonable(homework_context),
+        }
+
+        return f"""
+You are writing ONE Homework recommendation as the Professor immediately after
+the Module Debrief.
+
+This is not a new activity and not a second debrief. It is one short,
+practical learning action the learner can do independently in approximately
+5-15 minutes.
+
+Use only Professor Identity, ProfessorKnowledge, current_module, and
+homework_context. Do not inspect or invent anything else.
+current_module.teaching_context is the deterministic teaching interpretation
+for this module. homework_context contains the runtime module result and
+performance level.
+
+The Homework recommendation must:
+1. Address the learner directly in second person.
+2. Describe exactly ONE concrete action.
+3. Take approximately 5-15 minutes.
+4. Reinforce weak areas when performance is low.
+5. Consolidate understanding when performance is high.
+6. Be educationally meaningful and connected to the module's teaching context.
+
+Do not simply say "review", "study again", "go over the material", or similar
+generic instructions. The recommendation must tell the learner what to do and
+how to do it, without enumerating categories or topics.
+
+STYLE:
+- Experienced university professor.
+- Calm, concrete, concise, evidence-based.
+- One coherent paragraph.
+- Target length: 40-70 words.
+- Do not enumerate module categories or topics.
+- Do not repeat the Module Debrief.
+- Do not mention scores, accuracy, activity counts, question counts, or visible
+  dashboard statistics.
+- Do not mention Planner, algorithm, GPT, AI, system, application, software,
+  implementation, prompts, or internal codes.
+- Write entirely in ProfessorKnowledge.study_language.
+
+Return ONLY valid JSON with this shape:
+{{"homework": "..."}}
+
+INPUT:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+
+    def _build_module_question_prompt(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+        question: str,
+        conversation: list[dict[str, str]],
+    ) -> str:
+        module_context = self._module_context(knowledge, module_index)
+        module_question_context = self._module_question_context(
+            knowledge,
+            module_index,
+            module_results,
+            question,
+            conversation,
+        )
+        payload = {
+            "communication_type": COMMUNICATION_TYPE_MODULE_QUESTION,
+            "module_index": module_index,
+            "professor_identity": self._to_jsonable(self.identity),
+            "professor_knowledge": self._to_jsonable(knowledge),
+            "current_module": self._to_jsonable(module_context),
+            "module_question_context": self._to_jsonable(module_question_context),
+        }
+
+        return f"""
+You are answering a learner's optional question after a completed Study Plan
+module.
+
+This is Ask the Professor for the Module Debrief. It is not a new planning
+decision, not a new activity, and not a general chatbot conversation.
+
+Use only Professor Identity, ProfessorKnowledge, current_module, and
+module_question_context. Do not inspect or invent anything else.
+current_module.teaching_context is the deterministic teaching interpretation
+for this module. module_question_context contains the completed module result,
+Professor Debrief, Homework recommendation, short conversation history, and
+the learner's latest question.
+
+The answer must:
+1. Address the learner directly in second person.
+2. Answer concisely as a university professor.
+3. Use only the material and runtime evidence from the completed module.
+4. Explain concepts educationally, not procedurally.
+5. If the question is unrelated to the completed module, answer briefly and
+   gently bring the focus back to the studied material.
+
+STYLE:
+- Experienced university professor.
+- Calm, clear, encouraging, academically precise.
+- One or two short paragraphs.
+- Target length: 60-140 words.
+- Do not enumerate quiz questions, categories, or topics.
+- Do not repeat scores, accuracy, question counts, or dashboard statistics.
+- Do not mention Planner, algorithm, GPT, AI, system, application, software,
+  implementation, prompts, or internal codes.
+- Write entirely in ProfessorKnowledge.study_language.
+
+Return ONLY valid JSON with this shape:
+{{"answer": "..."}}
+
+INPUT:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+
     def _build_study_plan_debrief_prompt(
         self,
         knowledge: ProfessorKnowledge,
@@ -1550,6 +1936,58 @@ INPUT:
             return self._fallback_module_debrief_italian(module_context)
 
         return self._fallback_module_debrief_english(module_context)
+
+    def _fallback_homework_recommendation(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+    ) -> str:
+        homework_context = self._homework_recommendation_context(
+            knowledge,
+            module_index,
+            module_results,
+        )
+
+        if self._is_italian(knowledge.study_language):
+            return self._fallback_homework_recommendation_italian(homework_context)
+
+        return self._fallback_homework_recommendation_english(homework_context)
+
+    def _fallback_module_question_answer(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        question: str,
+    ) -> str:
+        teaching_context = self._teaching_context(knowledge, module_index)
+        focus = getattr(teaching_context, "expected_mastery", "") or ""
+        focus = self._second_person_mastery(focus)
+
+        if self._is_italian(knowledge.study_language):
+            if focus:
+                return (
+                    f"La domanda è utile perché riguarda il modo in cui dovresti orientare il ragionamento dopo questo modulo. "
+                    f"Il punto centrale è questo: {focus} "
+                    "Se qualcosa resta incerto, torna al collegamento tra idea principale ed esempio, perché lì di solito si chiarisce la distinzione più importante."
+                )
+
+            return (
+                "La domanda è utile, ma posso rispondere solo restando nel perimetro del modulo appena concluso. "
+                "Concentrati sul rapporto tra ciò che ti è sembrato stabile e ciò che richiede ancora una distinzione più precisa: è da lì che il lavoro successivo diventa più efficace."
+            )
+
+        if focus:
+            return (
+                f"Your question is useful because it goes to how you should organise the reasoning after this module. "
+                f"The central point is this: {focus} "
+                "If something still feels uncertain, return to the link between the main idea and a concrete example, because that is usually where the important distinction becomes clearer."
+            )
+
+        return (
+            "Your question is useful, but I can answer it only within the scope of the module you have just completed. "
+            "Focus on the relationship between what felt stable and what still needs a sharper distinction; that is where the next step becomes more effective."
+        )
 
     def _fallback_study_plan_debrief(
         self,
@@ -1724,6 +2162,104 @@ INPUT:
             "Hai completato questo modulo, e ora il passaggio importante è trasformare il lavoro svolto in orientamento per ciò che segue. "
             "Usa le idee che ti sono sembrate sicure come punti di appoggio, e considera quelle incerte come segnali di rinforzo. "
             "Il modulo successivo dovrebbe costruire continuità da qui, non apparire come un blocco separato."
+        )
+
+    def _fallback_homework_recommendation_english(
+        self,
+        homework_context: dict[str, Any],
+    ) -> str:
+        performance_level = homework_context.get("performance_level")
+        teaching_context = homework_context.get("teaching_context")
+        activity_profile = homework_context.get("activity_profile") or {}
+        has_flashcards = int(activity_profile.get("flashcards") or 0) > 0
+        focus_phrase = (
+            getattr(teaching_context, "expected_mastery", "") if teaching_context else ""
+        )
+        focus_phrase = self._second_person_mastery(focus_phrase).strip()
+
+        if performance_level == "high":
+            return (
+                "Spend ten minutes writing one compact explanation of the central reasoning from this module without looking at the material. "
+                "Then compare it with your notes and add only the missing link that would make your explanation clearer."
+            )
+
+        if performance_level == "medium":
+            return (
+                "Choose one distinction that felt uncertain and build a brief two-column comparison from memory. "
+                "In one column write the idea itself; in the other, write when you would recognise or apply it. "
+                "Use the material only at the end to correct the comparison."
+            )
+
+        if performance_level == "low":
+            return (
+                "Take ten focused minutes to rebuild the foundation slowly: write the main idea in your own words, then add one simple example and one reason why it matters. "
+                "Do not aim for completeness; aim for a clearer starting point."
+            )
+
+        if has_flashcards:
+            return (
+                "Before the next module, spend a short interval recalling the most important relationships without looking at the answers first. "
+                "Write down the connections that come easily and mark the ones that still need a slower return."
+            )
+
+        if focus_phrase:
+            return (
+                f"Spend ten minutes turning the objective into a short explanation in your own words: {focus_phrase} "
+                "Keep it concise, then check where your reasoning becomes vague and refine only that passage."
+            )
+
+        return (
+            "Spend ten minutes reconstructing the main line of reasoning from memory. "
+            "Write three connected sentences, then check the material only to identify the one point that needs the most precise correction."
+        )
+
+    def _fallback_homework_recommendation_italian(
+        self,
+        homework_context: dict[str, Any],
+    ) -> str:
+        performance_level = homework_context.get("performance_level")
+        teaching_context = homework_context.get("teaching_context")
+        activity_profile = homework_context.get("activity_profile") or {}
+        has_flashcards = int(activity_profile.get("flashcards") or 0) > 0
+        focus_phrase = (
+            getattr(teaching_context, "expected_mastery", "") if teaching_context else ""
+        )
+        focus_phrase = self._second_person_mastery(focus_phrase).strip()
+
+        if performance_level == "high":
+            return (
+                "Dedica dieci minuti a scrivere una spiegazione compatta del ragionamento centrale del modulo senza guardare il materiale. "
+                "Poi confrontala con gli appunti e aggiungi soltanto il collegamento mancante che renderebbe la spiegazione più chiara."
+            )
+
+        if performance_level == "medium":
+            return (
+                "Scegli una distinzione rimasta incerta e costruisci a memoria un breve confronto in due colonne. "
+                "In una colonna scrivi l’idea; nell’altra, quando sapresti riconoscerla o applicarla. "
+                "Usa il materiale solo alla fine per correggere il confronto."
+            )
+
+        if performance_level == "low":
+            return (
+                "Prenditi dieci minuti per ricostruire lentamente la base: scrivi l’idea principale con parole tue, poi aggiungi un esempio semplice e una ragione per cui è importante. "
+                "Non cercare completezza; cerca un punto di partenza più chiaro."
+            )
+
+        if has_flashcards:
+            return (
+                "Prima del prossimo modulo, dedica un breve intervallo a richiamare le relazioni più importanti senza guardare subito le risposte. "
+                "Annota i collegamenti che emergono facilmente e segna quelli che richiedono un ritorno più lento."
+            )
+
+        if focus_phrase:
+            return (
+                f"Dedica dieci minuti a trasformare l’obiettivo in una breve spiegazione con parole tue: {focus_phrase} "
+                "Tienila concisa, poi controlla dove il ragionamento diventa vago e correggi solo quel passaggio."
+            )
+
+        return (
+            "Dedica dieci minuti a ricostruire a memoria la linea principale del ragionamento. "
+            "Scrivi tre frasi collegate, poi usa il materiale solo per individuare il punto che richiede la correzione più precisa."
         )
 
     def _fallback_activity_debrief_english(
@@ -2127,6 +2663,77 @@ INPUT:
                 knowledge,
                 module_index + 1,
             ),
+        }
+
+    def _homework_recommendation_context(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+    ) -> dict[str, Any]:
+        module_context = self._module_debrief_context(
+            knowledge,
+            module_index,
+            module_results,
+        )
+
+        return {
+            "performance_level": module_context.get("performance_level"),
+            "mastery_level": module_context.get("mastery_level"),
+            "overall_accuracy": module_context.get("overall_accuracy"),
+            "activity_profile": module_context.get("activity_profile"),
+            "completed_activities": module_context.get("completed_activities"),
+            "teaching_context": module_context.get("teaching_context"),
+            "module_objective": module_context.get("module_objective"),
+            "current_activity_strategy": module_context.get("current_activity_strategy"),
+        }
+
+    def _module_question_context(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        module_results: Any,
+        question: str,
+        conversation: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        module_context = self._module_debrief_context(
+            knowledge,
+            module_index,
+            module_results,
+        )
+        safe_history = tuple(
+            {
+                "role": str(item.get("role") or "")[:20],
+                "content": str(item.get("content") or "")[:1200],
+            }
+            for item in (conversation or [])[-8:]
+            if isinstance(item, dict) and str(item.get("content") or "").strip()
+        )
+
+        return {
+            "learner_question": str(question or "").strip(),
+            "conversation": safe_history,
+            "module_results": module_context,
+            "professor_debrief": self._activity_result_value(
+                module_results,
+                "professor_debrief",
+            ) or "",
+            "homework_recommendation": self._activity_result_value(
+                module_results,
+                "homework_recommendation",
+            ) or "",
+            "module_categories": self.validator._module_categories(
+                knowledge,
+                module_index,
+            ),
+            "module_topics": self.validator._module_topics(
+                knowledge,
+                module_index,
+            ),
+            "teaching_context": module_context.get("teaching_context"),
+            "module_objective": module_context.get("module_objective"),
+            "activity_profile": module_context.get("activity_profile"),
+            "performance_level": module_context.get("performance_level"),
         }
 
     def _study_plan_debrief_context(

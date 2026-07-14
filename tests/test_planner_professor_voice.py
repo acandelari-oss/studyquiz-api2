@@ -896,6 +896,140 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
             )
         )
 
+    def test_generate_homework_recommendation_for_medium_performance(self):
+        service = ProfessorVoiceService(
+            llm_generate=lambda _prompt: (
+                '{"homework":"Choose one uncertain distinction and write a short two-column comparison from memory, then check the material only to correct the weakest link in your reasoning."}'
+            )
+        )
+
+        homework = service.generate_homework_recommendation(
+            self._knowledge(),
+            1,
+            {"accuracy": 0.65},
+        )
+
+        self.assertIn("you", homework.lower())
+        self.assertIn("comparison", homework)
+
+    def test_homework_recommendation_prompt_contains_v1_rules(self):
+        captured = {}
+
+        def capture_prompt(prompt):
+            captured["prompt"] = prompt
+            return (
+                '{"homework":"Spend ten minutes writing one compact explanation from memory, then check only the point where your reasoning becomes least precise."}'
+            )
+
+        service = ProfessorVoiceService(llm_generate=capture_prompt)
+
+        service.generate_homework_recommendation(
+            self._knowledge(),
+            1,
+            {"accuracy": 0.9},
+        )
+
+        self.assertIn("HOMEWORK_RECOMMENDATION", captured["prompt"])
+        self.assertIn("ONE concrete action", captured["prompt"])
+        self.assertIn("5-15 minutes", captured["prompt"])
+        self.assertIn("Do not simply say", captured["prompt"])
+        self.assertIn("homework_context", captured["prompt"])
+
+    def test_homework_recommendation_fallback_varies_by_high_performance(self):
+        service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
+
+        homework = service.generate_homework_recommendation(
+            self._knowledge(),
+            1,
+            {"accuracy": 0.9},
+        )
+
+        self.assertIn("ten minutes", homework)
+        self.assertIn("explanation", homework)
+
+    def test_homework_recommendation_fallback_varies_by_low_performance(self):
+        service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
+
+        homework = service.generate_homework_recommendation(
+            self._knowledge(),
+            1,
+            {"accuracy": 0.25},
+        )
+
+        self.assertIn("ten focused minutes", homework)
+        self.assertIn("own words", homework)
+
+    def test_homework_recommendation_fallback_uses_study_language(self):
+        service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
+
+        homework = service.generate_homework_recommendation(
+            self._knowledge(study_language="Italian"),
+            1,
+            {"accuracy": 0.25},
+        )
+
+        self.assertIn("dieci minuti", homework)
+        self.assertIn("parole tue", homework)
+
+    def test_homework_recommendation_validation_rejects_generic_text(self):
+        validator = ProfessorVoiceValidator()
+
+        self.assertFalse(
+            validator.validate_homework_recommendation(
+                "You should review the material again.",
+                self._knowledge(),
+                1,
+            )
+        )
+
+    def test_homework_recommendation_validation_rejects_score_repetition(self):
+        validator = ProfessorVoiceValidator()
+
+        self.assertFalse(
+            validator.validate_homework_recommendation(
+                "You scored 80%, so spend ten minutes writing a compact explanation.",
+                self._knowledge(),
+                1,
+            )
+        )
+
+    def test_homework_recommendation_validation_requires_direct_address(self):
+        validator = ProfessorVoiceValidator()
+
+        self.assertFalse(
+            validator.validate_homework_recommendation(
+                "The learner should write a compact explanation from memory.",
+                self._knowledge(),
+                1,
+            )
+        )
+
+    def test_homework_recommendation_validation_rejects_repeated_debrief(self):
+        validator = ProfessorVoiceValidator()
+        debrief = (
+            "You have developed a usable understanding of the main ideas, and the next module can now revisit them in a broader context."
+        )
+
+        self.assertFalse(
+            validator.validate_homework_recommendation(
+                "You have developed a usable understanding of the main ideas, and the next module can now revisit them in a broader context.",
+                self._knowledge(),
+                1,
+                module_debrief=debrief,
+            )
+        )
+
+    def test_homework_recommendation_validation_rejects_unrelated_multiple_tasks(self):
+        validator = ProfessorVoiceValidator()
+
+        self.assertFalse(
+            validator.validate_homework_recommendation(
+                "You should write a short explanation from memory. In addition, also complete a separate task with ten new examples.",
+                self._knowledge(),
+                1,
+            )
+        )
+
     def test_generate_study_plan_debrief_for_high_mastery(self):
         service = ProfessorVoiceService(
             llm_generate=lambda _prompt: '{"debrief":"Throughout this Study Plan, you have developed a coherent understanding of the underlying concepts. The knowledge you have built is now connected enough to support more demanding reasoning in the next Study Plan."}'
@@ -1057,6 +1191,88 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
             validator.validate_study_plan_debrief(
                 long_text,
                 self._knowledge(),
+            )
+        )
+
+    def test_generate_module_question_answer(self):
+        service = ProfessorVoiceService(
+            llm_generate=lambda _prompt: '{"answer":"You should connect the distinction to the concrete example from this module, because that is where the reasoning becomes clearer."}'
+        )
+
+        answer = service.generate_module_question_answer(
+            self._knowledge(),
+            1,
+            {
+                "activity_results": [{"activity_type": "quiz", "accuracy": 0.75}],
+                "professor_debrief": "You have identified the main ideas.",
+                "homework_recommendation": "Write one short comparison from memory.",
+            },
+            "Can you explain the main distinction again?",
+            [],
+        )
+
+        self.assertIn("You should connect", answer)
+
+    def test_module_question_prompt_contains_context(self):
+        captured = {}
+
+        def capture_prompt(prompt):
+            captured["prompt"] = prompt
+            return '{"answer":"You should focus on the central relationship from this module and use the example to test whether the distinction is clear."}'
+
+        service = ProfessorVoiceService(llm_generate=capture_prompt)
+
+        service.generate_module_question_answer(
+            self._knowledge(),
+            1,
+            {
+                "activity_results": [{"activity_type": "quiz", "accuracy": 0.75}],
+                "professor_debrief": "You have identified the main ideas.",
+                "homework_recommendation": "Write one short comparison from memory.",
+            },
+            "What should I focus on?",
+            [{"role": "student", "content": "I am unsure about the example."}],
+        )
+
+        self.assertIn("MODULE_QUESTION", captured["prompt"])
+        self.assertIn("module_question_context", captured["prompt"])
+        self.assertIn("professor_debrief", captured["prompt"])
+        self.assertIn("homework_recommendation", captured["prompt"])
+        self.assertIn("What should I focus on?", captured["prompt"])
+
+    def test_module_question_fallback_uses_study_language(self):
+        service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
+
+        answer = service.generate_module_question_answer(
+            self._knowledge(study_language="Italian"),
+            1,
+            {"activity_results": [{"activity_type": "quiz", "accuracy": 0.75}]},
+            "Può chiarire questo punto?",
+            [],
+        )
+
+        self.assertIn("La domanda", answer)
+        self.assertIn("modulo", answer)
+
+    def test_module_question_validation_rejects_implementation_language(self):
+        validator = ProfessorVoiceValidator()
+
+        self.assertFalse(
+            validator.validate_module_question_answer(
+                "The software generated this answer from the Planner prompt.",
+                self._knowledge(),
+                1,
+            )
+        )
+
+    def test_module_question_validation_rejects_score_repetition(self):
+        validator = ProfessorVoiceValidator()
+
+        self.assertFalse(
+            validator.validate_module_question_answer(
+                "Your accuracy was 75%, so you should continue.",
+                self._knowledge(),
+                1,
             )
         )
 

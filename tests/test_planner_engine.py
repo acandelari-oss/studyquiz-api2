@@ -141,6 +141,146 @@ class PlannerEngineTests(unittest.TestCase):
         self.assertEqual(first_day_activities[0].configuration.difficulty, "medium")
         self.assertIsNone(first_day_activities[0].result)
 
+    def test_assessment_uses_context_order_and_quiz_only_full_topic_coverage(self):
+        week = PlannerEngine().generate_assessment_week(
+            PlannerContext(
+                categories=("B", "A"),
+                topics_by_category={
+                    "B": self._topics("b", 3),
+                    "A": self._topics("a", 2),
+                },
+                analytics={
+                    "A": CategoryAnalytics(accuracy=0.10, coverage=0.10),
+                    "B": CategoryAnalytics(accuracy=0.90, coverage=0.90),
+                },
+                preferences=PlannerPreferences(
+                    question_pace_seconds=60,
+                    question_style="reasoning",
+                ),
+                number_of_sessions=1,
+                planning_budget_minutes=2,
+                week_start_date=date(2026, 6, 29),
+                week_id="assessment-test",
+            )
+        )
+
+        self.assertEqual(week.plan_type, "assessment")
+        self.assertGreater(len(week.daily_plans), 1)
+
+        allocations = [
+            allocation
+            for daily_plan in week.daily_plans
+            for allocation in daily_plan.planned_allocations
+        ]
+        self.assertEqual(
+            [allocation.category for allocation in allocations],
+            ["B", "B", "A"],
+        )
+        self.assertEqual(
+            [
+                topic.title
+                for allocation in allocations
+                for topic in allocation.selected_topics
+            ],
+            [
+                "b Topic 1",
+                "b Topic 2",
+                "b Topic 3",
+                "a Topic 1",
+                "a Topic 2",
+            ],
+        )
+
+        activities = [
+            activity
+            for daily_plan in week.daily_plans
+            for activity in daily_plan.activities
+        ]
+        self.assertTrue(activities)
+        self.assertTrue(all(activity.type == ActivityType.QUIZ for activity in activities))
+        self.assertTrue(
+            all(
+                activity.configuration.num_questions
+                >= len(activity.configuration.selected_topics)
+                for activity in activities
+            )
+        )
+        self.assertTrue(
+            all(
+                activity.configuration.question_style == "reasoning"
+                for activity in activities
+            )
+        )
+
+    def test_assessment_covers_programme_beyond_visible_study_plan_limit(self):
+        topics = self._topics("large", 13)
+
+        week = PlannerEngine().generate_assessment_week(
+            PlannerContext(
+                categories=("Large",),
+                topics_by_category={"Large": topics},
+                analytics={
+                    "Large": CategoryAnalytics(accuracy=0.95, coverage=0.95),
+                },
+                preferences=PlannerPreferences(
+                    question_pace_seconds=60,
+                    question_style="exam",
+                ),
+                number_of_sessions=1,
+                planning_budget_minutes=1,
+                week_start_date=date(2026, 6, 29),
+                week_id="assessment-large-test",
+            )
+        )
+
+        self.assertEqual(week.plan_type, "assessment")
+        self.assertEqual(len(week.daily_plans), 13)
+
+        selected_topic_ids = [
+            topic.id
+            for daily_plan in week.daily_plans
+            for allocation in daily_plan.planned_allocations
+            for topic in allocation.selected_topics
+        ]
+        self.assertEqual(selected_topic_ids, [topic.id for topic in topics])
+        self.assertEqual(len(selected_topic_ids), len(set(selected_topic_ids)))
+
+        activities = [
+            activity
+            for daily_plan in week.daily_plans
+            for activity in daily_plan.activities
+        ]
+        self.assertEqual(len(activities), 13)
+        self.assertTrue(all(activity.type == ActivityType.QUIZ for activity in activities))
+        self.assertTrue(
+            all(activity.configuration.num_questions >= 1 for activity in activities)
+        )
+
+    def test_assessment_quiz_size_uses_budget_instead_of_topic_count_only(self):
+        week = PlannerEngine().generate_assessment_week(
+            PlannerContext(
+                categories=("A",),
+                topics_by_category={"A": self._topics("a", 2)},
+                analytics={
+                    "A": CategoryAnalytics(accuracy=0.95, coverage=0.95),
+                },
+                preferences=PlannerPreferences(
+                    question_pace_seconds=60,
+                    question_style="balanced",
+                ),
+                number_of_sessions=1,
+                planning_budget_minutes=10,
+                week_start_date=date(2026, 6, 29),
+                week_id="assessment-budget-test",
+            )
+        )
+
+        activity = week.daily_plans[0].activities[0]
+
+        self.assertEqual(len(activity.configuration.selected_topics), 2)
+        self.assertGreater(activity.configuration.num_questions, 2)
+        self.assertLessEqual(activity.configuration.estimated_duration_minutes, 10)
+
 
 if __name__ == "__main__":
     unittest.main()

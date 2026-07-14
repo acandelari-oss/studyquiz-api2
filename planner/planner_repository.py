@@ -99,6 +99,7 @@ class PlannerRepository:
             start_date=self._as_date(week_row[1]),
             end_date=self._as_date(week_row[2]),
             status=WeekStatus(str(week_row[3])),
+            plan_type=planning_parameters.get("plan_type") or "study_plan",
             study_language=(
                 planning_parameters.get("study_language")
                 or planning_parameters.get("studyLanguage")
@@ -153,6 +154,29 @@ class PlannerRepository:
 
         loaded_week = self.load_week(active_week.id)
         return loaded_week or active_week
+
+    def complete_active_week(self, project_id: str) -> Optional[Week]:
+        """Mark the active plan-shaped week for a project as completed."""
+
+        active_week = self.load_active_week(project_id=project_id)
+
+        if not active_week:
+            return None
+
+        self.db.execute(
+            text("""
+                update planner_weeks
+                set status = :completed_status,
+                    updated_at = CURRENT_TIMESTAMP
+                where id = :week_id
+            """),
+            {
+                "completed_status": WeekStatus.COMPLETED.value,
+                "week_id": active_week.id,
+            },
+        )
+        self._commit_if_available()
+        return self.load_week(active_week.id)
 
     def _insert_week(
         self,
