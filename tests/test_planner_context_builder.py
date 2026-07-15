@@ -178,6 +178,65 @@ class PlannerContextBuilderTests(unittest.TestCase):
         self.assertIsNone(context.project)
         self.assertEqual(context.categories, ())
 
+    def test_mixed_naive_and_aware_learning_timestamps_do_not_crash(self):
+        self.db.execute(text("""
+            insert into projects
+            (id, name, created_at, user_id, topic_status, taxonomy_language)
+            values
+            ('project-1', 'Genetics', '2026-06-01', 'user-1', 'completed', 'en')
+        """))
+        self.db.execute(text("""
+            insert into topics
+            (id, project_id, category, topic, is_display_topic)
+            values
+            ('topic-1', 'project-1', 'GENETICS', 'Mitosis', true)
+        """))
+        self.db.execute(text("""
+            insert into quizzes (id, project_id, user_id)
+            values ('quiz-1', 'project-1', 'user-1')
+        """))
+        self.db.execute(text("""
+            insert into quiz_questions (id, quiz_id, topic)
+            values ('question-1', 'quiz-1', 'Mitosis')
+        """))
+        self.db.execute(text("""
+            insert into quiz_answers
+            (id, quiz_id, question_id, user_id, is_correct, created_at, topic)
+            values
+            (
+                'answer-1',
+                'quiz-1',
+                'question-1',
+                'user-1',
+                true,
+                '2026-06-28 10:00:00',
+                'Mitosis'
+            )
+        """))
+        self.db.execute(text("""
+            insert into flashcard_reviews
+            (id, project_id, user_id, is_correct, reviewed_at, topic)
+            values
+            (
+                'review-1',
+                'project-1',
+                'user-1',
+                false,
+                '2026-06-29T10:00:00+00:00',
+                'Mitosis'
+            )
+        """))
+        self.db.commit()
+
+        context = build_real_planner_context(
+            self.db,
+            project_id="project-1",
+            user_id="user-1",
+            today=date(2026, 7, 1),
+        )
+
+        self.assertEqual(context.analytics["GENETICS"].days_since_review, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

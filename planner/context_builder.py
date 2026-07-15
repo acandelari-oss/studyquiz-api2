@@ -7,7 +7,7 @@ state evaluation.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
 from sqlalchemy import text
@@ -344,11 +344,16 @@ def _apply_learning_event(
 
     category_stats["studied_topics"].add(topic_key)
 
+    normalized_occurred_at = _comparable_datetime(occurred_at)
+    normalized_last_reviewed_at = _comparable_datetime(
+        category_stats["last_reviewed_at"]
+    )
+
     if (
-        occurred_at
+        normalized_occurred_at
         and (
-            category_stats["last_reviewed_at"] is None
-            or occurred_at > category_stats["last_reviewed_at"]
+            normalized_last_reviewed_at is None
+            or normalized_occurred_at > normalized_last_reviewed_at
         )
     ):
         category_stats["last_reviewed_at"] = occurred_at
@@ -384,6 +389,29 @@ def _as_date(value: Any) -> date:
         return value
 
     return date.fromisoformat(str(value)[:10])
+
+
+def _comparable_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        text_value = str(value).strip()
+        if not text_value:
+            return None
+
+        parsed = datetime.fromisoformat(
+            text_value.replace("Z", "+00:00")
+        )
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+    return parsed
 
 
 def _as_iso(value: Any) -> Optional[str]:

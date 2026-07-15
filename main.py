@@ -57,6 +57,7 @@ from planner.survey_bootstrap import (
 )
 import time
 import re
+import traceback
 
 MAX_RECOMMENDED_PAGES = 150
 DEFAULT_MAX_VISIBLE_PLANNER_MODULES = 12
@@ -68,6 +69,76 @@ MAX_VISIBLE_PLANNER_MODULES = int(
 )
 MAX_WARNING_PAGES = 100
 MAX_STRONG_WARNING_PAGES = 180
+
+
+class UploadPipelineLogger:
+    def __init__(self, pipeline: str, project_id: Optional[str] = None):
+        self.pipeline = pipeline
+        self.project_id = project_id
+        self.total_start = time.perf_counter()
+        self.current_phase = None
+        self.current_phase_start = None
+
+    def header(self):
+        print("==========================")
+        print(self.pipeline)
+        print("==========================")
+        if self.project_id:
+            print("project_id:", self.project_id)
+
+    def start(self, phase: str, **counters):
+        self.current_phase = phase
+        self.current_phase_start = time.perf_counter()
+        print(f"[{phase}]")
+        print("START")
+        self._print_counters(counters)
+
+    def end(self, phase: Optional[str] = None, **counters):
+        phase_name = phase or self.current_phase or "UNKNOWN"
+        elapsed = (
+            time.perf_counter() - self.current_phase_start
+            if self.current_phase_start is not None
+            else 0
+        )
+        print(f"[{phase_name}]")
+        self._print_counters(counters)
+        print("END")
+        print(f"Elapsed: {elapsed:.3f} sec")
+        if phase is None or phase == self.current_phase:
+            self.current_phase = None
+            self.current_phase_start = None
+
+    def fail(self, exc: BaseException, phase: Optional[str] = None):
+        phase_name = phase or self.current_phase or "UNKNOWN"
+        elapsed = (
+            time.perf_counter() - self.current_phase_start
+            if self.current_phase_start is not None
+            else time.perf_counter() - self.total_start
+        )
+        print(f"[{phase_name}]")
+        print("ERROR")
+        print("Exception:", repr(exc))
+        print(f"Elapsed until failure: {elapsed:.3f} sec")
+        print("Traceback:")
+        print(traceback.format_exc())
+
+    def total(self, **counters):
+        elapsed = time.perf_counter() - self.total_start
+        print("[FINAL COMPLETION]")
+        self._print_counters(counters)
+        print(f"Total pipeline time: {elapsed:.3f} sec")
+
+    def _print_counters(self, counters):
+        for key, value in counters.items():
+            print(f"{key}: {value}")
+
+
+def _upload_timer():
+    return time.perf_counter()
+
+
+def _upload_elapsed(start):
+    return time.perf_counter() - start
 
 MAX_TOPIC_PROCESSING_SECONDS = 600
 MAX_ASSIGNMENT_MATCHES = 30000
@@ -2821,19 +2892,33 @@ def audit_taxonomy_reorganization(final_data, project_id: str):
 
 def process_topics_task(project_id: str):
     db = SessionLocal()
+    pipeline_log = UploadPipelineLogger(
+        "UPLOAD TOPIC PROCESSING",
+        project_id=project_id,
+    )
     try:
+        pipeline_log.header()
         print("BACKGROUND TOPICS START:", project_id)
         
        
         topic_phase_timer = time.time()
         topic_start_time = time.time()
         # 1. Update status and clear old topics
+        pipeline_log.start(
+            "DATABASE COMMIT",
+            operation="set processing and clear old topics",
+        )
         db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
         db.execute(text("delete from topics where project_id = :project_id"), {"project_id": project_id})
         ensure_project_chunk_roles(db, project_id)
         db.commit()
+        pipeline_log.end("DATABASE COMMIT")
 
         # Fetch chunks to analyze (up to 120 chunks)
+        pipeline_log.start(
+            "CHUNK LOADING",
+            limit=400,
+        )
         rows = db.execute(
             text("""
                 select chunk_text, section, chunk_role
@@ -2880,6 +2965,12 @@ def process_topics_task(project_id: str):
             round(time.time() - topic_phase_timer, 1),
             "seconds"
         )
+        pipeline_log.end(
+            "CHUNK LOADING",
+            chunks_processed=len(all_chunks),
+            eligible_chunks=chunk_eligibility_counts[0],
+            excluded_chunks=chunk_eligibility_counts[1],
+        )
 
         taxonomy_language = None
         taxonomy_language_confidence = None
@@ -2887,6 +2978,7 @@ def process_topics_task(project_id: str):
         detected_language_code = None
 
         try:
+            pipeline_log.start("TAXONOMY LANGUAGE DETECTION")
             detection_result = detect_project_taxonomy_language(
                 all_chunks
             )
@@ -2914,14 +3006,27 @@ def process_topics_task(project_id: str):
 
                 taxonomy_language = detected_language
                 language_enforcement_applied = True
+                pipeline_log.end(
+                    "TAXONOMY LANGUAGE DETECTION",
+                    detected_language=detected_language_code,
+                    confidence=taxonomy_language_confidence,
+                    language_enforcement_applied=language_enforcement_applied,
+                )
             else:
                 print(
                     "⚠️ LANGUAGE DETECTION CONFIDENCE TOO LOW — "
                     "CONTINUING EXISTING PIPELINE UNCHANGED"
                 )
+                pipeline_log.end(
+                    "TAXONOMY LANGUAGE DETECTION",
+                    detected_language=detected_language_code,
+                    confidence=taxonomy_language_confidence,
+                    language_enforcement_applied=language_enforcement_applied,
+                )
 
         except Exception as language_error:
             db.rollback()
+            pipeline_log.fail(language_error, "TAXONOMY LANGUAGE DETECTION")
             print(
                 "⚠️ LANGUAGE DETECTION FAILED — "
                 "CONTINUING EXISTING PIPELINE UNCHANGED:",
@@ -2979,16 +3084,22 @@ def process_topics_task(project_id: str):
         
         seen_titles = set()
         all_candidate_topics = []
+        total_mini_groups = sum(
+            len([
+                chunks[i:i+20]
+                for i in range(0, len(chunks), 20)
+            ])
+            for chunks in section_groups.values()
+        )
+        gpt_calls_performed = 0
+        pipeline_log.start(
+            "TOPIC GENERATION",
+            sections=len(section_groups),
+            mini_groups_created=total_mini_groups,
+            chunks_processed=len(all_chunks),
+        )
 
         for section_name, section_chunks in section_groups.items():
-            total_mini_groups = 0
-
-            for chunks in section_groups.values():
-                total_mini_groups += len([
-                    chunks[i:i+20]
-                    for i in range(0, len(chunks), 20)
-                ])
-
             print("📦 TOTAL MINI GROUPS:", total_mini_groups)
             
             print(
@@ -3187,6 +3298,7 @@ def process_topics_task(project_id: str):
                     messages=[{"role": "user", "content": prompt}],
                     response_format={ "type": "json_object" } # Ensures stable JSON output[cite: 2]
                 )
+                gpt_calls_performed += 1
 
                 try:
                     data = json.loads(response.choices[0].message.content.replace("```json", "").replace("```", "").strip())
@@ -3255,9 +3367,19 @@ def process_topics_task(project_id: str):
             round(time.time() - topic_phase_timer, 1),
             "seconds"
         )
+        pipeline_log.end(
+            "TOPIC GENERATION",
+            mini_groups_created=total_mini_groups,
+            gpt_calls_performed=gpt_calls_performed,
+            topics_generated=len(all_candidate_topics),
+        )
 
         topic_phase_timer = time.time()
         print("🌍 STARTING GLOBAL TOPIC CONSOLIDATION")
+        pipeline_log.start(
+            "TOPIC CONSOLIDATION",
+            initial_topics=len(all_candidate_topics),
+        )
 
         print(
                 "⏱️ BEFORE FINAL CONSOLIDATION:",
@@ -3458,6 +3580,11 @@ def process_topics_task(project_id: str):
             "📊 TOPICS AFTER CONSOLIDATION:",
             final_topics
         )
+        pipeline_log.end(
+            "TOPIC CONSOLIDATION",
+            initial_topics=total_candidate_topics,
+            final_topics=final_topics,
+        )
 
         print("🧬 PRECOMPUTING IMMUTABLE TOPIC LEDGER")
         topic_ledger = build_immutable_taxonomy_ledger(
@@ -3599,6 +3726,11 @@ def process_topics_task(project_id: str):
 
         # 🔥 DELETE OLD TOPIC-CHUNK LINKS
 
+        pipeline_log.start(
+            "DATABASE COMMIT",
+            operation="persist topics",
+            topics_to_persist=len(topic_ledger),
+        )
         db.execute(
             text("""
                 DELETE FROM topic_chunks
@@ -3674,9 +3806,14 @@ def process_topics_task(project_id: str):
             round(time.time() - topic_phase_timer, 1),
             "seconds"
         )
+        pipeline_log.end(
+            "DATABASE COMMIT",
+            topics_persisted=len(topic_ledger),
+        )
 
         topic_phase_timer = time.time()
         print("🧠 STARTING TOPIC-CHUNK ASSIGNMENT")
+        pipeline_log.start("TOPIC ASSIGNMENT")
 
         try:
             assign_topics_to_chunks(project_id)
@@ -3686,7 +3823,9 @@ def process_topics_task(project_id: str):
             round(time.time() - topic_phase_timer, 1),
             "seconds"
         )
+            pipeline_log.end("TOPIC ASSIGNMENT")
         except Exception as e:
+            pipeline_log.fail(e, "TOPIC ASSIGNMENT")
             print("❌ TOPIC-CHUNK ASSIGNMENT FAILED:", e)
             raise
 
@@ -3720,6 +3859,10 @@ def process_topics_task(project_id: str):
 
         final_db = SessionLocal()
 
+        pipeline_log.start(
+            "DATABASE COMMIT",
+            operation="set topic_status completed",
+        )
         final_db.execute(
             text("""
                 UPDATE projects
@@ -3742,21 +3885,39 @@ def process_topics_task(project_id: str):
 
         print("✅ PROJECT TOPIC STATUS = COMPLETED")
         print("🔥 STATUS READBACK:", check[0])
+        pipeline_log.end(
+            "DATABASE COMMIT",
+            topic_status=check[0],
+        )
+        pipeline_log.total(
+            topics_persisted=len(topic_ledger),
+            topic_status=check[0],
+        )
 
         final_db.close()
         
 
     except Exception as e:
+        pipeline_log.fail(e)
         db.rollback()
         print("BACKGROUND TOPICS ERROR:", e)
+        pipeline_log.start(
+            "DATABASE COMMIT",
+            operation="set topic_status error",
+        )
         db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
         db.commit()
+        pipeline_log.end("DATABASE COMMIT")
     finally:
         db.close()
 
 def assign_topics_to_chunks(project_id: str):
 
     db = SessionLocal()
+    pipeline_log = UploadPipelineLogger(
+        "UPLOAD TOPIC ASSIGNMENT",
+        project_id=project_id,
+    )
 
     def build_in_clause(prefix, values):
         placeholders = []
@@ -3816,15 +3977,22 @@ def assign_topics_to_chunks(project_id: str):
 
     try:
 
+        pipeline_log.header()
         print("🔗 START TOPIC ASSIGNMENT")
         print("🧪 ENTER assign_topics_to_chunks")
 
+        pipeline_log.start(
+            "DATABASE COMMIT",
+            operation="ensure chunk roles",
+        )
         project_chunk_roles = ensure_project_chunk_roles(
             db,
             project_id,
         )
         db.commit()
+        pipeline_log.end("DATABASE COMMIT")
 
+        pipeline_log.start("TOPIC ASSIGNMENT SETUP")
         topics_count = db.execute(
             text("""
                 select count(*)
@@ -3881,8 +4049,22 @@ def assign_topics_to_chunks(project_id: str):
         print("📦 CANDIDATE BUDGET PER BATCH:", MAX_ASSIGNMENT_MATCHES)
         print("📦 PHASE A CHUNK BATCH SIZE:", phase_a_batch_size)
         print("📦 PHASE A EXPECTED BATCHES:", phase_a_total_batches)
+        pipeline_log.end(
+            "TOPIC ASSIGNMENT SETUP",
+            topics_count=topics_count,
+            chunks_processed=chunks_count,
+            excluded_chunks=total_chunks_count - chunks_count,
+            total_candidate_pairs=total_candidate_pairs,
+            phase_a_batch_size=phase_a_batch_size,
+            phase_a_total_batches=phase_a_total_batches,
+        )
 
         # Phase A is atomic with deletion so a failure preserves old links.
+        pipeline_log.start(
+            "TOPIC ASSIGNMENT PHASE A",
+            batches=phase_a_total_batches,
+            total_candidate_pairs=total_candidate_pairs,
+        )
         db.execute(
             text("""
                 delete from topic_chunks
@@ -4072,11 +4254,20 @@ def assign_topics_to_chunks(project_id: str):
             "📊 PHASE A CHUNK COVERAGE:",
             f"{phase_a_covered_chunks}/{chunks_count}"
         )
+        pipeline_log.end(
+            "TOPIC ASSIGNMENT PHASE A",
+            batches=phase_a_total_batches,
+            pairs_processed=phase_a_pairs_processed,
+            matches_created=phase_a_links,
+            covered_topics=phase_a_covered_topics,
+            covered_chunks=phase_a_covered_chunks,
+        )
 
         rescue_links = 0
         lowest_rescue_score = None
 
         try:
+            pipeline_log.start("TOPIC ASSIGNMENT RESCUE PHASE")
             orphan_rows = db.execute(
                 text("""
                     select t.id, t.topic
@@ -4284,11 +4475,24 @@ def assign_topics_to_chunks(project_id: str):
 
                 db.commit()
                 print("✅ PHASE B RESCUE COMMIT COMPLETE")
+                pipeline_log.end(
+                    "TOPIC ASSIGNMENT RESCUE PHASE",
+                    orphan_topics=orphan_count,
+                    batches=phase_b_total_batches,
+                    pairs_processed=phase_b_pairs_processed,
+                    matches_created=rescue_links,
+                )
 
             else:
                 db.rollback()
+                pipeline_log.end(
+                    "TOPIC ASSIGNMENT RESCUE PHASE",
+                    orphan_topics=orphan_count,
+                    matches_created=0,
+                )
 
         except Exception as rescue_error:
+            pipeline_log.fail(rescue_error, "TOPIC ASSIGNMENT RESCUE PHASE")
             db.rollback()
             rescue_links = 0
             lowest_rescue_score = None
@@ -4337,9 +4541,19 @@ def assign_topics_to_chunks(project_id: str):
             "📊 FINAL MAX TOPICS PER CHUNK:",
             final_max_topics_per_chunk
         )
+        pipeline_log.total(
+            topics_count=topics_count,
+            chunks_processed=chunks_count,
+            total_candidate_pairs=total_candidate_pairs,
+            matches_created=final_links,
+            covered_topics=final_covered_topics,
+            covered_chunks=final_covered_chunks,
+            orphan_topics=final_orphans,
+        )
 
     except Exception as e:
 
+        pipeline_log.fail(e)
         db.rollback()
         print("❌ TOPIC ASSIGNMENT ERROR:", e)
         raise
@@ -4439,8 +4653,36 @@ async def ingest_stream(
 
     async def generate():
         db = SessionLocal()
+        pipeline_log = UploadPipelineLogger(
+            "UPLOAD PIPELINE",
+            project_id=project_id,
+        )
+        total_files = len(docs or [])
+        total_file_size = 0
+        total_pages_processed = 0
+        total_ocr_pages = 0
+        total_chunks_created = 0
+        total_embedding_calls = 0
+        total_chunk_chars = 0
 
         try:
+            pipeline_log.header()
+            pipeline_log.start(
+                "UPLOAD REQUEST RECEIVED",
+                project_id=project_id,
+                documents=total_files,
+            )
+            for doc in docs:
+                try:
+                    total_file_size += len(base64.b64decode(doc.file_bytes))
+                except Exception:
+                    pass
+            pipeline_log.end(
+                "UPLOAD REQUEST RECEIVED",
+                total_file_size_bytes=total_file_size,
+            )
+
+            pipeline_log.start("DATABASE COMMIT", operation="set topic_status processing")
             db.execute(
                 text("""
                     update projects
@@ -4450,6 +4692,7 @@ async def ingest_stream(
                 {"project_id": project_id}
             )
             db.commit()
+            pipeline_log.end("DATABASE COMMIT")
 
             yield "Starting upload...\n"
             
@@ -4478,14 +4721,28 @@ async def ingest_stream(
             # ======================
             project_chunk_roles = []
             for doc in docs:
+                document_start = _upload_timer()
+                document_chunks_created = 0
+                document_embedding_calls = 0
+                document_ocr_pages = 0
                 yield f"Processing document: {doc.title}\n"
 
+                pipeline_log.start(
+                    "PDF LOADING",
+                    filename=doc.title,
+                )
                 pdf_bytes = base64.b64decode(doc.file_bytes)
                 pdf_stream = io.BytesIO(pdf_bytes)
 
                 reader = PdfReader(pdf_stream)
 
                 total_pages = len(reader.pages)
+                pipeline_log.end(
+                    "PDF LOADING",
+                    filename=doc.title,
+                    file_size_bytes=len(pdf_bytes),
+                    pages_detected=total_pages,
+                )
 
                 yield f"FILE_ANALYSIS|pages={total_pages}\n"
 
@@ -4503,9 +4760,15 @@ async def ingest_stream(
                     .upper()
                 )
                 for page_index, page in enumerate(reader.pages):
+                    page_start = _upload_timer()
                     
                     print(f"📄 PROCESSING PAGE {page_index+1}/{len(reader.pages)}")
                     yield f"Page {page_index+1}\n"
+                    pipeline_log.start(
+                        "DATABASE COMMIT",
+                        operation="update last_processed_page",
+                        page=page_index + 1,
+                    )
                     db.execute(
                         text("""
                             UPDATE projects
@@ -4519,8 +4782,19 @@ async def ingest_stream(
                     )
 
                     db.commit()
+                    pipeline_log.end("DATABASE COMMIT")
 
+                    pdf_extract_start = _upload_timer()
                     raw_page_text = page.extract_text()
+                    print(
+                        "[PDF TEXT EXTRACTION]",
+                        "page:",
+                        page_index + 1,
+                        "text_chars:",
+                        len(raw_page_text or ""),
+                        "Elapsed:",
+                        f"{_upload_elapsed(pdf_extract_start):.3f} sec",
+                    )
 
                     current_section = detect_section_title(
                         raw_page_text,
@@ -4533,15 +4807,49 @@ async def ingest_stream(
                     page_text = clean_text(raw_page_text)
 
                     if not page_text or not page_text.strip():
+                        total_ocr_pages += 1
+                        document_ocr_pages += 1
+                        pipeline_log.start(
+                            "OCR",
+                            page=page_index + 1,
+                            filename=doc.title,
+                            pages_requiring_ocr=document_ocr_pages,
+                        )
                         yield f"OCR page {page_index+1}\n"
                         page_text = ocr_pdf_page(pdf_bytes, page_index)
+                        pipeline_log.end(
+                            "OCR",
+                            page=page_index + 1,
+                            text_chars=len(page_text or ""),
+                        )
 
                         if not page_text:
                             continue
 
+                    pipeline_log.start(
+                        "CHUNK GENERATION",
+                        page=page_index + 1,
+                        filename=doc.title,
+                        page_text_chars=len(page_text or ""),
+                    )
                     chunks = chunk_text(page_text)
                     chunks = [clean_text(c) for c in chunks]
                     chunks = [c for c in chunks if len(c) > 100]
+                    chunk_chars = sum(len(c) for c in chunks)
+                    total_chunk_chars += chunk_chars
+                    total_chunks_created += len(chunks)
+                    document_chunks_created += len(chunks)
+                    average_chunk_size = (
+                        round(chunk_chars / len(chunks), 1)
+                        if chunks
+                        else 0
+                    )
+                    pipeline_log.end(
+                        "CHUNK GENERATION",
+                        page=page_index + 1,
+                        chunks_created=len(chunks),
+                        average_chunk_size=average_chunk_size,
+                    )
 
                     print(
                         f"📦 PAGE {page_index+1} -> {len(chunks)} CHUNKS"
@@ -4559,10 +4867,24 @@ async def ingest_stream(
                         )
                         project_chunk_roles.append(chunk_role)
 
+                        pipeline_log.start(
+                            "EMBEDDING GENERATION",
+                            filename=doc.title,
+                            page=page_index + 1,
+                            chunk_index=i + 1,
+                            chunks_on_page=len(chunks),
+                            batch="single-chunk",
+                        )
                         emb = await asyncio.to_thread(
                             client.embeddings.create,
                             model="text-embedding-3-small",
                             input=chunk
+                        )
+                        total_embedding_calls += 1
+                        document_embedding_calls += 1
+                        pipeline_log.end(
+                            "EMBEDDING GENERATION",
+                            embeddings_created=1,
                         )
 
                         embedding = emb.data[0].embedding
@@ -4574,6 +4896,13 @@ async def ingest_stream(
                             print("ATTENZIONE: doc.title è vuoto o None!")
     # ------------------------------------
 
+                        pipeline_log.start(
+                            "DATABASE COMMIT",
+                            operation="insert chunk",
+                            filename=doc.title,
+                            page=page_index + 1,
+                            chunk_index=i + 1,
+                        )
                         db.execute(
                             text("""
                                 insert into chunks
@@ -4611,21 +4940,73 @@ async def ingest_stream(
                             }
                         )
                         db.commit()
+                        pipeline_log.end("DATABASE COMMIT")
                         print(f"CHUNK {i} SALVATO CON TOPIC: {doc.title}")
 
+                    total_pages_processed += 1
+                    print(
+                        "[PAGE PROCESSING]",
+                        "END",
+                        "page:",
+                        page_index + 1,
+                        "chunks_created:",
+                        len(chunks),
+                        "Elapsed:",
+                        f"{_upload_elapsed(page_start):.3f} sec",
+                    )
+
+                print(
+                    "[DOCUMENT PROCESSING]",
+                    "END",
+                    "filename:",
+                    doc.title,
+                    "pages:",
+                    total_pages,
+                    "ocr_pages:",
+                    document_ocr_pages,
+                    "chunks_created:",
+                    document_chunks_created,
+                    "embedding_calls:",
+                    document_embedding_calls,
+                    "Elapsed:",
+                    f"{_upload_elapsed(document_start):.3f} sec",
+                )
             
             log_chunk_role_counts(project_chunk_roles)
 
+            pipeline_log.start(
+                "TOPIC GENERATION",
+                action="schedule background task",
+                chunks_created=total_chunks_created,
+            )
             background_tasks.add_task(process_topics_task, project_id)
             print("✅ BACKGROUND TOPICS TASK SCHEDULED:", project_id)
+            pipeline_log.end("TOPIC GENERATION")
+
+            pipeline_log.total(
+                documents=total_files,
+                total_file_size_bytes=total_file_size,
+                pages_processed=total_pages_processed,
+                ocr_pages=total_ocr_pages,
+                chunks_created=total_chunks_created,
+                average_chunk_size=(
+                    round(total_chunk_chars / total_chunks_created, 1)
+                    if total_chunks_created
+                    else 0
+                ),
+                embeddings_created=total_embedding_calls,
+            )
 
             yield "Upload complete ✅\n"
 
         except Exception as e:
+            pipeline_log.fail(e)
             print("UPLOAD EXCEPTION:", repr(e))
             db.rollback()
+            pipeline_log.start("DATABASE COMMIT", operation="set topic_status error")
             db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
             db.commit()
+            pipeline_log.end("DATABASE COMMIT")
             yield f"Upload failed: {str(e)}\n"
         finally:
             db.close()
@@ -7639,6 +8020,10 @@ async def generate_quiz(
                         question,
                         correct_answer,
                         options,
+                        explanation,
+                        explanation_long,
+                        source_document,
+                        source_page,
                         topic,
                         question_order
                     )
@@ -7647,6 +8032,10 @@ async def generate_quiz(
                         :question,
                         :correct_answer,
                         :options,
+                        :explanation,
+                        :explanation_long,
+                        :source_document,
+                        :source_page,
                         :topic,
                         :question_order
                     )
@@ -7657,6 +8046,10 @@ async def generate_quiz(
                     "question": q["question"],
                     "correct_answer": q["correct_answer"],
                     "options": json.dumps(q["options"]),
+                    "explanation": q.get("explanation"),
+                    "explanation_long": q.get("explanation_long"),
+                    "source_document": q.get("source_document"),
+                    "source_page": q.get("source_page"),
                     "topic": q.get("topic"),
                     "question_order": i
                 }
@@ -7664,6 +8057,7 @@ async def generate_quiz(
 
             new_id = result.fetchone()[0]
             q["id"] = str(new_id)   # 👈 QUESTO È IL FIX CRITICO
+            q["quiz_id"] = str(quiz_id)
             saved_question_count += 1
 
         if saved_question_count != req.num_questions:
@@ -10075,7 +10469,8 @@ async def get_quiz(quiz_id: str):
 
     rows = db.execute(
         text("""
-            select question, options, correct, explanation, explanation_long,
+            select id, quiz_id, question, options, correct_answer, correct,
+                   explanation, explanation_long,
                    source_document, source_page, topic
             from quiz_questions
             where quiz_id = :quiz_id
@@ -10089,18 +10484,22 @@ async def get_quiz(quiz_id: str):
     questions = []
 
     for r in rows:
+        correct_answer = r[4] if r[4] is not None else r[5]
         questions.append({
-            "question": r[0],
-            "options": r[1] if isinstance(r[1], list) else json.loads(r[1]),
-            "correct": r[2],
-            "explanation": r[3],
-            "explanation_long": r[4],
-            "source_document": r[5],
-            "source_page": r[6],
-            "topic": r[7],
+            "id": str(r[0]),
+            "quiz_id": str(r[1]),
+            "question": r[2],
+            "options": r[3] if isinstance(r[3], list) else json.loads(r[3]),
+            "correct_answer": correct_answer,
+            "correct": correct_answer,
+            "explanation": r[6],
+            "explanation_long": r[7],
+            "source_document": r[8],
+            "source_page": r[9],
+            "topic": r[10],
         })
 
-    return {"questions": questions}
+    return {"quiz_id": quiz_id, "questions": questions}
 
 @app.post("/save_quiz_attempt")
 async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
