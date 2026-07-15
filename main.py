@@ -70,6 +70,8 @@ MAX_VISIBLE_PLANNER_MODULES = int(
 MAX_WARNING_PAGES = 100
 MAX_STRONG_WARNING_PAGES = 180
 
+_UPLOAD_DIAGNOSTIC_SUMMARIES = {}
+
 
 class UploadPipelineLogger:
     def __init__(self, pipeline: str, project_id: Optional[str] = None):
@@ -78,6 +80,8 @@ class UploadPipelineLogger:
         self.total_start = time.perf_counter()
         self.current_phase = None
         self.current_phase_start = None
+        self.phase_totals = {}
+        self.latest_counters = {}
 
     def header(self):
         print("==========================")
@@ -100,6 +104,10 @@ class UploadPipelineLogger:
             if self.current_phase_start is not None
             else 0
         )
+        self.phase_totals[phase_name] = (
+            self.phase_totals.get(phase_name, 0) + elapsed
+        )
+        self.latest_counters.update(counters)
         print(f"[{phase_name}]")
         self._print_counters(counters)
         print("END")
@@ -124,9 +132,103 @@ class UploadPipelineLogger:
 
     def total(self, **counters):
         elapsed = time.perf_counter() - self.total_start
+        self.latest_counters.update(counters)
         print("[FINAL COMPLETION]")
         self._print_counters(counters)
         print(f"Total pipeline time: {elapsed:.3f} sec")
+
+    def snapshot(self, **counters):
+        elapsed = time.perf_counter() - self.total_start
+        merged_counters = {
+            **self.latest_counters,
+            **counters,
+        }
+        return {
+            "project_id": self.project_id,
+            "phase_totals": dict(self.phase_totals),
+            "counters": merged_counters,
+            "total_elapsed": elapsed,
+        }
+
+    def failure_summary(self, exc: BaseException):
+        phase_name = self.current_phase or "UNKNOWN"
+        elapsed = (
+            time.perf_counter() - self.current_phase_start
+            if self.current_phase_start is not None
+            else time.perf_counter() - self.total_start
+        )
+        print("==================================================")
+        print("UPLOAD FAILED")
+        print("==================================================")
+        print("Current phase:", phase_name)
+        print(f"Elapsed until failure: {elapsed:.3f} sec")
+        print("Exception:", repr(exc))
+        print("Traceback:")
+        print(traceback.format_exc())
+        self.print_summary(
+            title="COMPLETED PHASE TIMING SUMMARY",
+            snapshot=self.snapshot(),
+        )
+
+    @staticmethod
+    def print_summary(title: str, snapshot: dict):
+        counters = snapshot.get("counters", {})
+        phase_totals = snapshot.get("phase_totals", {})
+
+        def counter(*names, default=0):
+            for name in names:
+                if counters.get(name) is not None:
+                    return counters.get(name)
+            return default
+
+        def elapsed(*names):
+            return sum(phase_totals.get(name, 0) for name in names)
+
+        def row(label, value):
+            print(f"{label:.<30}{value}")
+
+        print("==================================================")
+        print(title)
+        print("==================================================")
+        print("Project ID:", snapshot.get("project_id") or "-")
+        print("Filename:", counter("filename", "filenames", default="-"))
+        print()
+        row("Pages processed", counter("pages_processed", "chunks_processed"))
+        row("OCR pages", counter("ocr_pages", default=0))
+        print()
+        row("Chunks generated", counter("chunks_created", "chunks_processed"))
+        row("Embeddings", counter("embeddings_created", default=0))
+        print()
+        row("Sections", counter("sections", default=0))
+        row("Mini-groups", counter("mini_groups_created", default=0))
+        print()
+        row("Topics before consolidation", counter("initial_topics", "topics_generated"))
+        row("Topics after consolidation", counter("final_topics", "topics_persisted"))
+        print()
+        row("Topic assignment matches", counter("matches_created", default=0))
+        print("---------------------------------------")
+        print()
+        row("PDF loading", f"{elapsed('PDF LOADING'):.2f} s")
+        row("OCR", f"{elapsed('OCR'):.2f} s")
+        row("Chunk generation", f"{elapsed('CHUNK GENERATION'):.2f} s")
+        row("Embeddings", f"{elapsed('EMBEDDING GENERATION'):.2f} s")
+        row("Topic generation", f"{elapsed('TOPIC GENERATION'):.2f} s")
+        row("Consolidation", f"{elapsed('TOPIC CONSOLIDATION'):.2f} s")
+        row("Topic persistence", f"{elapsed('TOPIC PERSISTENCE'):.2f} s")
+        assignment_elapsed = elapsed(
+            'TOPIC ASSIGNMENT SETUP',
+            'TOPIC ASSIGNMENT PHASE A',
+            'TOPIC ASSIGNMENT RESCUE PHASE',
+        )
+        if assignment_elapsed == 0:
+            assignment_elapsed = elapsed('TOPIC ASSIGNMENT')
+        row("Topic assignment", f"{assignment_elapsed:.2f} s")
+        print()
+        print("---------------------------------------")
+        print()
+        row("TOTAL PIPELINE", f"{snapshot.get('total_elapsed', 0):.2f} s")
+        print()
+        print("==================================================")
 
     def _print_counters(self, counters):
         for key, value in counters.items():
@@ -139,6 +241,33 @@ def _upload_timer():
 
 def _upload_elapsed(start):
     return time.perf_counter() - start
+
+
+def _merge_upload_diagnostic_snapshots(*snapshots):
+    merged = {
+        "project_id": None,
+        "phase_totals": {},
+        "counters": {},
+        "total_elapsed": 0,
+    }
+
+    for snapshot in snapshots:
+        if not snapshot:
+            continue
+
+        merged["project_id"] = (
+            merged["project_id"]
+            or snapshot.get("project_id")
+        )
+        merged["total_elapsed"] += snapshot.get("total_elapsed", 0)
+        merged["counters"].update(snapshot.get("counters", {}))
+
+        for phase, elapsed in snapshot.get("phase_totals", {}).items():
+            merged["phase_totals"][phase] = (
+                merged["phase_totals"].get(phase, 0) + elapsed
+            )
+
+    return merged
 
 MAX_TOPIC_PROCESSING_SECONDS = 600
 MAX_ASSIGNMENT_MATCHES = 30000
@@ -313,10 +442,10 @@ SessionLocal = sessionmaker(bind=engine)
 
 def verify_user(authorization: str = Header(None)):
     
-    print("AUTH HEADER:", authorization)
-
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    print("Authenticated request received.")
 
     response = requests.get(
         f"{SUPABASE_URL}/auth/v1/user",
@@ -3079,8 +3208,9 @@ def process_topics_task(project_id: str):
 
         for chunk in all_chunks:
             section_groups[chunk["section"]].append(chunk["text"])
-            print("📚 TOTAL SECTIONS:", len(section_groups))
-            print("📦 TOTAL CHUNKS:", len(all_chunks))
+
+        print("📚 TOTAL SECTIONS:", len(section_groups))
+        print("📦 TOTAL CHUNKS:", len(all_chunks))
         
         seen_titles = set()
         all_candidate_topics = []
@@ -3727,7 +3857,7 @@ def process_topics_task(project_id: str):
         # 🔥 DELETE OLD TOPIC-CHUNK LINKS
 
         pipeline_log.start(
-            "DATABASE COMMIT",
+            "TOPIC PERSISTENCE",
             operation="persist topics",
             topics_to_persist=len(topic_ledger),
         )
@@ -3807,7 +3937,7 @@ def process_topics_task(project_id: str):
             "seconds"
         )
         pipeline_log.end(
-            "DATABASE COMMIT",
+            "TOPIC PERSISTENCE",
             topics_persisted=len(topic_ledger),
         )
 
@@ -3817,13 +3947,25 @@ def process_topics_task(project_id: str):
 
         try:
             assign_topics_to_chunks(project_id)
+            assignment_matches = db.execute(
+                text("""
+                    SELECT count(*)
+                    FROM topic_chunks tc
+                    JOIN topics t ON t.id = tc.topic_id
+                    WHERE t.project_id = :project_id
+                """),
+                {"project_id": project_id}
+            ).scalar()
             print("✅ TOPIC-CHUNK ASSIGNMENT COMPLETED")
             print(
             "⏱️ ASSIGNMENT COMPLETE:",
             round(time.time() - topic_phase_timer, 1),
             "seconds"
         )
-            pipeline_log.end("TOPIC ASSIGNMENT")
+            pipeline_log.end(
+                "TOPIC ASSIGNMENT",
+                matches_created=assignment_matches,
+            )
         except Exception as e:
             pipeline_log.fail(e, "TOPIC ASSIGNMENT")
             print("❌ TOPIC-CHUNK ASSIGNMENT FAILED:", e)
@@ -3890,15 +4032,48 @@ def process_topics_task(project_id: str):
             topic_status=check[0],
         )
         pipeline_log.total(
+            sections=len(section_groups),
+            mini_groups_created=total_mini_groups,
+            initial_topics=total_candidate_topics,
+            final_topics=final_topics,
             topics_persisted=len(topic_ledger),
+            matches_created=assignment_matches,
             topic_status=check[0],
         )
+        topic_snapshot = pipeline_log.snapshot(
+            sections=len(section_groups),
+            mini_groups_created=total_mini_groups,
+            initial_topics=total_candidate_topics,
+            final_topics=final_topics,
+            topics_persisted=len(topic_ledger),
+            matches_created=assignment_matches,
+            topic_status=check[0],
+        )
+        existing_summary = _UPLOAD_DIAGNOSTIC_SUMMARIES.get(project_id, {})
+        combined_snapshot = _merge_upload_diagnostic_snapshots(
+            existing_summary.get("upload"),
+            topic_snapshot,
+        )
+        UploadPipelineLogger.print_summary(
+            "UPLOAD PIPELINE SUMMARY",
+            combined_snapshot,
+        )
+        _UPLOAD_DIAGNOSTIC_SUMMARIES.pop(project_id, None)
 
         final_db.close()
         
 
     except Exception as e:
-        pipeline_log.fail(e)
+        pipeline_log.failure_summary(e)
+        existing_summary = _UPLOAD_DIAGNOSTIC_SUMMARIES.get(project_id, {})
+        combined_snapshot = _merge_upload_diagnostic_snapshots(
+            existing_summary.get("upload"),
+            pipeline_log.snapshot(),
+        )
+        UploadPipelineLogger.print_summary(
+            "COMPLETED PHASE TIMING SUMMARY",
+            combined_snapshot,
+        )
         db.rollback()
         print("BACKGROUND TOPICS ERROR:", e)
         pipeline_log.start(
@@ -4985,6 +5160,7 @@ async def ingest_stream(
 
             pipeline_log.total(
                 documents=total_files,
+                filenames=", ".join(doc.title for doc in docs),
                 total_file_size_bytes=total_file_size,
                 pages_processed=total_pages_processed,
                 ocr_pages=total_ocr_pages,
@@ -4996,11 +5172,27 @@ async def ingest_stream(
                 ),
                 embeddings_created=total_embedding_calls,
             )
+            _UPLOAD_DIAGNOSTIC_SUMMARIES[project_id] = {
+                "upload": pipeline_log.snapshot(
+                    documents=total_files,
+                    filenames=", ".join(doc.title for doc in docs),
+                    total_file_size_bytes=total_file_size,
+                    pages_processed=total_pages_processed,
+                    ocr_pages=total_ocr_pages,
+                    chunks_created=total_chunks_created,
+                    average_chunk_size=(
+                        round(total_chunk_chars / total_chunks_created, 1)
+                        if total_chunks_created
+                        else 0
+                    ),
+                    embeddings_created=total_embedding_calls,
+                )
+            }
 
             yield "Upload complete ✅\n"
 
         except Exception as e:
-            pipeline_log.fail(e)
+            pipeline_log.failure_summary(e)
             print("UPLOAD EXCEPTION:", repr(e))
             db.rollback()
             pipeline_log.start("DATABASE COMMIT", operation="set topic_status error")
