@@ -3336,7 +3336,11 @@ CREATE TABLE public.projects (
     created_at timestamp with time zone DEFAULT now(),
     user_id uuid,
     topic_status text DEFAULT 'idle'::text,
-    taxonomy_language text
+    taxonomy_language text,
+    study_mode text DEFAULT 'building'::text NOT NULL,
+    CONSTRAINT projects_study_mode_check CHECK (
+        study_mode = ANY (ARRAY['building'::text, 'learning'::text])
+    )
 );
 
 

@@ -269,6 +269,150 @@ def _merge_upload_diagnostic_snapshots(*snapshots):
 
     return merged
 
+
+def _unique_sorted(values):
+    return sorted({
+        str(value).strip()
+        for value in values
+        if value is not None and str(value).strip()
+    })
+
+
+def _print_name_list(title, values):
+    names = _unique_sorted(values)
+    print(f"{title}:")
+    if not names:
+        print("- none")
+        return
+
+    for name in names:
+        print(f"- {name}")
+
+
+def _get_taxonomy_diagnostic_snapshot(db, project_id: str):
+    documents_count = db.execute(
+        text("""
+            SELECT count(*)
+            FROM documents
+            WHERE project_id = :project_id
+        """),
+        {"project_id": project_id}
+    ).scalar()
+
+    chunks_count = db.execute(
+        text("""
+            SELECT count(*)
+            FROM chunks
+            WHERE project_id = :project_id
+        """),
+        {"project_id": project_id}
+    ).scalar()
+
+    taxonomy_rows = db.execute(
+        text("""
+            SELECT
+                topic,
+                category,
+                source_section
+            FROM topics
+            WHERE project_id = :project_id
+            ORDER BY category, topic
+        """),
+        {"project_id": project_id}
+    ).fetchall()
+
+    topic_titles = _unique_sorted(row[0] for row in taxonomy_rows)
+    categories = _unique_sorted(row[1] for row in taxonomy_rows)
+    macro_categories = _unique_sorted(row[2] for row in taxonomy_rows)
+
+    return {
+        "project_id": project_id,
+        "documents_count": documents_count,
+        "chunks_count": chunks_count,
+        "macro_categories": macro_categories,
+        "categories": categories,
+        "topic_titles": topic_titles,
+    }
+
+
+def _print_taxonomy_state_snapshot(title, snapshot):
+    print("=====================================")
+    print(title)
+    print("=====================================")
+    print("Project ID:", snapshot["project_id"])
+    print("Documents:", snapshot["documents_count"])
+    print("Chunks:", snapshot["chunks_count"])
+    print("Existing macro-categories:", len(snapshot["macro_categories"]))
+    print("Existing categories:", len(snapshot["categories"]))
+    print("Existing topics:", len(snapshot["topic_titles"]))
+    _print_name_list("Existing macro-category names", snapshot["macro_categories"])
+    _print_name_list("Existing category names", snapshot["categories"])
+    _print_name_list("Existing topic titles", snapshot["topic_titles"])
+    print("=====================================")
+
+
+def _print_taxonomy_evolution_summary(before_snapshot, after_snapshot):
+    before_topics = set(before_snapshot["topic_titles"])
+    after_topics = set(after_snapshot["topic_titles"])
+    before_categories = set(before_snapshot["categories"])
+    after_categories = set(after_snapshot["categories"])
+    before_macro_categories = set(before_snapshot["macro_categories"])
+    after_macro_categories = set(after_snapshot["macro_categories"])
+
+    created_topics = sorted(after_topics - before_topics)
+    preserved_topics = sorted(before_topics & after_topics)
+    removed_topics = sorted(before_topics - after_topics)
+    created_categories = sorted(after_categories - before_categories)
+    preserved_categories = sorted(before_categories & after_categories)
+    removed_categories = sorted(before_categories - after_categories)
+    created_macro_categories = sorted(
+        after_macro_categories - before_macro_categories
+    )
+    preserved_macro_categories = sorted(
+        before_macro_categories & after_macro_categories
+    )
+    removed_macro_categories = sorted(
+        before_macro_categories - after_macro_categories
+    )
+
+    _print_name_list("New macro-categories created", created_macro_categories)
+    _print_name_list("New categories created", created_categories)
+    _print_name_list("New topics created", created_topics)
+    _print_name_list("Existing topics still present", preserved_topics)
+    _print_name_list("Removed topics", removed_topics)
+    print("Total macro-categories:", len(after_macro_categories))
+    print("Total categories:", len(after_categories))
+    print("Total topics:", len(after_topics))
+
+    print("=====================================")
+    print("TAXONOMY EVOLUTION")
+    print("=====================================")
+    print(
+        f"Documents before.............{before_snapshot['documents_count']}"
+    )
+    print(
+        f"Documents after..............{after_snapshot['documents_count']}"
+    )
+    print()
+    print(f"Macro-categories before......{len(before_macro_categories)}")
+    print(f"Macro-categories created.....{len(created_macro_categories)}")
+    print(f"Macro-categories preserved...{len(preserved_macro_categories)}")
+    print(f"Macro-categories removed.....{len(removed_macro_categories)}")
+    print(f"Macro-categories after.......{len(after_macro_categories)}")
+    print()
+    print(f"Categories before............{len(before_categories)}")
+    print(f"Categories created...........{len(created_categories)}")
+    print(f"Categories preserved.........{len(preserved_categories)}")
+    print(f"Categories removed...........{len(removed_categories)}")
+    print(f"Categories after.............{len(after_categories)}")
+    print()
+    print(f"Topics before................{len(before_topics)}")
+    print(f"Topics created...............{len(created_topics)}")
+    print(f"Topics preserved.............{len(preserved_topics)}")
+    print(f"Topics removed...............{len(removed_topics)}")
+    print(f"Topics after.................{len(after_topics)}")
+    print("=====================================")
+
 MAX_TOPIC_PROCESSING_SECONDS = 600
 MAX_ASSIGNMENT_MATCHES = 30000
 HARD_ACCEPTED_DIAGNOSTIC_SAMPLE_SIZE = 10
@@ -1131,13 +1275,14 @@ def create_project(
 
     db.execute(
         text("""
-            insert into projects (id, name, user_id)
-            values (:id, :name, :user_id)
+            insert into projects (id, name, user_id, study_mode)
+            values (:id, :name, :user_id, :study_mode)
         """),
         {
             "id": project_id,
             "name": data.name,
-            "user_id": user_id
+            "user_id": user_id,
+            "study_mode": "building"
         }
     )
 
@@ -1146,7 +1291,8 @@ def create_project(
 
     return {
         "project_id": project_id,
-        "name": data.name
+        "name": data.name,
+        "study_mode": "building"
     }
 
 
@@ -1164,7 +1310,7 @@ def list_projects(
 
     rows = db.execute(
         text("""
-            select id, name
+            select id, name, coalesce(study_mode, 'building') as study_mode
             from projects
             where user_id = :user_id
             order by name
@@ -1176,9 +1322,56 @@ def list_projects(
 
     return {
         "projects": [
-            {"id": r[0], "name": r[1]}
+            {"id": r[0], "name": r[1], "study_mode": r[2]}
             for r in rows
         ]
+    }
+
+
+@app.post("/projects/{project_id}/begin_study")
+def begin_project_study(
+    project_id: str,
+    user = Depends(verify_user)
+):
+
+    user_id = user["id"]
+    db = SessionLocal()
+
+    project = db.execute(
+        text("""
+            select id
+            from projects
+            where id = :project_id
+            and user_id = :user_id
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
+    ).fetchone()
+
+    if not project:
+        db.close()
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    db.execute(
+        text("""
+            update projects
+            set study_mode = 'learning'
+            where id = :project_id
+            and user_id = :user_id
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id
+        }
+    )
+    db.commit()
+    db.close()
+
+    return {
+        "project_id": project_id,
+        "study_mode": "learning"
     }
 
 # ======================
@@ -3032,11 +3225,33 @@ def process_topics_task(project_id: str):
        
         topic_phase_timer = time.time()
         topic_start_time = time.time()
+        taxonomy_before_generation = _get_taxonomy_diagnostic_snapshot(
+            db,
+            project_id,
+        )
+        _print_taxonomy_state_snapshot(
+            "TAXONOMY STATE BEFORE GENERATION",
+            taxonomy_before_generation,
+        )
         # 1. Update status and clear old topics
         pipeline_log.start(
             "DATABASE COMMIT",
             operation="set processing and clear old topics",
         )
+        _print_name_list(
+            "Deleted macro-categories",
+            taxonomy_before_generation["macro_categories"],
+        )
+        _print_name_list(
+            "Deleted categories",
+            taxonomy_before_generation["categories"],
+        )
+        _print_name_list(
+            "Deleted topics",
+            taxonomy_before_generation["topic_titles"],
+        )
+        print("Updated topics:")
+        print("- none")
         db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
         db.execute(text("delete from topics where project_id = :project_id"), {"project_id": project_id})
         ensure_project_chunk_roles(db, project_id)
@@ -3939,6 +4154,18 @@ def process_topics_task(project_id: str):
         pipeline_log.end(
             "TOPIC PERSISTENCE",
             topics_persisted=len(topic_ledger),
+        )
+        taxonomy_after_generation = _get_taxonomy_diagnostic_snapshot(
+            db,
+            project_id,
+        )
+        _print_taxonomy_state_snapshot(
+            "TAXONOMY STATE AFTER GENERATION",
+            taxonomy_after_generation,
+        )
+        _print_taxonomy_evolution_summary(
+            taxonomy_before_generation,
+            taxonomy_after_generation,
         )
 
         topic_phase_timer = time.time()
