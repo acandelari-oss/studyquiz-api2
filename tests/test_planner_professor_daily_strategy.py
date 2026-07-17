@@ -86,6 +86,57 @@ class ProfessorDailyStrategyBuilderTests(unittest.TestCase):
 
         self.assertEqual(activity.activity_type, ProfessorDailyActivityType.FLASHCARDS)
 
+    def test_reinforce_with_quiz_weakness_maps_to_quiz(self):
+        activity = self._activity_for(
+            self._weekly_strategy(
+                "Category",
+                ProfessorCategoryStrategyCode.REINFORCE,
+            ),
+            analytics=CategoryAnalytics(
+                accuracy=0.40,
+                quiz_accuracy=0.40,
+                flashcard_accuracy=0.90,
+                coverage=0.90,
+            ),
+        )
+
+        self.assertEqual(activity.activity_type, ProfessorDailyActivityType.QUIZ)
+
+    def test_reinforce_with_flashcard_weakness_maps_to_flashcards(self):
+        activity = self._activity_for(
+            self._weekly_strategy(
+                "Category",
+                ProfessorCategoryStrategyCode.REINFORCE,
+            ),
+            analytics=CategoryAnalytics(
+                accuracy=0.50,
+                quiz_accuracy=0.90,
+                flashcard_accuracy=0.50,
+                coverage=0.90,
+            ),
+        )
+
+        self.assertEqual(activity.activity_type, ProfessorDailyActivityType.FLASHCARDS)
+
+    def test_reinforce_with_mixed_weakness_maps_to_mixed_activity(self):
+        activity = self._activity_for(
+            self._weekly_strategy(
+                "Category",
+                ProfessorCategoryStrategyCode.REINFORCE,
+            ),
+            analytics=CategoryAnalytics(
+                accuracy=0.40,
+                quiz_accuracy=0.40,
+                flashcard_accuracy=0.50,
+                coverage=0.90,
+            ),
+        )
+
+        self.assertEqual(
+            activity.activity_type,
+            ProfessorDailyActivityType.QUIZ_PLUS_FLASHCARDS,
+        )
+
     def test_assessment_maps_to_quiz(self):
         activity = self._activity_for(
             self._weekly_strategy(

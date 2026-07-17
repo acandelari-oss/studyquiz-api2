@@ -198,6 +198,10 @@ def _build_category_analytics(
         category: {
             "correct": 0,
             "total": 0,
+            "quiz_correct": 0,
+            "quiz_total": 0,
+            "flashcard_correct": 0,
+            "flashcard_total": 0,
             "studied_topics": set(),
             "last_reviewed_at": None,
         }
@@ -211,6 +215,7 @@ def _build_category_analytics(
             topic=event["topic"],
             is_correct=event["is_correct"],
             occurred_at=event["occurred_at"],
+            source="quiz",
         )
 
     for event in _load_flashcard_events(
@@ -224,6 +229,7 @@ def _build_category_analytics(
             topic=event["topic"],
             is_correct=event["is_correct"],
             occurred_at=event["occurred_at"],
+            source="flashcard",
         )
 
     analytics = {}
@@ -238,6 +244,17 @@ def _build_category_analytics(
             accuracy=(
                 category_stats["correct"] / total
                 if total > 0
+                else None
+            ),
+            quiz_accuracy=(
+                category_stats["quiz_correct"] / category_stats["quiz_total"]
+                if category_stats["quiz_total"] > 0
+                else None
+            ),
+            flashcard_accuracy=(
+                category_stats["flashcard_correct"]
+                / category_stats["flashcard_total"]
+                if category_stats["flashcard_total"] > 0
                 else None
             ),
             coverage=(
@@ -329,6 +346,7 @@ def _apply_learning_event(
     topic,
     is_correct,
     occurred_at,
+    source,
 ):
     topic_key = _normalize_topic_key(topic)
     category = topic_lookup.get(topic_key)
@@ -341,6 +359,16 @@ def _apply_learning_event(
 
     if is_correct:
         category_stats["correct"] += 1
+
+    if source == "quiz":
+        category_stats["quiz_total"] += 1
+        if is_correct:
+            category_stats["quiz_correct"] += 1
+
+    if source == "flashcard":
+        category_stats["flashcard_total"] += 1
+        if is_correct:
+            category_stats["flashcard_correct"] += 1
 
     category_stats["studied_topics"].add(topic_key)
 

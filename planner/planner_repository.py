@@ -115,6 +115,26 @@ class PlannerRepository:
             ),
         )
 
+    def load_week_planning_parameters(
+        self,
+        week_id: str,
+    ) -> Mapping[str, Any]:
+        """Return persisted generation parameters for one Week."""
+
+        row = self.db.execute(
+            text("""
+                select planning_parameters
+                from planner_weeks
+                where id = :week_id
+            """),
+            {"week_id": week_id},
+        ).fetchone()
+
+        if not row:
+            return {}
+
+        return self._json_value(row[0], default={}) or {}
+
     def save_active_week(
         self,
         project_id: str,
@@ -175,6 +195,110 @@ class PlannerRepository:
                 "week_id": active_week.id,
             },
         )
+        self._commit_if_available()
+        return self.load_week(active_week.id)
+
+    def complete_daily_plan(
+        self,
+        project_id: str,
+        session_index: int,
+        session_results: Mapping[str, Any],
+        professor_debrief: str = "",
+        homework_recommendation: str = "",
+        study_plan_debrief: str = "",
+    ) -> Optional[Week]:
+        """Persist completion data for one module of the active Week."""
+
+        active_week = self.load_active_week(project_id=project_id)
+
+        if not active_week:
+            return None
+
+        daily_row = self.db.execute(
+            text("""
+                select id, summary
+                from planner_daily_plans
+                where week_id = :week_id
+                and session_index = :session_index
+            """),
+            {
+                "week_id": active_week.id,
+                "session_index": session_index,
+            },
+        ).fetchone()
+
+        if not daily_row:
+            return active_week
+
+        existing_summary = self._json_value(daily_row[1], default={}) or {}
+        summary = {
+            **existing_summary,
+            "session_data": self._build_runtime_session_data(session_results),
+            "professor_debrief": (
+                professor_debrief
+                or existing_summary.get("professor_debrief")
+                or ""
+            ),
+            "homework_recommendations": (
+                [
+                    {
+                        "text": homework_recommendation,
+                        "rationale": "",
+                        "related_categories": [],
+                        "estimated_effort": 10,
+                    }
+                ]
+                if homework_recommendation
+                else existing_summary.get("homework_recommendations", []) or []
+            ),
+        }
+
+        self.db.execute(
+            text("""
+                update planner_daily_plans
+                set status = :status,
+                    summary = :summary,
+                    updated_at = CURRENT_TIMESTAMP
+                where id = :daily_plan_id
+            """).bindparams(
+                bindparam("summary", type_=JSON),
+            ),
+            {
+                "status": DailyStatus.COMPLETED.value,
+                "summary": self._json_data(summary),
+                "daily_plan_id": str(daily_row[0]),
+            },
+        )
+
+        weekly_statistics = self._completed_weekly_statistics(active_week.id)
+        current_statistics = serialize_planner_domain(active_week.weekly_statistics)
+        metadata = {
+            **(current_statistics.get("metadata", {}) or {}),
+            "runtime_statistics": weekly_statistics.pop("runtime_statistics"),
+        }
+        weekly_statistics = {
+            **current_statistics,
+            **weekly_statistics,
+            "metadata": metadata,
+        }
+
+        self.db.execute(
+            text("""
+                update planner_weeks
+                set weekly_statistics = :weekly_statistics,
+                    weekly_review = coalesce(:weekly_review, weekly_review),
+                    updated_at = CURRENT_TIMESTAMP
+                where id = :week_id
+            """).bindparams(
+                bindparam("weekly_statistics", type_=JSON),
+            ),
+            {
+                "weekly_statistics": self._json_data(weekly_statistics),
+                "weekly_review": study_plan_debrief or None,
+                "week_id": active_week.id,
+            },
+        )
+
         self._commit_if_available()
         return self.load_week(active_week.id)
 
@@ -458,6 +582,121 @@ class PlannerRepository:
             office_hours_offer=None,
             extra_session_offer=None,
         )
+
+    def _build_runtime_session_data(
+        self,
+        session_results: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        quiz_questions = int(session_results.get("quizQuestions") or 0)
+        quiz_correct = int(session_results.get("quizCorrect") or 0)
+        started_at_ms = session_results.get("startedAtMs")
+        completed_at_ms = session_results.get("completedAtMs")
+        study_time_minutes = self._runtime_duration_minutes(
+            started_at_ms,
+            completed_at_ms,
+        )
+
+        return {
+            "flashcards": int(session_results.get("flashcardsReviewed") or 0),
+            "flashcards_reviewed": int(
+                session_results.get("flashcardsReviewed") or 0
+            ),
+            "quiz": quiz_questions,
+            "quizzes_completed": int(
+                session_results.get("quizzesCompleted") or 0
+            ),
+            "quiz_questions": quiz_questions,
+            "quiz_correct": quiz_correct,
+            "accuracy": (
+                f"{round((quiz_correct / quiz_questions) * 100)}%"
+                if quiz_questions
+                else "—"
+            ),
+            "time": (
+                f"{study_time_minutes} min"
+                if study_time_minutes
+                else "—"
+            ),
+            "study_time_minutes": study_time_minutes,
+            "started_at_ms": started_at_ms,
+            "completed_at_ms": completed_at_ms,
+            "activity_results": session_results.get("activityResults", []) or [],
+        }
+
+    def _completed_weekly_statistics(self, week_id: str) -> Mapping[str, Any]:
+        rows = self.db.execute(
+            text("""
+                select summary
+                from planner_daily_plans
+                where week_id = :week_id
+                and status = :status
+                order by session_index asc
+            """),
+            {
+                "week_id": week_id,
+                "status": DailyStatus.COMPLETED.value,
+            },
+        ).fetchall()
+
+        runtime_statistics = {
+            "flashcards_reviewed": 0,
+            "quizzes_completed": 0,
+            "quiz_questions": 0,
+            "quiz_correct": 0,
+            "study_time_minutes": 0,
+        }
+
+        for row in rows:
+            summary = self._json_value(row[0], default={}) or {}
+            session_data = summary.get("session_data", {}) or {}
+            runtime_statistics["flashcards_reviewed"] += int(
+                session_data.get("flashcards_reviewed")
+                or session_data.get("flashcards")
+                or 0
+            )
+            runtime_statistics["quizzes_completed"] += int(
+                session_data.get("quizzes_completed") or 0
+            )
+            runtime_statistics["quiz_questions"] += int(
+                session_data.get("quiz_questions")
+                or session_data.get("quiz")
+                or 0
+            )
+            runtime_statistics["quiz_correct"] += int(
+                session_data.get("quiz_correct") or 0
+            )
+            runtime_statistics["study_time_minutes"] += int(
+                session_data.get("study_time_minutes") or 0
+            )
+
+        quiz_questions = runtime_statistics["quiz_questions"]
+
+        return {
+            "sessions_completed": runtime_statistics["quizzes_completed"],
+            "quiz_accuracy": (
+                runtime_statistics["quiz_correct"] / quiz_questions
+                if quiz_questions
+                else None
+            ),
+            "flashcard_completion": None,
+            "study_time": runtime_statistics["study_time_minutes"] or None,
+            "runtime_statistics": runtime_statistics,
+        }
+
+    def _runtime_duration_minutes(
+        self,
+        started_at_ms: Any,
+        completed_at_ms: Any,
+    ) -> Optional[int]:
+        if not started_at_ms or not completed_at_ms:
+            return None
+
+        try:
+            elapsed = (float(completed_at_ms) - float(started_at_ms)) / 60000
+        except (TypeError, ValueError):
+            return None
+
+        return max(1, round(elapsed))
 
     def _json_data(self, value: Any) -> Any:
         return serialize_planner_domain(value)

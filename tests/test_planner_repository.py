@@ -143,6 +143,49 @@ class PlannerRepositoryTests(unittest.TestCase):
             1,
         )
 
+    def test_completes_daily_plan_and_reloads_runtime_summary(self):
+        repository = PlannerRepository(self.db)
+        week = PlannerEngine().generate_week(self._context(week_id="week-1"))
+
+        repository.save_active_week(project_id="project-1", week=week)
+        repository.complete_daily_plan(
+            project_id="project-1",
+            session_index=1,
+            session_results={
+                "flashcardsReviewed": 0,
+                "quizzesCompleted": 1,
+                "quizQuestions": 5,
+                "quizCorrect": 4,
+                "startedAtMs": 1000,
+                "completedAtMs": 61000,
+                "activityResults": [{"type": "quiz"}],
+            },
+            professor_debrief="The module debrief.",
+            homework_recommendation="Write one concise explanation.",
+            study_plan_debrief="The Study Plan debrief.",
+        )
+
+        loaded_week = repository.load_active_week(project_id="project-1")
+
+        self.assertIsNotNone(loaded_week)
+        self.assertEqual(loaded_week.daily_plans[0].status.value, "COMPLETED")
+        self.assertEqual(
+            loaded_week.daily_plans[0].summary.session_data["quiz_questions"],
+            5,
+        )
+        self.assertEqual(
+            loaded_week.daily_plans[0].summary.professor_debrief,
+            "The module debrief.",
+        )
+        self.assertEqual(
+            loaded_week.daily_plans[0].summary.homework_recommendations[0].text,
+            "Write one concise explanation.",
+        )
+        self.assertEqual(loaded_week.weekly_statistics.sessions_completed, 1)
+        self.assertEqual(loaded_week.weekly_statistics.quiz_accuracy, 0.8)
+        self.assertEqual(loaded_week.weekly_statistics.study_time, 1)
+        self.assertEqual(loaded_week.weekly_review, "The Study Plan debrief.")
+
 
 if __name__ == "__main__":
     unittest.main()

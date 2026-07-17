@@ -7,7 +7,7 @@ only: no natural language, no LLM calls, no persistence, and no frontend data.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, Sequence, cast
+from typing import Mapping, Optional, Sequence, cast
 
 from .category_selector import CategoryAnalytics
 from .planner_models import DailyPlan, PlannerContext
@@ -84,6 +84,8 @@ class ProfessorDailyStrategyBuilder:
     """Build deterministic daily Professor strategy from scheduled allocations."""
 
     UNSTABLE_REVIEW_ACCURACY_THRESHOLD = 0.75
+    WEAK_QUIZ_ACCURACY_THRESHOLD = 0.60
+    WEAK_FLASHCARD_ACCURACY_THRESHOLD = 0.70
 
     QUIZ_SIZE_BY_DEPTH = {
         ProfessorDepthCode.LIGHT: 6,
@@ -184,6 +186,11 @@ class ProfessorDailyStrategyBuilder:
             return ProfessorDailyActivityType.QUIZ
 
         if weekly_category_strategy.strategy == ProfessorCategoryStrategyCode.REINFORCE:
+            source_specific_activity = self._source_specific_reinforcement_activity(
+                analytics
+            )
+            if source_specific_activity is not None:
+                return source_specific_activity
             return ProfessorDailyActivityType.FLASHCARDS
 
         if weekly_category_strategy.strategy == ProfessorCategoryStrategyCode.REVIEW:
@@ -192,6 +199,37 @@ class ProfessorDailyStrategyBuilder:
             return ProfessorDailyActivityType.FLASHCARDS
 
         return ProfessorDailyActivityType.QUIZ
+
+    def _source_specific_reinforcement_activity(
+        self,
+        analytics: CategoryAnalytics,
+    ) -> Optional[ProfessorDailyActivityType]:
+        """Choose the reinforcement activity from persisted evidence source.
+
+        Quiz weakness is treated as conceptual evidence and remains quiz-based.
+        Flashcard weakness is treated as retention evidence and remains
+        flashcard-based. If both signals are weak, the activity is mixed.
+        """
+
+        weak_quiz = (
+            analytics.quiz_accuracy is not None
+            and analytics.quiz_accuracy < self.WEAK_QUIZ_ACCURACY_THRESHOLD
+        )
+        weak_flashcards = (
+            analytics.flashcard_accuracy is not None
+            and analytics.flashcard_accuracy < self.WEAK_FLASHCARD_ACCURACY_THRESHOLD
+        )
+
+        if weak_quiz and weak_flashcards:
+            return ProfessorDailyActivityType.QUIZ_PLUS_FLASHCARDS
+
+        if weak_quiz:
+            return ProfessorDailyActivityType.QUIZ
+
+        if weak_flashcards:
+            return ProfessorDailyActivityType.FLASHCARDS
+
+        return None
 
     def _build_reasoning_codes(
         self,

@@ -154,7 +154,9 @@ class PlannerApiTests(unittest.TestCase):
                 ('project-active', 'Active Week', '2026-06-30', 'user-1', 'completed', 'en'),
                 ('project-generated-only', 'Generated Only', '2026-07-01', 'user-1', 'completed', 'en'),
                 ('project-survey-only', 'Survey Only', '2026-07-02', 'user-1', 'completed', 'en'),
-                ('project-assessment', 'Assessment Project', '2026-07-03', 'user-1', 'completed', 'en')
+                ('project-assessment', 'Assessment Project', '2026-07-03', 'user-1', 'completed', 'en'),
+                ('project-completion', 'Completion Project', '2026-07-04', 'user-1', 'completed', 'en'),
+                ('project-adaptive', 'Adaptive Project', '2026-07-05', 'user-1', 'completed', 'en')
             """))
             db.execute(text("""
                 insert into topics
@@ -178,14 +180,20 @@ class PlannerApiTests(unittest.TestCase):
                 ('survey-topic-3', 'project-survey-only', 'C_UNSURE', 'C Topic', true),
                 ('assessment-topic-1', 'project-assessment', 'A', 'A Topic 1', true),
                 ('assessment-topic-2', 'project-assessment', 'A', 'A Topic 2', true),
-                ('assessment-topic-3', 'project-assessment', 'B', 'B Topic 1', true)
+                ('assessment-topic-3', 'project-assessment', 'B', 'B Topic 1', true),
+                ('completion-topic-1', 'project-completion', 'COMPLETION', 'Completion 1', true),
+                ('completion-topic-2', 'project-completion', 'COMPLETION', 'Completion 2', true),
+                ('completion-topic-3', 'project-completion', 'COMPLETION', 'Completion 3', true),
+                ('adaptive-topic-1', 'project-adaptive', 'QUIZ_WEAK', 'Adaptive Quiz Weak', true),
+                ('adaptive-topic-2', 'project-adaptive', 'FLASH_WEAK', 'Adaptive Flash Weak', true)
             """))
             db.execute(text("""
                 insert into quizzes (id, project_id, user_id)
                 values
                 ('low-quiz', 'project-low', 'user-1'),
                 ('ready-quiz', 'project-ready', 'user-1'),
-                ('generated-quiz', 'project-generated-only', 'user-1')
+                ('generated-quiz', 'project-generated-only', 'user-1'),
+                ('adaptive-quiz', 'project-adaptive', 'user-1')
             """))
             db.execute(text("""
                 insert into quiz_questions (id, quiz_id, topic)
@@ -195,7 +203,8 @@ class PlannerApiTests(unittest.TestCase):
                 ('ready-question-2', 'ready-quiz', 'Ready 2'),
                 ('ready-question-3', 'ready-quiz', 'Ready 3'),
                 ('generated-question-1', 'generated-quiz', 'Generated 1'),
-                ('generated-question-2', 'generated-quiz', 'Generated 2')
+                ('generated-question-2', 'generated-quiz', 'Generated 2'),
+                ('adaptive-question-1', 'adaptive-quiz', 'Adaptive Quiz Weak')
             """))
             db.execute(text("""
                 insert into quiz_answers
@@ -203,13 +212,15 @@ class PlannerApiTests(unittest.TestCase):
                 values
                 ('low-answer-1', 'low-quiz', 'low-question-1', 'user-1', true, '2026-07-01', 'Topic 1'),
                 ('ready-answer-1', 'ready-quiz', 'ready-question-1', 'user-1', true, '2026-07-01', 'Ready 1'),
-                ('ready-answer-2', 'ready-quiz', 'ready-question-2', 'user-1', true, '2026-07-01', 'Ready 2')
+                ('ready-answer-2', 'ready-quiz', 'ready-question-2', 'user-1', true, '2026-07-01', 'Ready 2'),
+                ('adaptive-answer-1', 'adaptive-quiz', 'adaptive-question-1', 'user-1', false, '2026-07-01', 'Adaptive Quiz Weak')
             """))
             db.execute(text("""
                 insert into flashcard_reviews
                 (id, project_id, user_id, is_correct, reviewed_at, topic)
                 values
-                ('ready-review-1', 'project-ready', 'user-1', true, '2026-07-01', 'Ready 3')
+                ('ready-review-1', 'project-ready', 'user-1', true, '2026-07-01', 'Ready 3'),
+                ('adaptive-review-1', 'project-adaptive', 'user-1', false, '2026-07-01', 'Adaptive Flash Weak')
             """))
             db.execute(text("""
                 insert into flashcards
@@ -388,6 +399,209 @@ class PlannerApiTests(unittest.TestCase):
         self.assertEqual(planning_parameters["studyLanguage"], "Italian")
         self.assertEqual(planning_parameters["study_language"], "Italian")
         self.assertEqual(planning_parameters["survey"], {"LOW": "practice"})
+
+    def test_complete_module_persists_dashboard_reload_state(self):
+        client = TestClient(app)
+
+        payload = {
+            "survey": {
+                "COMPLETION": "practice",
+            },
+            "study_language": "English",
+            "preferences": {
+                "studyDurationMinutes": 45,
+                "questionPaceSeconds": 90,
+                "questionStyle": "balanced",
+            },
+        }
+
+        with patch.object(main, "SessionLocal", self._session):
+            generation_response = client.post(
+                "/projects/project-completion/planner/week/generate",
+                json=payload,
+            )
+            completion_response = client.post(
+                "/projects/project-completion/planner/module/complete",
+                json={
+                    "session_index": 1,
+                    "session_results": {
+                        "flashcardsReviewed": 0,
+                        "quizzesCompleted": 1,
+                        "quizQuestions": 5,
+                        "quizCorrect": 4,
+                        "startedAtMs": 1000,
+                        "completedAtMs": 61000,
+                        "activityResults": [{"type": "quiz"}],
+                    },
+                    "professor_debrief": "Persisted module debrief.",
+                    "homework_recommendation": "Persisted homework.",
+                    "study_plan_debrief": "Persisted Study Plan debrief.",
+                },
+            )
+            reload_response = client.get(
+                "/projects/project-completion/planner/week",
+            )
+
+        self.assertEqual(generation_response.status_code, 200)
+        self.assertEqual(completion_response.status_code, 200)
+        self.assertEqual(reload_response.status_code, 200)
+
+        data = reload_response.json()
+        daily_plan = data["week"]["daily_plans"][0]
+
+        self.assertEqual(daily_plan["status"], "COMPLETED")
+        self.assertEqual(
+            daily_plan["summary"]["professor_debrief"],
+            "Persisted module debrief.",
+        )
+        self.assertEqual(
+            daily_plan["summary"]["homework_recommendations"][0]["text"],
+            "Persisted homework.",
+        )
+        self.assertEqual(
+            daily_plan["summary"]["session_data"]["quiz_questions"],
+            5,
+        )
+        self.assertEqual(
+            data["week"]["weekly_statistics"]["metadata"]["runtime_statistics"][
+                "quiz_questions"
+            ],
+            5,
+        )
+        self.assertEqual(
+            data["week"]["weekly_review"],
+            "Persisted Study Plan debrief.",
+        )
+
+    def test_generate_next_week_requires_completed_active_study_plan(self):
+        client = TestClient(app)
+        payload = {
+            "survey": {
+                "COMPLETION": "practice",
+            },
+            "study_language": "English",
+            "preferences": {
+                "studyDurationMinutes": 45,
+                "questionPaceSeconds": 90,
+                "questionStyle": "balanced",
+            },
+        }
+
+        with patch.object(main, "SessionLocal", self._session):
+            generation_response = client.post(
+                "/projects/project-completion/planner/week/generate",
+                json=payload,
+            )
+            next_response = client.post(
+                "/projects/project-completion/planner/week/generate-next",
+            )
+
+        self.assertEqual(generation_response.status_code, 200)
+        self.assertEqual(next_response.status_code, 400)
+        self.assertEqual(
+            next_response.json()["detail"],
+            "Complete the current Study Plan before creating a new one.",
+        )
+
+    def test_generate_next_week_creates_new_active_plan_and_preserves_history(self):
+        client = TestClient(app)
+        payload = {
+            "survey": {
+                "QUIZ_WEAK": "practice",
+                "FLASH_WEAK": "practice",
+            },
+            "study_language": "Italian",
+            "preferences": {
+                "studyDurationMinutes": 30,
+                "questionPaceSeconds": 60,
+                "questionStyle": "exam",
+            },
+        }
+
+        with patch.object(main, "SessionLocal", self._session):
+            generation_response = client.post(
+                "/projects/project-adaptive/planner/week/generate",
+                json=payload,
+            )
+            first_week = generation_response.json()["week"]
+
+            for session_index, _daily_plan in enumerate(
+                first_week["daily_plans"],
+                start=1,
+            ):
+                client.post(
+                    "/projects/project-adaptive/planner/module/complete",
+                    json={
+                        "session_index": session_index,
+                        "session_results": {
+                            "flashcardsReviewed": 1,
+                            "quizzesCompleted": 1,
+                            "quizQuestions": 2,
+                            "quizCorrect": 1,
+                            "startedAtMs": 1000,
+                            "completedAtMs": 61000,
+                            "activityResults": [{"type": "quiz"}],
+                        },
+                        "professor_debrief": "Completed module.",
+                        "homework_recommendation": "Targeted homework.",
+                        "study_plan_debrief": "Completed Study Plan.",
+                    },
+                )
+
+            next_response = client.post(
+                "/projects/project-adaptive/planner/week/generate-next",
+            )
+
+        self.assertEqual(generation_response.status_code, 200)
+        self.assertEqual(next_response.status_code, 200)
+
+        data = next_response.json()
+        next_week = data["week"]
+
+        self.assertEqual(data["state"], "ACTIVE_WEEK")
+        self.assertEqual(next_week["status"], "ACTIVE")
+        self.assertNotEqual(next_week["id"], first_week["id"])
+        self.assertLessEqual(
+            len(next_week["daily_plans"]),
+            main.ADAPTIVE_STUDY_PLAN_MAX_MODULES,
+        )
+        self.assertEqual(next_week["study_language"], "Italian")
+        self.assertEqual(
+            next_week["weekly_statistics"]["metadata"]["source_week_id"],
+            first_week["id"],
+        )
+
+        activity_types = [
+            activity["type"]
+            for daily_plan in next_week["daily_plans"]
+            for activity in daily_plan["activities"]
+        ]
+        self.assertIn("QUIZ", activity_types)
+        self.assertIn("FLASHCARDS", activity_types)
+
+        with self.engine.connect() as db:
+            rows = db.execute(text("""
+                select id, status, planning_parameters
+                from planner_weeks
+                where project_id = 'project-adaptive'
+                order by created_at asc, id asc
+            """)).fetchall()
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row[1] for row in rows},
+            {"COMPLETED", "ACTIVE"},
+        )
+        self.assertTrue(any(row[0] == first_week["id"] for row in rows))
+        next_parameters = json.loads(
+            next(row[2] for row in rows if row[1] == "ACTIVE")
+        )
+        self.assertEqual(next_parameters["onboarding_mode"], "adaptive_study_plan")
+        self.assertEqual(next_parameters["evidence_source"], "quiz_flashcard_only")
+        self.assertEqual(
+            next_parameters["maxVisibleModules"],
+            main.ADAPTIVE_STUDY_PLAN_MAX_MODULES,
+        )
 
     def test_generate_week_from_ready_configuration_without_survey(self):
         client = TestClient(app)

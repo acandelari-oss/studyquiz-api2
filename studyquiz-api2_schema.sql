@@ -3422,7 +3422,9 @@ CREATE TABLE public.quiz_attempts (
     created_at timestamp with time zone DEFAULT now(),
     topic text DEFAULT 'General'::text NOT NULL,
     project_id uuid NOT NULL,
-    question_index integer
+    question_index integer,
+    target_duration_seconds integer,
+    actual_duration_seconds integer
 );
 
 

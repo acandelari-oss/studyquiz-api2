@@ -61,6 +61,7 @@ import traceback
 
 MAX_RECOMMENDED_PAGES = 150
 DEFAULT_MAX_VISIBLE_PLANNER_MODULES = 12
+ADAPTIVE_STUDY_PLAN_MAX_MODULES = 6
 MAX_VISIBLE_PLANNER_MODULES = int(
     os.getenv(
         "MAX_VISIBLE_PLANNER_MODULES",
@@ -687,6 +688,14 @@ class PlannerProfessorStudyPlanDebriefRequest(BaseModel):
     study_language: Optional[str] = None
 
 
+class PlannerModuleCompletionRequest(BaseModel):
+    session_index: int
+    session_results: dict
+    professor_debrief: Optional[str] = ""
+    homework_recommendation: Optional[str] = ""
+    study_plan_debrief: Optional[str] = ""
+
+
 # ======================
 # HEALTH
 # ======================
@@ -848,6 +857,134 @@ def generate_project_planner_week(
         db.close()
 
 
+@app.post("/projects/{project_id}/planner/week/generate-next")
+def generate_next_project_planner_week(project_id: str):
+    db = SessionLocal()
+    try:
+        context = build_real_planner_context(db, project_id=project_id)
+
+        if not context.project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found for Study Planner.",
+            )
+
+        resolved_project_id = str(context.project["id"])
+        repository = PlannerRepository(db)
+        active_week = repository.load_active_week(project_id=resolved_project_id)
+
+        if not active_week:
+            raise HTTPException(
+                status_code=400,
+                detail="No active Study Plan found for this project.",
+            )
+
+        if active_week.plan_type != "study_plan":
+            raise HTTPException(
+                status_code=400,
+                detail="Only completed Study Plans can create a new Study Plan.",
+            )
+
+        if not _planner_week_all_modules_completed(active_week):
+            raise HTTPException(
+                status_code=400,
+                detail="Complete the current Study Plan before creating a new one.",
+            )
+
+        previous_parameters = repository.load_week_planning_parameters(active_week.id)
+        study_duration_minutes = _planner_parameter_int(
+            previous_parameters,
+            "studyDurationMinutes",
+            "planning_budget_minutes",
+            context.planning_budget_minutes,
+        )
+        question_pace_seconds = _planner_parameter_int(
+            previous_parameters,
+            "questionPaceSeconds",
+            "question_pace_seconds",
+            context.preferences.question_pace_seconds,
+        )
+        question_style = (
+            previous_parameters.get("questionStyle")
+            or previous_parameters.get("question_style")
+            or context.preferences.question_style
+        )
+        study_language = (
+            previous_parameters.get("studyLanguage")
+            or previous_parameters.get("study_language")
+            or active_week.study_language
+            or context.study_language
+        )
+
+        generation_context = PlannerContext(
+            project=context.project,
+            categories=context.categories,
+            topics_by_category=context.topics_by_category,
+            analytics=context.analytics,
+            preferences=PlannerPreferences(
+                question_pace_seconds=question_pace_seconds,
+                question_style=question_style,
+            ),
+            study_language=study_language,
+            number_of_sessions=ADAPTIVE_STUDY_PLAN_MAX_MODULES,
+            planning_budget_minutes=study_duration_minutes,
+            week_start_date=context.week_start_date,
+            week_id=(
+                f"{context.project['id']}-study-plan-"
+                f"{uuid.uuid4()}"
+            ),
+        )
+        week = PlannerEngine().generate_week(generation_context)
+        additional_modules_remain = _planner_additional_modules_remain(
+            context=context,
+            week=week,
+        )
+        week = replace(
+            week,
+            weekly_statistics=replace(
+                week.weekly_statistics,
+                metadata={
+                    **dict(week.weekly_statistics.metadata or {}),
+                    "max_visible_modules": ADAPTIVE_STUDY_PLAN_MAX_MODULES,
+                    "additional_modules_remain": additional_modules_remain,
+                    "source_week_id": active_week.id,
+                },
+            ),
+        )
+        planning_parameters = {
+            **build_planning_parameters(generation_context),
+            "plan_type": "study_plan",
+            "onboarding_mode": "adaptive_study_plan",
+            "evidence_source": "quiz_flashcard_only",
+            "sourceWeekId": active_week.id,
+            "studyDurationMinutes": study_duration_minutes,
+            "questionPaceSeconds": question_pace_seconds,
+            "maxVisibleModules": ADAPTIVE_STUDY_PLAN_MAX_MODULES,
+            "additionalModulesRemain": additional_modules_remain,
+            "questionStyle": question_style,
+            "studyLanguage": study_language,
+            "survey": None,
+        }
+
+        repository.complete_active_week(project_id=resolved_project_id)
+        week = repository.save_active_week(
+            project_id=resolved_project_id,
+            week=week,
+            planning_parameters=planning_parameters,
+        )
+
+        response = serialize_planner_state_evaluation(
+            PlannerStateEvaluator(
+                db,
+                repository=repository,
+            ).evaluate(project_id=resolved_project_id)
+        )
+        response["week"] = serialize_planner_domain(week)
+        return response
+    finally:
+        db.close()
+
+
 @app.post("/projects/{project_id}/planner/assessment/generate")
 def generate_project_planner_assessment(
     project_id: str,
@@ -962,6 +1099,49 @@ def complete_project_planner_assessment(project_id: str):
                 repository=repository,
             ).evaluate(project_id=str(context.project["id"]))
         )
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/planner/module/complete")
+def complete_project_planner_module(
+    project_id: str,
+    req: PlannerModuleCompletionRequest,
+):
+    db = SessionLocal()
+    try:
+        context = build_real_planner_context(db, project_id=project_id)
+
+        if not context.project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found for Study Planner.",
+            )
+
+        repository = PlannerRepository(db)
+        week = repository.complete_daily_plan(
+            project_id=str(context.project["id"]),
+            session_index=req.session_index,
+            session_results=req.session_results,
+            professor_debrief=req.professor_debrief or "",
+            homework_recommendation=req.homework_recommendation or "",
+            study_plan_debrief=req.study_plan_debrief or "",
+        )
+
+        if not week:
+            raise HTTPException(
+                status_code=404,
+                detail="No active Study Plan found for this project.",
+            )
+
+        response = serialize_planner_state_evaluation(
+            PlannerStateEvaluator(
+                db,
+                repository=repository,
+            ).evaluate(project_id=str(context.project["id"]))
+        )
+        response["week"] = serialize_planner_domain(week)
+        return response
     finally:
         db.close()
 
@@ -1236,6 +1416,32 @@ def _project_has_objective_learning_evidence(db, project_id: str) -> bool:
     ).fetchone()
 
     return bool(flashcard_evidence)
+
+
+def _planner_week_all_modules_completed(week) -> bool:
+    return bool(week.daily_plans) and all(
+        str(daily_plan.status.value if hasattr(daily_plan.status, "value") else daily_plan.status)
+        == "COMPLETED"
+        for daily_plan in week.daily_plans
+    )
+
+
+def _planner_parameter_int(
+    planning_parameters: dict,
+    public_key: str,
+    internal_key: str,
+    default_value: int,
+) -> int:
+    value = (
+        planning_parameters.get(public_key)
+        if planning_parameters.get(public_key) is not None
+        else planning_parameters.get(internal_key)
+    )
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default_value)
 
 
 def _planner_additional_modules_remain(context: PlannerContext, week) -> bool:
@@ -10925,6 +11131,9 @@ async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
     quiz_id = req.get("quiz_id")
     user_id = user["id"]  # <--- Recuperiamo l'ID dell'utente autenticato
     answers = req.get("answers", [])
+    project_id = req.get("project_id")
+    target_duration_seconds = req.get("target_duration_seconds")
+    actual_duration_seconds = req.get("actual_duration_seconds")
 
     db = SessionLocal()
     try:
@@ -10945,6 +11154,14 @@ async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
                     "user_id": user_id  # <--- Passiamo lo user_id al DB
                 }
             )
+        _update_quiz_attempt_timing(
+            db=db,
+            quiz_id=quiz_id,
+            user_id=user_id,
+            project_id=project_id,
+            target_duration_seconds=target_duration_seconds,
+            actual_duration_seconds=actual_duration_seconds,
+        )
         db.commit()
         print(f"✅ Salvate {len(answers)} risposte per l'utente {user_id}")
         return {"status": "saved"}
@@ -10954,6 +11171,63 @@ async def save_quiz_attempt(req: dict, user = Depends(verify_user)):
         return {"status": "error", "detail": str(e)}
     finally:
         db.close()
+
+
+def _update_quiz_attempt_timing(
+    db,
+    quiz_id,
+    user_id,
+    project_id,
+    target_duration_seconds,
+    actual_duration_seconds,
+):
+    if not quiz_id or not user_id:
+        return
+
+    try:
+        target_duration_seconds = (
+            int(target_duration_seconds)
+            if target_duration_seconds is not None
+            else None
+        )
+        actual_duration_seconds = (
+            int(actual_duration_seconds)
+            if actual_duration_seconds is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        return
+
+    if target_duration_seconds is None and actual_duration_seconds is None:
+        return
+
+    filters = ["quiz_id = :quiz_id", "user_id = :user_id"]
+    params = {
+        "quiz_id": quiz_id,
+        "user_id": user_id,
+        "target_duration_seconds": target_duration_seconds,
+        "actual_duration_seconds": actual_duration_seconds,
+    }
+
+    if project_id:
+        filters.append("project_id = :project_id")
+        params["project_id"] = project_id
+
+    db.execute(
+        text(f"""
+            update quiz_attempts
+            set target_duration_seconds = coalesce(
+                    :target_duration_seconds,
+                    target_duration_seconds
+                ),
+                actual_duration_seconds = coalesce(
+                    :actual_duration_seconds,
+                    actual_duration_seconds
+                )
+            where {' and '.join(filters)}
+        """),
+        params,
+    )
 
 @app.get("/projects/{project_id}/stats")
 async def get_quiz_stats(project_id: str, user = Depends(verify_user)):

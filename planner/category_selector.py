@@ -26,12 +26,16 @@ class CategoryAnalytics:
 
     Values are expected to be normalized where possible:
     - accuracy: 0.0 to 1.0, where lower means weaker performance.
+    - quiz_accuracy: quiz-only accuracy, when quiz evidence exists.
+    - flashcard_accuracy: flashcard-only accuracy, when flashcard evidence exists.
     - coverage: 0.0 to 1.0, where lower means less study coverage.
     - days_since_review: higher means the category is more stale.
     - priority_weight: 1.0 is neutral; higher values make a category more urgent.
     """
 
     accuracy: Optional[float] = None
+    quiz_accuracy: Optional[float] = None
+    flashcard_accuracy: Optional[float] = None
     coverage: Optional[float] = None
     days_since_review: Optional[int] = None
     priority_weight: float = 1.0
