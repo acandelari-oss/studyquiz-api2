@@ -3508,6 +3508,7 @@ CREATE TABLE public.topics (
     topic text,
     category text,
     description text,
+    document_id text,
     embedding public.vector(1536),
     is_display_topic boolean DEFAULT true,
     source_section text
@@ -5011,6 +5012,14 @@ ALTER TABLE ONLY public.quiz_answers
 
 ALTER TABLE ONLY public.quiz_questions
     ADD CONSTRAINT quiz_questions_quiz_id_fkey FOREIGN KEY (quiz_id) REFERENCES public.quizzes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: topics topics_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.topics
+    ADD CONSTRAINT topics_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.documents(id) ON DELETE SET NULL;
 
 
 --

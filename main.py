@@ -290,7 +290,18 @@ def _print_name_list(title, values):
         print(f"- {name}")
 
 
-def _get_taxonomy_diagnostic_snapshot(db, project_id: str):
+def _get_taxonomy_diagnostic_snapshot(
+    db,
+    project_id: str,
+    document_id: Optional[str] = None,
+):
+    document_filter = ""
+    params = {"project_id": project_id}
+
+    if document_id:
+        document_filter = "AND document_id = :document_id"
+        params["document_id"] = document_id
+
     documents_count = db.execute(
         text("""
             SELECT count(*)
@@ -301,25 +312,27 @@ def _get_taxonomy_diagnostic_snapshot(db, project_id: str):
     ).scalar()
 
     chunks_count = db.execute(
-        text("""
+        text(f"""
             SELECT count(*)
             FROM chunks
             WHERE project_id = :project_id
+            {document_filter}
         """),
-        {"project_id": project_id}
+        params
     ).scalar()
 
     taxonomy_rows = db.execute(
-        text("""
+        text(f"""
             SELECT
                 topic,
                 category,
                 source_section
             FROM topics
             WHERE project_id = :project_id
+            {document_filter}
             ORDER BY category, topic
         """),
-        {"project_id": project_id}
+        params
     ).fetchall()
 
     topic_titles = _unique_sorted(row[0] for row in taxonomy_rows)
@@ -328,6 +341,7 @@ def _get_taxonomy_diagnostic_snapshot(db, project_id: str):
 
     return {
         "project_id": project_id,
+        "document_id": document_id,
         "documents_count": documents_count,
         "chunks_count": chunks_count,
         "macro_categories": macro_categories,
@@ -341,6 +355,8 @@ def _print_taxonomy_state_snapshot(title, snapshot):
     print(title)
     print("=====================================")
     print("Project ID:", snapshot["project_id"])
+    if snapshot.get("document_id"):
+        print("Document ID:", snapshot["document_id"])
     print("Documents:", snapshot["documents_count"])
     print("Chunks:", snapshot["chunks_count"])
     print("Existing macro-categories:", len(snapshot["macro_categories"]))
@@ -482,15 +498,27 @@ def calculate_topic_chunk_score(
     )
 
 
-def ensure_project_chunk_roles(db, project_id):
+def ensure_project_chunk_roles(
+    db,
+    project_id,
+    document_id: Optional[str] = None,
+):
+    document_filter = ""
+    params = {"project_id": project_id}
+
+    if document_id:
+        document_filter = "and document_id = :document_id"
+        params["document_id"] = document_id
+
     rows = db.execute(
-        text("""
+        text(f"""
             select id, chunk_text, page, doc_title, chunk_role
             from chunks
             where project_id = :project_id
+            {document_filter}
             order by page, id
         """),
-        {"project_id": project_id}
+        params
     ).fetchall()
 
     updates = []
@@ -3418,7 +3446,12 @@ def audit_taxonomy_reorganization(final_data, project_id: str):
         "confidence_score": confidence_score
     }
 
-def process_topics_task(project_id: str):
+def process_topics_task(
+    project_id: str,
+    document_id: Optional[str] = None,
+    document_title: Optional[str] = None,
+    mark_project_completed: bool = True,
+):
     db = SessionLocal()
     pipeline_log = UploadPipelineLogger(
         "UPLOAD TOPIC PROCESSING",
@@ -3427,6 +3460,10 @@ def process_topics_task(project_id: str):
     try:
         pipeline_log.header()
         print("BACKGROUND TOPICS START:", project_id)
+        if document_id:
+            print("BACKGROUND TOPICS DOCUMENT SCOPE:", document_id)
+        if document_title:
+            print("BACKGROUND TOPICS DOCUMENT TITLE:", document_title)
         
        
         topic_phase_timer = time.time()
@@ -3434,51 +3471,68 @@ def process_topics_task(project_id: str):
         taxonomy_before_generation = _get_taxonomy_diagnostic_snapshot(
             db,
             project_id,
+            document_id=document_id,
         )
         _print_taxonomy_state_snapshot(
             "TAXONOMY STATE BEFORE GENERATION",
             taxonomy_before_generation,
         )
-        # 1. Update status and clear old topics
+        # 1. Update status and preserve previously uploaded document taxonomies.
         pipeline_log.start(
             "DATABASE COMMIT",
-            operation="set processing and clear old topics",
+            operation="set processing and preserve existing taxonomy",
         )
         _print_name_list(
             "Deleted macro-categories",
-            taxonomy_before_generation["macro_categories"],
+            [],
         )
         _print_name_list(
             "Deleted categories",
-            taxonomy_before_generation["categories"],
+            [],
         )
         _print_name_list(
             "Deleted topics",
+            [],
+        )
+        _print_name_list(
+            "Preserved topics",
             taxonomy_before_generation["topic_titles"],
         )
         print("Updated topics:")
         print("- none")
         db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
-        db.execute(text("delete from topics where project_id = :project_id"), {"project_id": project_id})
-        ensure_project_chunk_roles(db, project_id)
+        ensure_project_chunk_roles(
+            db,
+            project_id,
+            document_id=document_id,
+        )
         db.commit()
         pipeline_log.end("DATABASE COMMIT")
 
-        # Fetch chunks to analyze (up to 120 chunks)
+        document_filter = ""
+        topic_alias_filter = ""
+        topic_scope_params = {"project_id": project_id}
+        if document_id:
+            document_filter = "and document_id = :document_id"
+            topic_alias_filter = "and t.document_id = :document_id"
+            topic_scope_params["document_id"] = document_id
+
+        # Fetch only the uploaded document chunks to analyze.
         pipeline_log.start(
             "CHUNK LOADING",
             limit=400,
         )
         rows = db.execute(
-            text("""
+            text(f"""
                 select chunk_text, section, chunk_role
                 from chunks
                 where project_id = :project_id
+                {document_filter}
                 and chunk_role = 'teaching'
                 order by page asc
                 limit 400
             """),
-            {"project_id": project_id}
+            topic_scope_params
         ).fetchall()
 
         all_chunks = [
@@ -3491,7 +3545,7 @@ def process_topics_task(project_id: str):
             if r[0]
         ]
         chunk_eligibility_counts = db.execute(
-            text("""
+            text(f"""
                 select
                     count(*) filter (
                         where chunk_role = 'teaching'
@@ -3501,8 +3555,9 @@ def process_topics_task(project_id: str):
                     ) as excluded_chunks
                 from chunks
                 where project_id = :project_id
+                {document_filter}
             """),
-            {"project_id": project_id}
+            topic_scope_params
         ).fetchone()
         print("📦 TOTAL CHUNKS:", len(all_chunks))
         print(
@@ -4275,38 +4330,67 @@ def process_topics_task(project_id: str):
                 "NO PARTIAL CATEGORY MERGES APPLIED"
             )
 
-        # 🔥 DELETE OLD TOPIC-CHUNK LINKS
-
         pipeline_log.start(
             "TOPIC PERSISTENCE",
             operation="persist topics",
             topics_to_persist=len(topic_ledger),
         )
-        db.execute(
-            text("""
-                DELETE FROM topic_chunks
-                WHERE topic_id IN (
-                    SELECT id
-                    FROM topics
+        if document_id:
+            db.execute(
+                text("""
+                    DELETE FROM topic_chunks
+                    WHERE topic_id IN (
+                        SELECT id
+                        FROM topics
+                        WHERE project_id = :project_id
+                        AND document_id = :document_id
+                    )
+                """),
+                {
+                    "project_id": project_id,
+                    "document_id": document_id,
+                }
+            )
+
+            db.execute(
+                text("""
+                    DELETE FROM topics
                     WHERE project_id = :project_id
-                )
-            """),
-            {"project_id": project_id}
-        )
+                    AND document_id = :document_id
+                """),
+                {
+                    "project_id": project_id,
+                    "document_id": document_id,
+                }
+            )
+        else:
+            db.execute(
+                text("""
+                    DELETE FROM topic_chunks
+                    WHERE topic_id IN (
+                        SELECT id
+                        FROM topics
+                        WHERE project_id = :project_id
+                    )
+                """),
+                {"project_id": project_id}
+            )
 
-        # 🔥 DELETE OLD TOPICS
-
-        db.execute(
-            text("""
-                DELETE FROM topics
-                WHERE project_id = :project_id
-            """),
-            {"project_id": project_id}
-        )
+            db.execute(
+                text("""
+                    DELETE FROM topics
+                    WHERE project_id = :project_id
+                """),
+                {"project_id": project_id}
+            )
 
         db.commit()
 
-        print("🧹 OLD TOPICS + TOPIC_CHUNKS REMOVED")
+        print(
+            "🧹 TOPICS + TOPIC_CHUNKS REMOVED FOR CURRENT DOCUMENT ONLY"
+            if document_id
+            else "🧹 OLD PROJECT TOPICS + TOPIC_CHUNKS REMOVED"
+        )
         for ledger_entry in topic_ledger:
             category_name = category_mapping[
                 ledger_entry.original_category
@@ -4320,6 +4404,7 @@ def process_topics_task(project_id: str):
                     insert into topics
                     (
                         project_id,
+                        document_id,
                         category,
                         topic,
                         description,
@@ -4330,6 +4415,7 @@ def process_topics_task(project_id: str):
                     values
                     (
                         :project_id,
+                        :document_id,
                         :category,
                         :topic,
                         :description,
@@ -4340,6 +4426,7 @@ def process_topics_task(project_id: str):
                 """),
                 {
                     "project_id": project_id,
+                    "document_id": document_id,
                     "category": category_name,
                     "topic": ledger_entry.topic,
                     "description": ledger_entry.description,
@@ -4364,6 +4451,7 @@ def process_topics_task(project_id: str):
         taxonomy_after_generation = _get_taxonomy_diagnostic_snapshot(
             db,
             project_id,
+            document_id=document_id,
         )
         _print_taxonomy_state_snapshot(
             "TAXONOMY STATE AFTER GENERATION",
@@ -4379,15 +4467,19 @@ def process_topics_task(project_id: str):
         pipeline_log.start("TOPIC ASSIGNMENT")
 
         try:
-            assign_topics_to_chunks(project_id)
+            assign_topics_to_chunks(
+                project_id,
+                document_id=document_id,
+            )
             assignment_matches = db.execute(
-                text("""
+                text(f"""
                     SELECT count(*)
                     FROM topic_chunks tc
                     JOIN topics t ON t.id = tc.topic_id
                     WHERE t.project_id = :project_id
+                    {topic_alias_filter}
                 """),
-                {"project_id": project_id}
+                topic_scope_params
             ).scalar()
             print("✅ TOPIC-CHUNK ASSIGNMENT COMPLETED")
             print(
@@ -4405,21 +4497,23 @@ def process_topics_task(project_id: str):
             raise
 
         output_valid = db.execute(
-            text("""
+            text(f"""
                 SELECT
                     EXISTS (
                         SELECT 1
                         FROM topics
                         WHERE project_id = :project_id
+                        {document_filter}
                     )
                     AND EXISTS (
                         SELECT 1
                         FROM topic_chunks tc
                         JOIN topics t ON t.id = tc.topic_id
                         WHERE t.project_id = :project_id
+                        {topic_alias_filter}
                     )
             """),
-            {"project_id": project_id}
+            topic_scope_params
         ).scalar()
 
         if not output_valid:
@@ -4431,6 +4525,18 @@ def process_topics_task(project_id: str):
         # ======================
 
         
+
+        if not mark_project_completed:
+            pipeline_log.total(
+                sections=len(section_groups),
+                mini_groups_created=total_mini_groups,
+                initial_topics=total_candidate_topics,
+                final_topics=final_topics,
+                topics_persisted=len(topic_ledger),
+                matches_created=assignment_matches,
+                topic_status="processing",
+            )
+            return True
 
         final_db = SessionLocal()
 
@@ -4494,6 +4600,7 @@ def process_topics_task(project_id: str):
         _UPLOAD_DIAGNOSTIC_SUMMARIES.pop(project_id, None)
 
         final_db.close()
+        return True
         
 
     except Exception as e:
@@ -4516,10 +4623,34 @@ def process_topics_task(project_id: str):
         db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
         db.commit()
         pipeline_log.end("DATABASE COMMIT")
+        return False
     finally:
         db.close()
 
-def assign_topics_to_chunks(project_id: str):
+def process_uploaded_documents_topics_task(
+    project_id: str,
+    uploaded_documents: list,
+):
+    for index, uploaded_document in enumerate(uploaded_documents):
+        processed = process_topics_task(
+            project_id,
+            uploaded_document.get("document_id"),
+            uploaded_document.get("title"),
+            mark_project_completed=(
+                index == len(uploaded_documents) - 1
+            ),
+        )
+        if not processed:
+            print(
+                "❌ STOPPING DOCUMENT TOPIC PROCESSING AFTER FAILURE:",
+                uploaded_document.get("document_id"),
+            )
+            break
+
+def assign_topics_to_chunks(
+    project_id: str,
+    document_id: Optional[str] = None,
+):
 
     db = SessionLocal()
     pipeline_log = UploadPipelineLogger(
@@ -4547,27 +4678,43 @@ def assign_topics_to_chunks(project_id: str):
             row[6],
         )
 
+    topic_filter = ""
+    topic_alias_filter = ""
+    chunk_filter = ""
+    chunk_alias_filter = ""
+    scope_params = {"project_id": project_id}
+
+    if document_id:
+        topic_filter = "and document_id = :document_id"
+        topic_alias_filter = "and t.document_id = :document_id"
+        chunk_filter = "and document_id = :document_id"
+        chunk_alias_filter = "and c.document_id = :document_id"
+        scope_params["document_id"] = document_id
+
     def get_coverage_stats():
         return db.execute(
-            text("""
+            text(f"""
                 select
                     (
                         select count(*)
                         from topic_chunks tc
                         join topics t on t.id = tc.topic_id
                         where t.project_id = :project_id
+                        {topic_alias_filter}
                     ) as total_links,
                     (
                         select count(distinct tc.topic_id)
                         from topic_chunks tc
                         join topics t on t.id = tc.topic_id
                         where t.project_id = :project_id
+                        {topic_alias_filter}
                     ) as covered_topics,
                     (
                         select count(distinct tc.chunk_id)
                         from topic_chunks tc
                         join topics t on t.id = tc.topic_id
                         where t.project_id = :project_id
+                        {topic_alias_filter}
                     ) as covered_chunks,
                     (
                         select coalesce(max(topic_count), 0)
@@ -4576,11 +4723,12 @@ def assign_topics_to_chunks(project_id: str):
                             from topic_chunks tc
                             join topics t on t.id = tc.topic_id
                             where t.project_id = :project_id
+                            {topic_alias_filter}
                             group by tc.chunk_id
                         ) chunk_counts
                     ) as max_topics_per_chunk
             """),
-            {"project_id": project_id}
+            scope_params
         ).fetchone()
 
     try:
@@ -4588,6 +4736,8 @@ def assign_topics_to_chunks(project_id: str):
         pipeline_log.header()
         print("🔗 START TOPIC ASSIGNMENT")
         print("🧪 ENTER assign_topics_to_chunks")
+        if document_id:
+            print("🧪 ASSIGNMENT DOCUMENT SCOPE:", document_id)
 
         pipeline_log.start(
             "DATABASE COMMIT",
@@ -4596,28 +4746,31 @@ def assign_topics_to_chunks(project_id: str):
         project_chunk_roles = ensure_project_chunk_roles(
             db,
             project_id,
+            document_id=document_id,
         )
         db.commit()
         pipeline_log.end("DATABASE COMMIT")
 
         pipeline_log.start("TOPIC ASSIGNMENT SETUP")
         topics_count = db.execute(
-            text("""
+            text(f"""
                 select count(*)
                 from topics
                 where project_id = :project_id
+                {topic_filter}
             """),
-            {"project_id": project_id}
+            scope_params
         ).fetchone()[0]
 
         chunks_count = db.execute(
-            text("""
+            text(f"""
                 select count(*)
                 from chunks
                 where project_id = :project_id
+                {chunk_filter}
                 and chunk_role = 'teaching'
             """),
-            {"project_id": project_id}
+            scope_params
         ).fetchone()[0]
 
         total_chunks_count = len(project_chunk_roles)
@@ -4674,15 +4827,16 @@ def assign_topics_to_chunks(project_id: str):
             total_candidate_pairs=total_candidate_pairs,
         )
         db.execute(
-            text("""
+            text(f"""
                 delete from topic_chunks
                 where topic_id in (
                     select id
                     from topics
                     where project_id = :project_id
+                    {topic_filter}
                 )
             """),
-            {"project_id": project_id}
+            scope_params
         )
 
         phase_a_links = 0
@@ -4691,17 +4845,18 @@ def assign_topics_to_chunks(project_id: str):
 
         for batch_number in range(1, phase_a_total_batches + 1):
             chunk_rows = db.execute(
-                text("""
+                text(f"""
                     select id
                     from chunks
                     where project_id = :project_id
+                    {chunk_filter}
                     and chunk_role = 'teaching'
                     and id > :last_chunk_id
                     order by id
                     limit :batch_size
                 """),
                 {
-                    "project_id": project_id,
+                    **scope_params,
                     "last_chunk_id": last_chunk_id,
                     "batch_size": phase_a_batch_size,
                 }
@@ -4718,7 +4873,7 @@ def assign_topics_to_chunks(project_id: str):
                 chunk_ids
             )
             candidate_params = {
-                "project_id": project_id,
+                **scope_params,
                 **chunk_params,
             }
             matches = db.execute(
@@ -4734,6 +4889,8 @@ def assign_topics_to_chunks(project_id: str):
                     from chunks c
                     join topics t on t.project_id = c.project_id
                     where c.project_id = :project_id
+                    {chunk_alias_filter}
+                    {topic_alias_filter}
                     and c.id in ({chunk_clause})
                     order by c.id, t.id
                 """),
@@ -4821,17 +4978,18 @@ def assign_topics_to_chunks(project_id: str):
             )
 
         phase_a_max = db.execute(
-            text("""
+            text(f"""
                 select coalesce(max(topic_count), 0)
                 from (
                     select tc.chunk_id, count(*) as topic_count
                     from topic_chunks tc
                     join topics t on t.id = tc.topic_id
                     where t.project_id = :project_id
+                    {topic_alias_filter}
                     group by tc.chunk_id
                 ) chunk_counts
             """),
-            {"project_id": project_id}
+            scope_params
         ).scalar()
 
         if phase_a_max > MAX_TOPICS_PER_CHUNK:
@@ -4877,10 +5035,11 @@ def assign_topics_to_chunks(project_id: str):
         try:
             pipeline_log.start("TOPIC ASSIGNMENT RESCUE PHASE")
             orphan_rows = db.execute(
-                text("""
+                text(f"""
                     select t.id, t.topic
                     from topics t
                     where t.project_id = :project_id
+                    {topic_alias_filter}
                     and not exists (
                         select 1
                         from topic_chunks tc
@@ -4888,7 +5047,7 @@ def assign_topics_to_chunks(project_id: str):
                     )
                     order by t.id
                 """),
-                {"project_id": project_id}
+                scope_params
             ).fetchall()
 
             orphan_count = len(orphan_rows)
@@ -4947,12 +5106,14 @@ def assign_topics_to_chunks(project_id: str):
                             from topics t
                             join chunks c on c.project_id = t.project_id
                             where t.project_id = :project_id
+                            {topic_alias_filter}
+                            {chunk_alias_filter}
                             and t.id in ({topic_clause})
                             and c.chunk_role = 'teaching'
                             order by t.id, c.id
                         """),
                         {
-                            "project_id": project_id,
+                            **scope_params,
                             **topic_params,
                         }
                     ).fetchall()
@@ -5061,17 +5222,18 @@ def assign_topics_to_chunks(project_id: str):
                     )
 
                 rescued_topic_count = db.execute(
-                    text("""
+                    text(f"""
                         select count(*)
                         from topics t
                         where t.project_id = :project_id
+                        {topic_alias_filter}
                         and exists (
                             select 1
                             from topic_chunks tc
                             where tc.topic_id = t.id
                         )
                     """),
-                    {"project_id": project_id}
+                    scope_params
                 ).scalar() - phase_a_covered_topics
 
                 if rescued_topic_count != rescue_links:
@@ -5272,6 +5434,7 @@ async def ingest_stream(
         total_chunks_created = 0
         total_embedding_calls = 0
         total_chunk_chars = 0
+        uploaded_documents = []
 
         try:
             pipeline_log.header()
@@ -5329,6 +5492,8 @@ async def ingest_stream(
             # ======================
             project_chunk_roles = []
             for doc in docs:
+                document_id = str(uuid.uuid4())
+                document_text_parts = []
                 document_start = _upload_timer()
                 document_chunks_created = 0
                 document_embedding_calls = 0
@@ -5353,6 +5518,39 @@ async def ingest_stream(
                 )
 
                 yield f"FILE_ANALYSIS|pages={total_pages}\n"
+
+                pipeline_log.start(
+                    "DATABASE COMMIT",
+                    operation="insert document",
+                    filename=doc.title,
+                    document_id=document_id,
+                )
+                db.execute(
+                    text("""
+                        insert into documents
+                        (
+                            id,
+                            project_id,
+                            title,
+                            text
+                        )
+                        values
+                        (
+                            :document_id,
+                            :project_id,
+                            :title,
+                            :text
+                        )
+                    """),
+                    {
+                        "document_id": document_id,
+                        "project_id": project_id,
+                        "title": doc.title,
+                        "text": "",
+                    }
+                )
+                db.commit()
+                pipeline_log.end("DATABASE COMMIT")
 
                 if total_pages > MAX_WARNING_PAGES:
                     yield (
@@ -5433,6 +5631,8 @@ async def ingest_stream(
 
                         if not page_text:
                             continue
+
+                    document_text_parts.append(page_text)
 
                     pipeline_log.start(
                         "CHUNK GENERATION",
@@ -5516,6 +5716,7 @@ async def ingest_stream(
                                 insert into chunks
                                 (
                                     project_id,
+                                    document_id,
                                     doc_title,
                                     chunk_text,
                                     embedding,
@@ -5527,6 +5728,7 @@ async def ingest_stream(
                                 values
                                 (
                                     :project_id,
+                                    :document_id,
                                     :doc_title,
                                     :chunk_text,
                                     CAST(:embedding AS vector),
@@ -5538,6 +5740,7 @@ async def ingest_stream(
                             """),
                             {
                                 "project_id": project_id,
+                                "document_id": document_id,
                                 "doc_title": doc.title,
                                 "chunk_text": chunk,
                                 "embedding": embedding_str,
@@ -5577,8 +5780,33 @@ async def ingest_stream(
                     "embedding_calls:",
                     document_embedding_calls,
                     "Elapsed:",
-                    f"{_upload_elapsed(document_start):.3f} sec",
+                        f"{_upload_elapsed(document_start):.3f} sec",
                 )
+                pipeline_log.start(
+                    "DATABASE COMMIT",
+                    operation="update document text",
+                    filename=doc.title,
+                    document_id=document_id,
+                )
+                db.execute(
+                    text("""
+                        update documents
+                        set text = :document_text
+                        where id = :document_id
+                        and project_id = :project_id
+                    """),
+                    {
+                        "document_text": "\n\n".join(document_text_parts),
+                        "document_id": document_id,
+                        "project_id": project_id,
+                    }
+                )
+                db.commit()
+                pipeline_log.end("DATABASE COMMIT")
+                uploaded_documents.append({
+                    "document_id": document_id,
+                    "title": doc.title,
+                })
             
             log_chunk_role_counts(project_chunk_roles)
 
@@ -5587,7 +5815,11 @@ async def ingest_stream(
                 action="schedule background task",
                 chunks_created=total_chunks_created,
             )
-            background_tasks.add_task(process_topics_task, project_id)
+            background_tasks.add_task(
+                process_uploaded_documents_topics_task,
+                project_id,
+                uploaded_documents,
+            )
             print("✅ BACKGROUND TOPICS TASK SCHEDULED:", project_id)
             pipeline_log.end("TOPIC GENERATION")
 
