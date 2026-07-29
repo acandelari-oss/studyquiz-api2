@@ -11060,6 +11060,98 @@ async def get_topics(project_id: str):
     finally:
         db.close()
 
+@app.post("/projects/{project_id}/ask_suggestions")
+async def get_ask_suggestions(project_id: str, req: dict, user = Depends(verify_user)):
+    selected_categories = [
+        str(category or "").strip()
+        for category in (req.get("categories") or [])
+        if str(category or "").strip()
+    ]
+    language = str(req.get("language") or "English")
+
+    db = SessionLocal()
+    try:
+        params = {"project_id": project_id}
+        category_filter = ""
+
+        if selected_categories:
+            category_filter = "AND category IN :categories"
+            params["categories"] = tuple(selected_categories)
+
+        rows = db.execute(
+            sql_text(f"""
+                SELECT category, topic, description
+                FROM topics
+                WHERE project_id = :project_id
+                AND topic IS NOT NULL
+                AND is_display_topic = true
+                {category_filter}
+                ORDER BY category ASC, topic ASC
+                LIMIT 80
+            """),
+            params
+        ).fetchall()
+
+        topic_context = [
+            {
+                "category": r[0] or "General",
+                "topic": r[1],
+                "description": r[2] or "",
+            }
+            for r in rows
+        ]
+
+        if not topic_context:
+            return {"suggestions": []}
+
+        prompt = f"""
+        You are helping a student start a study chat in DOUNO.
+
+        Generate 4 short, natural questions the student could ask.
+
+        Rules:
+        - Use only the categories and topics provided below.
+        - Do not mention that you are using metadata.
+        - Do not invent topics outside this list.
+        - Keep questions concise and useful for studying.
+        - Write all questions in this language: {language}.
+        - Return STRICT JSON only.
+
+        JSON shape:
+        {{
+          "suggestions": ["...", "...", "...", "..."]
+        }}
+
+        Available study material:
+        {json.dumps(topic_context[:80], ensure_ascii=False)}
+        """
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+        )
+
+        raw = response.choices[0].message.content or "{}"
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {}
+
+        suggestions = parsed.get("suggestions") or []
+        suggestions = [
+            str(suggestion).strip()
+            for suggestion in suggestions
+            if str(suggestion).strip()
+        ][:4]
+
+        return {"suggestions": suggestions}
+    finally:
+        db.close()
+
 @app.get("/projects/{project_id}/topic_status")
 
 def get_topic_status(
@@ -12254,6 +12346,24 @@ async def ask_documents(req: AskRequest):
     if chunks:
         print("SAMPLE CHUNK:", chunks[0]["text"][:200])
 
+    sources = []
+    seen_sources = set()
+    for c in chunks:
+        document = c.get("document")
+        page = c.get("page")
+        if not document or page is None:
+            continue
+
+        source_key = (str(document), str(page))
+        if source_key in seen_sources:
+            continue
+
+        seen_sources.add(source_key)
+        sources.append({
+            "document": str(document),
+            "page": page,
+        })
+
     
 
     context_blocks = []
@@ -12343,7 +12453,11 @@ async def ask_documents(req: AskRequest):
         ]
     )
 
-    return {"answer": response.choices[0].message.content}
+    return {
+        "answer": response.choices[0].message.content,
+        "sources": sources,
+        "used_global_knowledge": bool(getattr(req, 'expand_search', False)),
+    }
 
 
 
@@ -12360,14 +12474,16 @@ async def active_recall_question(project_id: str, req: ActiveRecallRequest, user
     def super_clean(s):
         return re.sub(r'\s+', ' ', str(s).replace('\xa0', ' ')).strip()
 
-    topics = [super_clean(t) for t in req.topics if t]
-    
-    if not topics:
-        return {"question": "No topics available", "concept": "General"}
+    topics = [super_clean(t) for t in (req.topics or []) if t]
+    is_full_project = len(topics) == 0
 
     # 2. ROTAZIONE FORZATA
     # Usiamo l'indice del frontend per pescare il topic
-    current_focus = topics[req.index % len(topics)]
+    current_focus = (
+        topics[req.index % len(topics)]
+        if topics
+        else "Full Project"
+    )
     
     # Estraiamo la parola chiave (es. da "Block Actions" prendiamo "Block")
     # Questo serve per il matching nel DB se il nome intero è corrotto
@@ -12380,12 +12496,13 @@ async def active_recall_question(project_id: str, req: ActiveRecallRequest, user
 
     # 🔥 NORMALIZZA
     topics = [normalize_string(t) for t in topics if t]
+    is_full_project = len(topics) == 0
 
     # 🔥 ROTAZIONE
     if topics:
         current_focus = topics[req.index % len(topics)]
     else:
-        current_focus = "General"
+        current_focus = "Full Project"
 
     # 🔥 KEYWORD SEMPLICE (prima parola)
     keyword = current_focus.split(" ")[0]
@@ -12421,27 +12538,45 @@ async def active_recall_question(project_id: str, req: ActiveRecallRequest, user
         len(active_recall_roles) - active_recall_teaching_count
     )
 
-    rows = db.execute(
-        text("""
-            SELECT chunk_text, doc_title, page, topic
-            FROM chunks
-            WHERE project_id = :project_id
-            AND chunk_role = 'teaching'
-            AND (
-                topic ILIKE :full_focus             -- Esempio: %Block Actions%
-                OR topic ILIKE :keyword_focus       -- Esempio: %Block%
-                OR chunk_text ILIKE :keyword_focus  -- Cerca "Block" nel testo
-            )
-            ORDER BY embedding <-> CAST(:embedding AS vector)
-            LIMIT 12
-        """),
-        {
-            "project_id": project_id,
-            "full_focus": f"%{current_focus}%",
-            "keyword_focus": f"%{keyword}%",
-            "embedding": query_embedding
-        }
-    ).fetchall()
+    if is_full_project:
+        rows = db.execute(
+            text("""
+                SELECT chunk_text, doc_title, page, topic
+                FROM chunks
+                WHERE project_id = :project_id
+                AND chunk_role = 'teaching'
+                AND chunk_text IS NOT NULL
+                AND length(chunk_text) > 100
+                ORDER BY embedding <-> CAST(:embedding AS vector)
+                LIMIT 12
+            """),
+            {
+                "project_id": project_id,
+                "embedding": query_embedding
+            }
+        ).fetchall()
+    else:
+        rows = db.execute(
+            text("""
+                SELECT chunk_text, doc_title, page, topic
+                FROM chunks
+                WHERE project_id = :project_id
+                AND chunk_role = 'teaching'
+                AND (
+                    topic ILIKE :full_focus             -- Esempio: %Block Actions%
+                    OR topic ILIKE :keyword_focus       -- Esempio: %Block%
+                    OR chunk_text ILIKE :keyword_focus  -- Cerca "Block" nel testo
+                )
+                ORDER BY embedding <-> CAST(:embedding AS vector)
+                LIMIT 12
+            """),
+            {
+                "project_id": project_id,
+                "full_focus": f"%{current_focus}%",
+                "keyword_focus": f"%{keyword}%",
+                "embedding": query_embedding
+            }
+        ).fetchall()
     db.close()
 
     # ... (il resto del codice per generare la risposta con GPT)
