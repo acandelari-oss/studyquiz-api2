@@ -49,6 +49,21 @@ class ProfessorModuleComposerTests(unittest.TestCase):
             week_start_date=date(2026, 7, 6),
         )
 
+    def _context_with_priorities(self, categories, priorities, budget=30, pace=90):
+        return PlannerContext(
+            categories=categories,
+            analytics={
+                category: CategoryAnalytics(accuracy=0.80, coverage=0.80)
+                for category in categories
+            },
+            preferences=PlannerPreferences(
+                question_pace_seconds=pace,
+                priority_categories=tuple(priorities),
+            ),
+            planning_budget_minutes=budget,
+            week_start_date=date(2026, 7, 6),
+        )
+
     def _weekly_strategy(self, categories, depth=ProfessorDepthCode.NORMAL):
         return ProfessorWeeklyStrategy(
             weekly_goal_code=ProfessorWeeklyGoalCode.ASSESS_AND_MAINTAIN,
@@ -63,6 +78,22 @@ class ProfessorModuleComposerTests(unittest.TestCase):
             ),
             priority_categories=tuple(categories[:3]),
             secondary_categories=tuple(categories[3:]),
+        )
+
+    def _coverage_weekly_strategy(self, categories):
+        return ProfessorWeeklyStrategy(
+            weekly_goal_code=ProfessorWeeklyGoalCode.CALIBRATE_COVERAGE,
+            category_strategies=tuple(
+                ProfessorCategoryStrategy(
+                    category=category,
+                    strategy=ProfessorCategoryStrategyCode.EXPLORE,
+                    depth=ProfessorDepthCode.DEEP,
+                    reasoning_code=ProfessorReasoningCode.INSUFFICIENT_EVIDENCE,
+                )
+                for category in categories
+            ),
+            priority_categories=(),
+            secondary_categories=tuple(categories),
         )
 
     def test_composes_only_required_modules_without_empty_placeholders(self):
@@ -84,6 +115,89 @@ class ProfessorModuleComposerTests(unittest.TestCase):
             ["A", "B"],
         )
         self.assertLessEqual(modules[0].estimated_duration_minutes, 45)
+
+    def test_student_priority_categories_are_not_combined_in_one_module(self):
+        categories = ("A", "B", "C")
+
+        modules = self.composer.compose_modules(
+            context=self._context_with_priorities(
+                categories,
+                priorities=("A", "B"),
+                budget=45,
+                pace=90,
+            ),
+            weekly_strategy=self._weekly_strategy(categories),
+            allocations=(
+                self._allocation("A", 2),
+                self._allocation("B", 2),
+                self._allocation("C", 2),
+            ),
+            max_visible_modules=12,
+        )
+
+        self.assertEqual(
+            [allocation.category for allocation in modules[0].allocations],
+            ["A", "C"],
+        )
+        self.assertEqual(
+            [allocation.category for allocation in modules[1].allocations],
+            ["B"],
+        )
+
+    def test_short_priority_category_can_be_filled_by_non_priority_category(self):
+        categories = ("A", "B")
+
+        modules = self.composer.compose_modules(
+            context=self._context_with_priorities(
+                categories,
+                priorities=("A",),
+                budget=30,
+                pace=90,
+            ),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(
+                self._allocation("A", 5),
+                self._allocation("B", 4),
+            ),
+            max_visible_modules=12,
+        )
+
+        self.assertEqual(
+            [allocation.category for allocation in modules[0].allocations],
+            ["A", "B"],
+        )
+        self.assertEqual(
+            [activity.estimated_questions for activity in modules[0].daily_strategy.activities],
+            [10, 8],
+        )
+
+    def test_short_priority_category_skips_blocked_priority_and_uses_non_priority_filler(self):
+        categories = ("A", "B", "C")
+
+        modules = self.composer.compose_modules(
+            context=self._context_with_priorities(
+                categories,
+                priorities=("A", "B"),
+                budget=30,
+                pace=90,
+            ),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(
+                self._allocation("A", 5),
+                self._allocation("B", 5),
+                self._allocation("C", 4),
+            ),
+            max_visible_modules=12,
+        )
+
+        self.assertEqual(
+            [allocation.category for allocation in modules[0].allocations],
+            ["A", "C"],
+        )
+        self.assertEqual(
+            [allocation.category for allocation in modules[1].allocations],
+            ["B"],
+        )
 
     def test_starts_new_module_when_next_activity_exceeds_budget(self):
         categories = ("A", "B", "C")
@@ -151,6 +265,124 @@ class ProfessorModuleComposerTests(unittest.TestCase):
                 for allocation in module.allocations
             ],
             ["A", "B"],
+        )
+
+    def test_coverage_primary_uses_two_passes_for_ten_or_fewer_topics(self):
+        categories = ("A",)
+
+        modules = self.composer.compose_modules(
+            context=self._context(categories, budget=30, pace=90),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(self._allocation("A", 5),),
+            max_visible_modules=12,
+        )
+
+        activity = modules[0].daily_strategy.activities[0]
+
+        self.assertEqual(activity.activity_type, ProfessorDailyActivityType.QUIZ)
+        self.assertEqual(activity.estimated_questions, 10)
+
+    def test_coverage_primary_uses_one_pass_above_ten_topics(self):
+        categories = ("A",)
+
+        modules = self.composer.compose_modules(
+            context=self._context(categories, budget=30, pace=90),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(self._allocation("A", 12),),
+            max_visible_modules=12,
+        )
+
+        activity = modules[0].daily_strategy.activities[0]
+
+        self.assertEqual(activity.activity_type, ProfessorDailyActivityType.QUIZ)
+        self.assertEqual(activity.estimated_questions, 12)
+
+    def test_coverage_primary_inside_negative_buffer_does_not_add_filler(self):
+        categories = ("A", "B")
+
+        modules = self.composer.compose_modules(
+            context=self._context(categories, budget=30, pace=90),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(
+                self._allocation("A", 10),
+                self._allocation("B", 2),
+            ),
+            max_visible_modules=12,
+        )
+
+        self.assertEqual(
+            [allocation.category for allocation in modules[0].allocations],
+            ["A"],
+        )
+
+    def test_priority_category_inside_negative_buffer_remains_alone(self):
+        categories = ("A", "B")
+
+        modules = self.composer.compose_modules(
+            context=self._context_with_priorities(
+                categories,
+                priorities=("A",),
+                budget=30,
+                pace=90,
+            ),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(
+                self._allocation("A", 10),
+                self._allocation("B", 2),
+            ),
+            max_visible_modules=12,
+        )
+
+        self.assertEqual(
+            [allocation.category for allocation in modules[0].allocations],
+            ["A"],
+        )
+
+    def test_coverage_can_add_two_complete_pass_fillers(self):
+        categories = ("A", "B", "C")
+
+        modules = self.composer.compose_modules(
+            context=self._context(categories, budget=30, pace=90),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(
+                self._allocation("A", 4),
+                self._allocation("B", 8),
+                self._allocation("C", 2),
+            ),
+            max_visible_modules=12,
+        )
+
+        self.assertEqual(
+            [allocation.category for allocation in modules[0].allocations],
+            ["A", "B", "C"],
+        )
+        self.assertEqual(
+            [activity.estimated_questions for activity in modules[0].daily_strategy.activities],
+            [8, 8, 4],
+        )
+
+    def test_module_never_contains_more_than_three_categories(self):
+        categories = ("A", "B", "C", "D")
+
+        modules = self.composer.compose_modules(
+            context=self._context(categories, budget=45, pace=90),
+            weekly_strategy=self._coverage_weekly_strategy(categories),
+            allocations=(
+                self._allocation("A", 4),
+                self._allocation("B", 4),
+                self._allocation("C", 4),
+                self._allocation("D", 4),
+            ),
+            max_visible_modules=12,
+        )
+
+        self.assertEqual(
+            [allocation.category for allocation in modules[0].allocations],
+            ["A", "B", "C"],
+        )
+        self.assertEqual(
+            [allocation.category for allocation in modules[1].allocations],
+            ["D"],
         )
 
 

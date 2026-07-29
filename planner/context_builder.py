@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 from .category_selector import CategoryAnalytics
 from .planner_models import PlannerContext, PlannerPreferences, SelectedTopic
+from .planner_repository import PlannerRepository
 
 
 DEFAULT_QUESTION_PACE_SECONDS = 60
@@ -56,6 +57,14 @@ def build_real_planner_context(
         topic_lookup=topic_lookup,
         today=today,
     )
+    previously_scheduled_categories = (
+        PlannerRepository(db)
+        .load_previously_scheduled_categories(project_id=str(project["id"]))
+    )
+    completed_survey_categories = (
+        PlannerRepository(db)
+        .load_completed_survey_categories(project_id=str(project["id"]))
+    )
 
     return PlannerContext(
         project=project,
@@ -71,6 +80,8 @@ def build_real_planner_context(
         planning_budget_minutes=DEFAULT_PLANNING_BUDGET_MINUTES,
         week_start_date=_week_start(today),
         week_id=f"{project['id']}-week-{_week_start(today).isoformat()}",
+        previously_scheduled_categories=previously_scheduled_categories,
+        completed_survey_categories=completed_survey_categories,
     )
 
 
@@ -102,7 +113,8 @@ def _load_project(
                 p.created_at,
                 p.user_id,
                 p.topic_status,
-                p.taxonomy_language
+                p.taxonomy_language,
+                coalesce(p.professor_mode, 'coverage') as professor_mode
             from projects p
             {where_clause}
             order by
@@ -133,6 +145,7 @@ def _load_project(
         "user_id": str(row[3]) if row[3] else None,
         "topic_status": row[4],
         "taxonomy_language": row[5],
+        "professor_mode": row[6],
     }
 
 
@@ -203,6 +216,7 @@ def _build_category_analytics(
             "flashcard_correct": 0,
             "flashcard_total": 0,
             "studied_topics": set(),
+            "quiz_studied_topics": set(),
             "last_reviewed_at": None,
         }
         for category in categories
@@ -259,6 +273,11 @@ def _build_category_analytics(
             ),
             coverage=(
                 len(category_stats["studied_topics"]) / topic_count
+                if topic_count > 0
+                else None
+            ),
+            quiz_coverage=(
+                len(category_stats["quiz_studied_topics"]) / topic_count
                 if topic_count > 0
                 else None
             ),
@@ -362,6 +381,7 @@ def _apply_learning_event(
 
     if source == "quiz":
         category_stats["quiz_total"] += 1
+        category_stats["quiz_studied_topics"].add(topic_key)
         if is_correct:
             category_stats["quiz_correct"] += 1
 

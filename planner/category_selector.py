@@ -6,9 +6,13 @@ not call AI services, access the database, or depend on FastAPI/main.py.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from .priority_policy import calculate_priority_score
+from .student_preferences import (
+    PRIORITY_CATEGORY_SCORE_MULTIPLIER,
+    apply_student_preference_score_bonus,
+)
 
 
 class CategorySelectionReason(str, Enum):
@@ -29,6 +33,7 @@ class CategoryAnalytics:
     - quiz_accuracy: quiz-only accuracy, when quiz evidence exists.
     - flashcard_accuracy: flashcard-only accuracy, when flashcard evidence exists.
     - coverage: 0.0 to 1.0, where lower means less study coverage.
+    - quiz_coverage: 0.0 to 1.0, based only on completed quiz-question evidence.
     - days_since_review: higher means the category is more stale.
     - priority_weight: 1.0 is neutral; higher values make a category more urgent.
     """
@@ -37,6 +42,7 @@ class CategoryAnalytics:
     quiz_accuracy: Optional[float] = None
     flashcard_accuracy: Optional[float] = None
     coverage: Optional[float] = None
+    quiz_coverage: Optional[float] = None
     days_since_review: Optional[int] = None
     priority_weight: float = 1.0
 
@@ -58,22 +64,30 @@ class CategorySelector:
     STALE_REVIEW_DAYS = 14
     HIGH_PRIORITY_WEIGHT = 1.0
 
+    def __init__(
+        self,
+        priority_category_score_multiplier: float = PRIORITY_CATEGORY_SCORE_MULTIPLIER,
+    ) -> None:
+        self.priority_category_score_multiplier = priority_category_score_multiplier
+
     def select_categories(
         self,
         project_categories: Sequence[str],
         category_analytics: Mapping[str, CategoryAnalytics],
-        planner_preferences: Optional[Mapping[str, object]] = None,
+        planner_preferences: Optional[Any] = None,
     ) -> Sequence[CategoryPriority]:
         """Return categories sorted by descending planning priority.
 
-        Planner preferences are accepted to keep the interface ready for future
-        personalization, but they do not affect V1 scoring.
+        Planner preferences are applied as a dedicated deterministic stage after
+        the base Planner score is computed.
         """
 
-        del planner_preferences
-
         priorities = [
-            self._build_priority(category, category_analytics.get(category))
+            self._build_priority(
+                category,
+                category_analytics.get(category),
+                planner_preferences,
+            )
             for category in project_categories
         ]
         return self._rank_priorities(priorities)
@@ -82,17 +96,25 @@ class CategorySelector:
         self,
         category: str,
         analytics: Optional[CategoryAnalytics],
+        planner_preferences: Optional[Any] = None,
     ) -> CategoryPriority:
         """Calculate score and explanations for a single category."""
 
         analytics = analytics or CategoryAnalytics()
+        base_score = calculate_priority_score(
+            accuracy=analytics.accuracy,
+            coverage=analytics.coverage,
+            days_since_review=analytics.days_since_review,
+            priority_weight=analytics.priority_weight,
+        )
+
         return CategoryPriority(
             category=category,
-            priority_score=calculate_priority_score(
-                accuracy=analytics.accuracy,
-                coverage=analytics.coverage,
-                days_since_review=analytics.days_since_review,
-                priority_weight=analytics.priority_weight,
+            priority_score=apply_student_preference_score_bonus(
+                category=category,
+                planner_score=base_score,
+                planner_preferences=planner_preferences,
+                multiplier=self.priority_category_score_multiplier,
             ),
             reasons=self._generate_reasons(analytics),
         )

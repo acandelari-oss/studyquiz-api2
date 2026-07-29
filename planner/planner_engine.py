@@ -5,6 +5,14 @@ from typing import Mapping, Optional, Sequence, cast
 
 from .activity_planner import ActivityPlanner
 from .category_selector import CategoryAnalytics, CategorySelector
+from .coverage_category_packer import CoverageCategoryPacker
+from .coverage_state import (
+    CoverageState,
+    coverage_metadata,
+    evaluate_coverage_state,
+    ordered_first_exposure_categories,
+    ordered_coverage_categories,
+)
 from .planner_models import DailyPlan, PlannerContext, Week
 from .planner_state import WeekStatus
 from .professor_bridge import ProfessorBridge
@@ -40,6 +48,7 @@ class PlannerEngine:
         professor_knowledge_builder: Optional[ProfessorKnowledgeBuilder] = None,
         professor_voice_service: Optional[ProfessorVoiceService] = None,
         professor_bridge: Optional[ProfessorBridge] = None,
+        coverage_category_packer: Optional[CoverageCategoryPacker] = None,
     ) -> None:
         """Create an engine from pure Planner collaborators."""
 
@@ -65,6 +74,10 @@ class PlannerEngine:
         )
         self.professor_voice_service = professor_voice_service or ProfessorVoiceService()
         self.professor_bridge = professor_bridge or ProfessorBridge()
+        self.coverage_category_packer = (
+            coverage_category_packer
+            or CoverageCategoryPacker()
+        )
         self.last_professor_knowledge: Optional[ProfessorKnowledge] = None
 
     def generate_week(self, context: PlannerContext) -> Week:
@@ -74,32 +87,94 @@ class PlannerEngine:
         category selection, category segmentation, and weekly scheduling.
         """
 
+        uses_first_exposure_ordering = self._uses_first_exposure_ordering(context)
+        category_analytics = cast(Mapping[str, CategoryAnalytics], context.analytics)
+        if uses_first_exposure_ordering:
+            category_analytics = self._coverage_category_analytics(
+                category_analytics
+            )
+
         category_priorities = self.category_selector.select_categories(
             project_categories=context.categories,
-            category_analytics=cast(Mapping[str, CategoryAnalytics], context.analytics),
-            planner_preferences={},
+            category_analytics=category_analytics,
+            planner_preferences=context.preferences,
         )
 
-        category_allocations = self._allocate_categories(
+        coverage_state = (
+            evaluate_coverage_state(context)
+            if uses_first_exposure_ordering
+            else CoverageState(
+                covered_categories=(),
+                categories_requiring_coverage=tuple(context.categories),
+            )
+        )
+        has_preserved_coverage_order = bool(context.coverage_continuation_categories)
+        initial_ranked_categories = tuple(
+            context.coverage_continuation_categories
+            or tuple(priority.category for priority in category_priorities)
+        )
+        if not has_preserved_coverage_order:
+            initial_ranked_categories = ordered_first_exposure_categories(
+                ranked_categories=initial_ranked_categories,
+                previously_scheduled_categories=context.previously_scheduled_categories,
+                priority_categories=context.preferences.priority_categories,
+                enabled=uses_first_exposure_ordering,
+            )
+        coverage_ordered_categories = ordered_coverage_categories(
+            initial_ranked_categories=initial_ranked_categories,
+            categories_requiring_coverage=coverage_state.categories_requiring_coverage,
+        )
+
+        allocations_by_category = self._allocate_categories_by_category(
             context=context,
-            ordered_categories=tuple(priority.category for priority in category_priorities),
+            ordered_categories=coverage_ordered_categories,
         )
+        packing = self.coverage_category_packer.pack(
+            ranked_categories=coverage_ordered_categories,
+            allocations_by_category=allocations_by_category,
+            target_modules=context.number_of_sessions,
+        )
+        category_allocations = packing.allocations
 
-        weekly_strategy = self.professor_weekly_strategy_builder.build_strategy(context)
+        weekly_strategy = self._coverage_weekly_strategy(
+            context=context,
+            ordered_categories=coverage_ordered_categories,
+        )
         modules = self.professor_module_composer.compose_modules(
             context=context,
             weekly_strategy=weekly_strategy,
             allocations=category_allocations,
-            max_visible_modules=context.number_of_sessions or None,
+            max_visible_modules=None,
         )
 
         week = self._build_week(context=context, modules=modules)
+        from dataclasses import replace
+
+        week = replace(
+            week,
+            weekly_statistics=replace(
+                week.weekly_statistics,
+                metadata={
+                    **dict(week.weekly_statistics.metadata or {}),
+                    **coverage_metadata(
+                        coverage_state=coverage_state,
+                        accepted_categories=packing.accepted_categories,
+                        skipped_categories=packing.skipped_categories,
+                        continuation_order=coverage_ordered_categories,
+                        target_modules=packing.target_modules,
+                        buffer_modules=packing.buffer_modules,
+                        maximum_modules=packing.maximum_modules,
+                        category_required_modules=packing.category_required_modules,
+                    ),
+                },
+            ),
+        )
         self.last_professor_knowledge = self.professor_knowledge_builder.build(
             context=context,
             week=week,
             weekly_strategy=weekly_strategy,
             modules=modules,
-            max_visible_modules=context.number_of_sessions or None,
+            max_visible_modules=None,
         )
         return self._add_professor_voice(
             week=week,
@@ -206,6 +281,57 @@ class PlannerEngine:
 
         return tuple(allocations)
 
+    def _allocate_categories_by_category(
+        self,
+        context: PlannerContext,
+        ordered_categories: Sequence[str],
+    ) -> Mapping[str, Sequence[CategoryAllocation]]:
+        """Allocate full category segments keyed by category."""
+
+        question_pace_seconds = context.preferences.question_pace_seconds or 0
+        return {
+            category: tuple(
+                self.session_allocator.allocate_category_segments(
+                    category=category,
+                    ordered_topics=context.topics_by_category.get(category, ()),
+                    available_budget_minutes=context.planning_budget_minutes,
+                    question_pace_seconds=question_pace_seconds,
+                )
+            )
+            for category in ordered_categories
+        }
+
+    def _coverage_category_analytics(
+        self,
+        category_analytics: Mapping[str, CategoryAnalytics],
+    ) -> Mapping[str, CategoryAnalytics]:
+        """Strip learning evidence from Coverage/Survey category ranking."""
+
+        return {
+            category: CategoryAnalytics(
+                priority_weight=(
+                    analytics.priority_weight
+                    if isinstance(analytics, CategoryAnalytics)
+                    else 1.0
+                )
+            )
+            for category, analytics in (category_analytics or {}).items()
+        }
+
+    def _uses_first_exposure_ordering(
+        self,
+        context: PlannerContext,
+    ) -> bool:
+        """Return whether Study Plan generation is still in first-exposure Coverage Mode."""
+
+        project = context.project or {}
+        if isinstance(project, Mapping):
+            professor_mode = project.get("professor_mode")
+        else:
+            professor_mode = getattr(project, "professor_mode", None)
+
+        return str(professor_mode or "coverage") != "adaptive"
+
     def _assessment_weekly_strategy(
         self,
         context: PlannerContext,
@@ -226,6 +352,29 @@ class PlannerEngine:
             category_strategies=category_strategies,
             priority_categories=(),
             secondary_categories=tuple(context.categories),
+        )
+
+    def _coverage_weekly_strategy(
+        self,
+        context: PlannerContext,
+        ordered_categories: Sequence[str],
+    ) -> ProfessorWeeklyStrategy:
+        """Return a quiz-oriented strategy for Coverage evidence collection."""
+
+        category_strategies = tuple(
+            ProfessorCategoryStrategy(
+                category=category,
+                strategy=ProfessorCategoryStrategyCode.EXPLORE,
+                depth=ProfessorDepthCode.DEEP,
+                reasoning_code=ProfessorReasoningCode.INSUFFICIENT_EVIDENCE,
+            )
+            for category in ordered_categories
+        )
+        return ProfessorWeeklyStrategy(
+            weekly_goal_code=ProfessorWeeklyGoalCode.CALIBRATE_COVERAGE,
+            category_strategies=category_strategies,
+            priority_categories=tuple(ordered_categories[:3]),
+            secondary_categories=tuple(ordered_categories[3:]),
         )
 
     def _assessment_week_id(self, context: PlannerContext) -> str:

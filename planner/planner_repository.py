@@ -135,6 +135,116 @@ class PlannerRepository:
 
         return self._json_value(row[0], default={}) or {}
 
+    def load_previously_scheduled_categories(
+        self,
+        project_id: str,
+    ) -> Sequence[str]:
+        """Return category identities scheduled by prior persisted Study Plans."""
+
+        rows = self.db.execute(
+            text("""
+                select
+                    w.planning_parameters,
+                    d.planned_allocations
+                from planner_weeks w
+                join planner_daily_plans d
+                    on d.week_id = w.id
+                where w.project_id = :project_id
+                order by w.created_at asc, w.id asc, d.session_index asc
+            """),
+            {"project_id": project_id},
+        ).fetchall()
+
+        scheduled = []
+        seen = set()
+
+        for row in rows:
+            planning_parameters = self._json_value(row[0], default={}) or {}
+            plan_type = planning_parameters.get("plan_type") or "study_plan"
+            if plan_type != "study_plan":
+                continue
+
+            allocations = self._json_value(row[1], default=[]) or []
+            for allocation in allocations:
+                if not isinstance(allocation, Mapping):
+                    continue
+
+                identity = self._category_identity(allocation.get("category"))
+                if not identity or identity in seen:
+                    continue
+
+                scheduled.append(identity)
+                seen.add(identity)
+
+        return tuple(scheduled)
+
+    def load_completed_survey_categories(
+        self,
+        project_id: str,
+    ) -> Sequence[str]:
+        """Return category identities completed by persisted Survey/Coverage plans.
+
+        Survey progression is intentionally plan-based, not evidence-based:
+        completed Coverage Study Plans determine which categories must not be
+        scheduled again during Survey.
+        """
+
+        rows = self.db.execute(
+            text("""
+                select
+                    w.planning_parameters,
+                    w.weekly_statistics,
+                    d.planned_allocations
+                from planner_weeks w
+                left join planner_daily_plans d
+                    on d.week_id = w.id
+                where w.project_id = :project_id
+                and w.status = :status
+                order by w.created_at asc, w.id asc, d.session_index asc
+            """),
+            {
+                "project_id": project_id,
+                "status": WeekStatus.COMPLETED.value,
+            },
+        ).fetchall()
+
+        completed = []
+        seen = set()
+
+        for row in rows:
+            planning_parameters = self._json_value(row[0], default={}) or {}
+            weekly_statistics = self._json_value(row[1], default={}) or {}
+            metadata = weekly_statistics.get("metadata", {}) or {}
+
+            plan_type = planning_parameters.get("plan_type") or "study_plan"
+            if plan_type != "study_plan":
+                continue
+
+            professor_mode = (
+                metadata.get("professor_mode")
+                or planning_parameters.get("professor_mode")
+                or "coverage"
+            )
+            if professor_mode != "coverage":
+                continue
+
+            accepted_categories = metadata.get("coverage_accepted_categories") or ()
+            categories = accepted_categories or tuple(
+                allocation.get("category")
+                for allocation in self._json_value(row[2], default=[]) or []
+                if isinstance(allocation, Mapping)
+            )
+
+            for category in categories:
+                identity = self._category_identity(category)
+                if not identity or identity in seen:
+                    continue
+
+                completed.append(identity)
+                seen.add(identity)
+
+        return tuple(completed)
+
     def save_active_week(
         self,
         project_id: str,
@@ -710,6 +820,9 @@ class PlannerRepository:
 
         return value
 
+    def _category_identity(self, category: Any) -> str:
+        return " ".join(str(category or "").strip().split()).casefold()
+
     def _as_date(self, value: Any) -> date:
         if isinstance(value, datetime):
             return value.date()
@@ -740,6 +853,7 @@ def build_planning_parameters(context: Any) -> Mapping[str, Any]:
     return {
         "question_pace_seconds": preferences.question_pace_seconds,
         "question_style": preferences.question_style,
+        "priority_categories": tuple(preferences.priority_categories or ()),
         "study_language": getattr(context, "study_language", None),
         "number_of_sessions": getattr(context, "number_of_sessions", None),
         "planning_budget_minutes": getattr(

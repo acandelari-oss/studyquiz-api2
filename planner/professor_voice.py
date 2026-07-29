@@ -11,10 +11,14 @@ import json
 import os
 import re
 from dataclasses import asdict, is_dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .professor_identity import DEFAULT_PROFESSOR_IDENTITY, ProfessorIdentity
 from .professor_knowledge import ProfessorKnowledge
+from .professor_observations import (
+    GoalNotYetDemonstrated,
+    ProfessorObservationBuilder,
+)
 
 
 COMMUNICATION_TYPE_STUDY_PLAN_BRIEFING = "STUDY_PLAN_BRIEFING"
@@ -183,6 +187,28 @@ class ProfessorVoiceValidator:
         r"\bmodulo\s+\d+\b",
         r"\bmoduli\s+\d+\s*(e|,)\s*\d+\b",
     )
+    STUDY_PLAN_LESSON_FRAMING_PATTERNS = (
+        r"\blet'?s start\b",
+        r"\bwe start\b",
+        r"\bwe begin\b",
+        r"\bbegin with\b",
+        r"\bstart with\b",
+        r"\bthe first module\b",
+        r"\bthe first category\b",
+        r"\bthe first lesson\b",
+        r"\bstarting point\b",
+        r"\bfoundation(al)?\b",
+        r"\bfundamental\b",
+        r"\biniziamo\b",
+        r"\bpartiamo\b",
+        r"\bcominciamo\b",
+        r"\bprimo modulo\b",
+        r"\bprima categoria\b",
+        r"\bprima lezione\b",
+        r"\bpunto di partenza\b",
+        r"\bfondament[oa]li?\b",
+        r"\bbase\b",
+    )
 
     def validate_study_plan_briefing(
         self,
@@ -226,6 +252,9 @@ class ProfessorVoiceValidator:
             return False
 
         if self._sounds_like_documentation(lower_text):
+            return False
+
+        if self._frames_study_plan_as_first_lesson(lower_text):
             return False
 
         return True
@@ -633,6 +662,12 @@ class ProfessorVoiceValidator:
             )
         )
 
+    def _frames_study_plan_as_first_lesson(self, lower_text: str) -> bool:
+        return any(
+            re.search(pattern, lower_text)
+            for pattern in self.STUDY_PLAN_LESSON_FRAMING_PATTERNS
+        )
+
     def _looks_like_category_list(
         self,
         lower_text: str,
@@ -890,16 +925,20 @@ class ProfessorVoiceValidator:
 class ProfessorVoiceService:
     """Generate Professor Voice text from identity and ProfessorKnowledge only."""
 
+    MODULE_SHORT_DURATION_NOTE_THRESHOLD_MINUTES = 2
+
     def __init__(
         self,
         *,
         identity: ProfessorIdentity = DEFAULT_PROFESSOR_IDENTITY,
         llm_generate: Optional[Callable[[str], str]] = None,
         validator: Optional[ProfessorVoiceValidator] = None,
+        observation_builder: Optional[ProfessorObservationBuilder] = None,
     ) -> None:
         self.identity = identity
         self.llm_generate = llm_generate
         self.validator = validator or ProfessorVoiceValidator()
+        self.observation_builder = observation_builder or ProfessorObservationBuilder()
 
     def generate_study_plan_briefing(
         self,
@@ -923,6 +962,10 @@ class ProfessorVoiceService:
             print("⚠️ PROFESSOR VOICE VALIDATION FAILED — USING FALLBACK")
             return fallback
 
+        if not self._text_matches_study_language(briefing, knowledge):
+            print("⚠️ PROFESSOR VOICE LANGUAGE MISMATCH — USING FALLBACK")
+            return fallback
+
         return briefing or fallback
 
     def generate_daily_briefing(
@@ -938,7 +981,11 @@ class ProfessorVoiceService:
             briefing = self._generate_daily_with_llm(knowledge, module_index).strip()
         except Exception as error:
             print("⚠️ PROFESSOR DAILY VOICE FALLBACK:", repr(error))
-            return fallback
+            return self._append_short_duration_note(
+                fallback,
+                knowledge,
+                module_index,
+            )
 
         if not self.validator.validate_daily_briefing(
             briefing,
@@ -946,9 +993,27 @@ class ProfessorVoiceService:
             module_index,
         ):
             print("⚠️ PROFESSOR DAILY VOICE VALIDATION FAILED — USING FALLBACK")
-            return fallback
+            return self._append_short_duration_note(
+                fallback,
+                knowledge,
+                module_index,
+            )
 
-        return briefing or fallback
+        briefing = self._append_short_duration_note(
+            briefing or fallback,
+            knowledge,
+            module_index,
+        )
+
+        if not self._text_matches_study_language(briefing, knowledge):
+            print("⚠️ PROFESSOR DAILY VOICE LANGUAGE MISMATCH — USING FALLBACK")
+            return self._append_short_duration_note(
+                fallback,
+                knowledge,
+                module_index,
+            )
+
+        return briefing
 
     def generate_module_objective(
         self,
@@ -974,6 +1039,10 @@ class ProfessorVoiceService:
             module_index,
         ):
             print("⚠️ PROFESSOR MODULE OBJECTIVE VALIDATION FAILED — USING FALLBACK")
+            return fallback
+
+        if not self._text_matches_study_language(objective, knowledge):
+            print("⚠️ PROFESSOR MODULE OBJECTIVE LANGUAGE MISMATCH — USING FALLBACK")
             return fallback
 
         return objective or fallback
@@ -1010,6 +1079,10 @@ class ProfessorVoiceService:
             print("⚠️ PROFESSOR ACTIVITY DEBRIEF VALIDATION FAILED — USING FALLBACK")
             return fallback
 
+        if not self._text_matches_study_language(debrief, knowledge):
+            print("⚠️ PROFESSOR ACTIVITY DEBRIEF LANGUAGE MISMATCH — USING FALLBACK")
+            return fallback
+
         return debrief or fallback
 
     def generate_module_debrief(
@@ -1042,6 +1115,10 @@ class ProfessorVoiceService:
             module_index,
         ):
             print("⚠️ PROFESSOR MODULE DEBRIEF VALIDATION FAILED — USING FALLBACK")
+            return fallback
+
+        if not self._text_matches_study_language(debrief, knowledge):
+            print("⚠️ PROFESSOR MODULE DEBRIEF LANGUAGE MISMATCH — USING FALLBACK")
             return fallback
 
         return debrief or fallback
@@ -1079,6 +1156,10 @@ class ProfessorVoiceService:
             module_debrief,
         ):
             print("⚠️ PROFESSOR HOMEWORK VALIDATION FAILED — USING FALLBACK")
+            return fallback
+
+        if not self._text_matches_study_language(homework, knowledge):
+            print("⚠️ PROFESSOR HOMEWORK LANGUAGE MISMATCH — USING FALLBACK")
             return fallback
 
         return homework or fallback
@@ -1119,6 +1200,10 @@ class ProfessorVoiceService:
             print("⚠️ PROFESSOR MODULE QUESTION VALIDATION FAILED — USING FALLBACK")
             return fallback
 
+        if not self._text_matches_study_language(answer, knowledge):
+            print("⚠️ PROFESSOR MODULE QUESTION LANGUAGE MISMATCH — USING FALLBACK")
+            return fallback
+
         return answer or fallback
 
     def generate_study_plan_debrief(
@@ -1147,6 +1232,10 @@ class ProfessorVoiceService:
             knowledge,
         ):
             print("⚠️ PROFESSOR STUDY PLAN DEBRIEF VALIDATION FAILED — USING FALLBACK")
+            return fallback
+
+        if not self._text_matches_study_language(debrief, knowledge):
+            print("⚠️ PROFESSOR STUDY PLAN DEBRIEF LANGUAGE MISMATCH — USING FALLBACK")
             return fallback
 
         return debrief or fallback
@@ -1253,50 +1342,141 @@ class ProfessorVoiceService:
             else self._default_llm_generate(prompt)
         )
 
+    def _credibility_rules(self, available_evidence: str) -> str:
+        return f"""
+	PROFESSOR CREDIBILITY RULES:
+	- Every output must contain at least ONE observation, decision, or conditional
+	  intention that depends on the supplied DOUNO data.
+	- When professor_observations is present and non-empty, use those observations
+	  as the preferred source of educational reasoning. Do not independently
+	  reconstruct an equivalent conclusion from raw scores, strategy codes,
+	  remaining material flags, or runtime data.
+	- The Professor remains responsible for language. Observations are typed facts,
+	  not text to copy directly.
+	- If a sentence could be written without access to ProfessorKnowledge,
+	  current_module, runtime results, or the provided context, remove it.
+	- Speak only about:
+	  1. observations from available data, for example "I noticed...",
+	     "This activity suggests...", "Based on the recent module result...";
+	  2. existing deterministic decisions, for example "I chose...",
+	     "This Study Plan focuses on...", "I intentionally limited...";
+	  3. conditional intentions, for example "If this pattern continues...",
+	     "This result can be considered when a future Study Plan is generated."
+	- Do not promise future behaviour that has not already been decided by the
+	  provided Planner data. Avoid "tomorrow I will", "the next module will",
+	  "we will study", or "I will give you" unless that decision already exists
+	  in the input.
+	- Do not use generic academic filler such as "build deeper understanding",
+	  "prepare for future applications", "strengthen your learning journey", or
+	  "develop important skills" unless the supplied context says exactly why.
+	- Evidence hierarchy:
+	  LEVEL 1 FACTS: completed activities, Planner decisions, TeachingContext,
+	  selected categories/topics, activity type, module objective, assigned
+	  homework, and runtime result values. These may be stated confidently.
+	  LEVEL 2 SUPPORTED INTERPRETATIONS: use "suggests", "may indicate",
+	  "appears", or "the current evidence points toward" when interpreting what
+	  facts may mean educationally.
+	  LEVEL 3 UNSUPPORTED DIAGNOSES: never state "your foundations are weak",
+	  "you do not understand", "you struggle with", "you confuse", "you need to
+	  revisit", or "the problem is" unless the provided runtime evidence directly
+	  demonstrates that conclusion.
+	- If evidence is insufficient, say so briefly and choose a cautious,
+	  conditional interpretation instead of a diagnosis.
+	- Before writing each paragraph, internally check: which sentence is directly
+	  supported by the provided evidence? If no sentence is supported, rewrite.
+	- Grounding available for this communication: {available_evidence}
+	"""
+
+    def _language_output_rules(self, knowledge: ProfessorKnowledge) -> str:
+        if self._is_italian(knowledge.study_language):
+            return """
+	LANGUAGE RULE:
+	- Required output language: Italian.
+	- Write the student-facing text entirely in Italian.
+	- Use natural Italian formulations such as "In questo modulo...", "Il lavoro
+	  svolto indica...", "Questo risultato suggerisce...", "Dedica qualche
+	  minuto...", or "La domanda è utile..." when appropriate.
+	- Do not copy English wording from these instructions, examples, field names,
+	  JSON keys, or input data.
+	- Do not use English student-facing formulas such as "Your result",
+	  "Your work", "By the end", "Today you", "This module", "Choose one", or
+	  "Spend ten minutes".
+	"""
+
+        return """
+	LANGUAGE RULE:
+	- Required output language: English.
+	- Write the student-facing text entirely in English.
+	"""
+
     def _build_study_plan_briefing_prompt(self, knowledge: ProfessorKnowledge) -> str:
         payload = {
             "communication_type": COMMUNICATION_TYPE_STUDY_PLAN_BRIEFING,
             "professor_identity": self._to_jsonable(self.identity),
             "professor_knowledge": self._to_jsonable(knowledge),
+            "professor_observations": self._observation_context(
+                knowledge,
+                include_goal_observations=False,
+            ),
         }
 
         return f"""
-You are writing the Study Plan Briefing as the Professor.
+	You are writing the Study Plan Briefing as the Professor.
 
-COMMUNICATION GOAL:
-Interpret the educational reasoning behind the Study Plan. Do not describe
-what was generated.
+	COMMUNICATION GOAL:
+	Present the strategy behind the Study Plan. The student is opening a Study
+	Plan, not a lesson. Explain why this learning cycle exists and how it fits
+	into the wider preparation.
 
-The student can already see the modules, categories, activities, counts,
-durations, and sequence on screen. Your role is to explain the educational
-reasoning behind the plan, not to repeat what is visible.
+	{self._credibility_rules(
+	    "Use ProfessorKnowledge fields such as activity_mix, "
+	    "selected_topics_by_category, planning_constraints, "
+	    "additional_modules_remain, and remaining_topics_by_category. The briefing "
+	    "must contain at least one observation about why this exact Study Plan was "
+	    "chosen from this exact project data. Prefer plan-level facts: coverage "
+	    "status, selected-versus-remaining material, priority categories, activity "
+	    "mix, planning constraints, and whether the plan is part of initial coverage "
+	    "or later adaptation."
+	)}
 
-ProfessorKnowledge.teaching_contexts contains deterministic educational context
-for the modules. Use it as the primary source for conceptual interpretation,
-learning progression, expected mastery, and activity rationale. Do not rebuild
-those concepts independently when TeachingContext already provides them.
+	The student can already see the modules, categories, activities, counts,
+	durations, and sequence on screen. Your role is to explain the educational
+	strategy behind the plan, not to repeat what is visible.
 
-Write as an experienced university professor introducing the learning path.
-The student should feel guided by a teacher, not informed by software.
+ProfessorKnowledge may include module teaching contexts. For this communication,
+do not use them to introduce, justify, or name any individual module, topic, or
+category. The briefing must remain at Study Plan level.
 
-Your explanation must cover these educational questions naturally:
-1. WHY WE START HERE:
-   Explain why this is the correct starting point, what foundation it builds,
-   and why beginning elsewhere would be less effective. Do not list
-   categories.
-2. STUDY PLAN OBJECTIVE:
-   Explain what the student should be able to achieve by the end of this Study
-   Plan. Focus on learning outcomes such as conceptual foundations, connecting
-   isolated ideas, identifying weak areas, consolidating essential knowledge,
-   or preparing for more advanced work. Do not merely describe activities.
-3. WHAT COMES NEXT:
-   Explain educational continuity. After this Study Plan, the next teaching
-   decision can be based on evidence from the work: whether reinforcement is
-   needed, progression is appropriate, harder material can be introduced, or
-   earlier concepts require consolidation.
-4. ACTIVITY REASONING:
-   Explicitly explain why the chosen activity type is pedagogically appropriate
-   for this Study Plan.
+Write as an experienced university professor presenting the learning strategy.
+The student should understand why this Study Plan exists, not feel that a first
+lesson is beginning.
+
+	Your explanation must cover these educational questions naturally, only when
+	the answer is supported by ProfessorKnowledge:
+	1. WHY THIS STUDY PLAN:
+	   Explain why only this portion of the syllabus is included now. If
+	   additional_modules_remain or remaining_topics_by_category indicates that
+	   material remains, explain that the syllabus is intentionally distributed
+	   across multiple Study Plans. If priority categories exist, explain that
+	   the student's selected priorities received precedence. Do not list
+	   categories.
+	2. STUDY PLAN OBJECTIVE:
+	   Explain what completing the whole Study Plan is meant to achieve:
+	   obtaining an initial assessment, consolidating knowledge across the
+	   selected material, collecting evidence for future planning, improving the
+	   quality of subsequent Study Plans, or making measurable progress through
+	   the syllabus. This section must never depend on the title, subject, or
+	   teaching context of any individual category, topic, or module.
+	3. WHAT COMES NEXT:
+	   Explain that future Study Plans can progressively cover remaining material
+	   and can use completed activity evidence to decide where less attention,
+	   reinforcement, or further practice is justified. Do not promise specific
+	   future modules, topics, or activities unless they already exist in
+	   ProfessorKnowledge.
+	4. ACTIVITY REASONING:
+	   Explain why the chosen activity type is appropriate at Study Plan level,
+	   using activity_mix and activity_rationale. Do not describe the contents of
+	   any specific module.
 
 Every sentence must explain a deterministic educational decision that is
 grounded in ProfessorKnowledge.
@@ -1304,13 +1484,13 @@ If another Study Plan may follow, explain it as pedagogical continuity:
 remaining work receives priority and the next step continues from the evidence
 created here. Never frame this as a software or generation process.
 
-ACTIVITY GROUNDING RULE:
-- If ProfessorKnowledge.activity_mix contains only quizzes, explain why quizzes
-  were chosen: they provide an objective picture of current preparation. Do not
-  mention a mix, combination, variety, alternation, or flashcards.
-- If ProfessorKnowledge.activity_mix contains only flashcards, explain why
-  flashcards were chosen: they reinforce long-term retention for concepts that
-  should be stabilised. Do not mention quizzes.
+	ACTIVITY GROUNDING RULE:
+	- If ProfessorKnowledge.activity_mix contains only quizzes, explain why quizzes
+	  were chosen: they provide an objective picture of current preparation. Do not
+	  mention a mix, combination, variety, alternation, or flashcards.
+	- If ProfessorKnowledge.activity_mix contains only flashcards, explain why
+	  flashcards were chosen: they reinforce long-term retention for concepts that
+	  the plan has selected for consolidation. Do not mention quizzes.
 - Only if both quizzes and flashcards are present may you explain the reason
   for combining activity types: some concepts need assessment while others
   benefit from reinforcement.
@@ -1324,11 +1504,17 @@ STYLE:
 - Do not enumerate categories, topics, modules, durations, activity counts, or
   question counts.
 - Avoid repeating information already visible in the UI.
-- Avoid generic educational phrases unless they are directly supported by the
-  actual Study Plan.
+	- Avoid generic educational phrases unless they are directly supported by the
+	  actual Study Plan.
 - Avoid course-brochure language such as "future applications" or "deeper
   understanding" unless the deterministic plan specifically justifies it.
 - Never sound like documentation.
+- Never write as if introducing a lesson.
+- Never say "let's start", "we start", "we begin", "start with",
+  "foundation", or "fundamental" unless ProfessorKnowledge explicitly provides
+  that reason. At present it does not.
+- Never infer subject importance, prerequisites, or conceptual foundations from
+  module order.
 - Never use phrases such as "the system", "the planner", "the algorithm",
   "the application", "the generated plan", or "the generated Study Plan".
 
@@ -1342,6 +1528,7 @@ Do not mention software, GPT, Planner, algorithms, implementation, prompts, or
 internal codes.
 Do not expose enum/code names directly.
 Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 Return ONLY valid JSON with this shape:
 {{"briefing": "..."}}
 
@@ -1361,42 +1548,68 @@ INPUT:
             "professor_identity": self._to_jsonable(self.identity),
             "professor_knowledge": self._to_jsonable(knowledge),
             "current_module": self._to_jsonable(module_context),
+            "professor_observations": self._observation_context(
+                knowledge,
+                include_goal_observations=False,
+            ),
         }
 
         return f"""
-You are writing the Daily Briefing as the Professor immediately before a study
-module begins.
+	You are writing the Daily Briefing as the Professor immediately before a study
+	module begins.
 
-This is not another Study Plan briefing. It is a short conversation before
-today's lesson starts.
+	This is not another Study Plan briefing. It is a short conversation before
+	today's lesson starts.
 
-Use only Professor Identity, ProfessorKnowledge, and current_module.
-Do not inspect or invent anything else.
+	{self._credibility_rules(
+	    "Use current_module.teaching_context, current_module activities, "
+	    "module_strategies, and activity_rationale. The briefing must include at "
+	    "least one observation about why this exact module is being approached in "
+	    "this exact way."
+	)}
+
+	Use only Professor Identity, ProfessorKnowledge, and current_module.
+	Do not inspect or invent anything else.
 current_module.teaching_context is the deterministic teaching interpretation
 for this module. Use it as the primary source for the conceptual focus,
 progression, expected mastery, and activity rationale.
 
-The Daily Briefing must answer four questions naturally:
-1. Why are we studying this module now?
-2. What should you focus on?
-3. Why is today's activity type appropriate?
-4. What attitude should you have while studying?
+	The Daily Briefing must answer these questions naturally only when the current
+	module data supports the answer:
+	1. Why are we studying this module now?
+	2. What should you focus on?
+	3. Why is today's activity type appropriate?
+	4. What should you pay attention to while studying, based on the actual
+	   activity rationale?
 
 Speak directly to the learner. Use second-person language such as "you",
 "your", and "you should". Avoid institutional formulations such as "the
 student", "students should", or "learners should".
 Do not always begin with "We are studying this module now". Vary the opening
-naturally, for example: "Today we'll focus on...", "In this session you'll...",
-"We'll begin by...", "This module introduces...", or "Today's work centres on...".
+naturally using ProfessorKnowledge.study_language.
+Italian examples: "Oggi ti concentrerai su...", "In questa sessione lavorerai su...",
+"Questo modulo serve a..."
+English examples: "Today you'll focus on...", "In this session you'll...",
+"This module helps you..."
+If ProfessorKnowledge.study_language is Italian, do not use English openings
+such as "Today we'll", "In this session", "We'll begin", or "This module".
 
-ACTIVITY GROUNDING RULE:
-- If the current module contains only quizzes, explain that quizzes help reveal
-  what is already solid and what still requires attention. Do not mention
-  flashcards.
-- If the current module contains only flashcards, explain that flashcards help
-  strengthen active recall and long-term retention. Do not mention quizzes.
+	ACTIVITY GROUNDING RULE:
+	- If the current module contains only quizzes, explain that quizzes help reveal
+	  what the evidence can and cannot support yet. Do not mention flashcards.
+	- If the current module contains only flashcards, explain that flashcards help
+	  strengthen active recall and long-term retention. Do not mention quizzes.
 - If the current module contains both, explain that the work both checks and
   reinforces preparation.
+
+	MODULE DURATION RULE:
+	- If current_module.effective_duration_may_be_shorter is true, include one
+	  concise note explaining that the module may finish before the selected
+	  session length because the planned material has been covered under the
+	  question-quality and repetition limits. Explain that the student may proceed
+	  directly to the next module after completion.
+	- If current_module.effective_duration_may_be_shorter is false, do not mention
+	  duration.
 
 STYLE:
 - Experienced, calm, encouraging, academically rigorous.
@@ -1410,6 +1623,7 @@ STYLE:
 - Do not invent previous mistakes, previous scores, previous sessions,
   strengths, weaknesses, or future certainty.
 - Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 
 Return ONLY valid JSON with this shape:
 {{"briefing": "..."}}
@@ -1430,29 +1644,44 @@ INPUT:
             "professor_identity": self._to_jsonable(self.identity),
             "professor_knowledge": self._to_jsonable(knowledge),
             "current_module": self._to_jsonable(module_context),
+            "professor_observations": self._observation_context(
+                knowledge,
+                include_goal_observations=False,
+            ),
         }
 
         return f"""
 You are writing the Module Objective as the Professor.
 
-The objective is not a briefing and not a description of today's activities.
-It must answer one question:
-"What will you be able to understand or master by the end of this module?"
+	The objective is not a briefing and not a description of today's activities.
+	It must answer one question:
+	"What will you be able to understand or master by the end of this module?"
 
-Use only Professor Identity, ProfessorKnowledge, and current_module.
-Do not inspect or invent anything else.
+	{self._credibility_rules(
+	    "Use current_module.teaching_context.expected_mastery, conceptual_summary, "
+	    "learning_progression, selected module topics, and activity type. The "
+	    "objective must describe an outcome that depends on this exact module, not "
+	    "a generic academic objective."
+	)}
+
+	Use only Professor Identity, ProfessorKnowledge, and current_module.
+	Do not inspect or invent anything else.
 current_module.teaching_context is the deterministic teaching interpretation
 for this module. Use it as the primary source for the expected mastery,
 conceptual focus, progression, and activity rationale.
 
-The Module Objective must:
-- express the expected learning outcome
-- describe the understanding, reasoning ability, or mastery you should develop
-- be grounded in the module categories, module topics, and activity type
-- address the learner directly in second person
-- prefer formulations such as "By the end of this module, you will be able
-  to...", "When you complete this module, you will be able to...", or "After
-  this session, you should be able to..."
+	The Module Objective must:
+	- express the expected learning outcome
+	- describe the understanding, reasoning ability, or mastery you should develop
+	- be grounded in the module categories, module topics, and activity type
+	- use current_module.teaching_context.expected_mastery as the strongest source
+	  when it is available
+	- address the learner directly in second person
+- use an opening formulation that matches ProfessorKnowledge.study_language:
+  Italian examples: "Al termine di questo modulo...", "Completando questo modulo..."
+  English examples: "By the end of this module...", "When you complete this module..."
+- if ProfessorKnowledge.study_language is Italian, do not use English objective
+  formulas such as "By the end", "When you complete", or "After this session"
 - avoid enumerating categories or topics
 - avoid describing the module contents
 - avoid describing visible dashboard data
@@ -1475,6 +1704,7 @@ STYLE:
 - Do not invent previous mistakes, previous scores, previous sessions,
   strengths, weaknesses, or future certainty.
 - Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 
 Return ONLY valid JSON with this shape:
 {{"objective": "..."}}
@@ -1502,39 +1732,58 @@ INPUT:
             "professor_knowledge": self._to_jsonable(knowledge),
             "current_module": self._to_jsonable(module_context),
             "activity_context": self._to_jsonable(activity_context),
+            "professor_observations": self._observation_context(
+                knowledge,
+                module_results_by_index={
+                    module_index: {
+                        "activity_results": (activity_result,),
+                    },
+                },
+            ),
         }
 
         return f"""
 You are writing the Activity Debrief as the Professor immediately after one
 learning activity has been completed.
 
-This is not a quiz review. The detailed question-by-question review already
-exists elsewhere. Your task is to interpret the educational meaning of the
-activity outcome.
+	This is not a quiz review. The detailed question-by-question review already
+	exists elsewhere. Your task is to interpret the educational meaning of the
+	activity outcome.
 
-Use only Professor Identity, ProfessorKnowledge, current_module, and
-activity_context. Do not inspect or invent anything else.
+	{self._credibility_rules(
+	    "Use activity_context, performance_level, activity type, current_module."
+	    "teaching_context, and the module activity rationale. The debrief must "
+	    "contain at least one observation about what this exact completed activity "
+	    "suggests, without repeating visible score data."
+	)}
+
+	Use only Professor Identity, ProfessorKnowledge, current_module, and
+	activity_context. Do not inspect or invent anything else.
 current_module.teaching_context is the deterministic teaching interpretation
 for this module. activity_context contains the available runtime result.
 
-The Activity Debrief must explain naturally:
-1. What this activity demonstrates about the learner's preparation.
-2. What appears solid, if the result supports that.
-3. What still needs reinforcement, if the result supports that.
-4. Why the next activity or continuation makes educational sense.
+	The Activity Debrief must explain naturally:
+	1. What this activity demonstrates about the learner's preparation.
+	2. What appears supported by the result, if the evidence supports that.
+	3. What may still require reinforcement, if the evidence supports that.
+	4. Why continuation makes educational sense only if a next activity or
+	   continuation is actually present in the provided context.
 
 Speak directly to the learner. Always use second-person language such as
 "you", "your", and "you should".
 
 PERFORMANCE GROUNDING RULE:
-- High performance means the answer pattern suggests stable understanding.
-  Explain that the foundation can support more demanding application.
-- Medium performance means the main ideas are present but distinctions still
-  need reinforcement. Explain why consolidation or careful continuation helps.
-- Low performance means the core ideas are not yet stable. Explain why
-  strengthening the foundation should come before adding complexity.
-- If no score or accuracy is available, interpret completion cautiously and
-  avoid claims about strengths or weaknesses.
+	- High performance may support the interpretation that the assessed
+	  relationships are becoming stable. Say "suggests" or "points toward", not
+	  "proves".
+	- Medium performance means the main ideas are present but distinctions still
+	  may require reinforcement. Explain why consolidation or careful continuation
+	  may be useful.
+	- Low performance may indicate that the assessed ideas are not yet stable.
+	  Explain this as an interpretation from the result, not as a diagnosis of the
+	  learner.
+	- If no score or accuracy is available, interpret completion cautiously and
+	  avoid claims about strengths or weaknesses.
 
 STYLE:
 - Experienced university professor.
@@ -1549,6 +1798,7 @@ STYLE:
 - Do not mention Planner, algorithm, GPT, AI, system, application, software,
   implementation, prompts, or internal codes.
 - Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 
 Return ONLY valid JSON with this shape:
 {{"debrief": "..."}}
@@ -1576,43 +1826,57 @@ INPUT:
             "professor_knowledge": self._to_jsonable(knowledge),
             "current_module": self._to_jsonable(module_context),
             "module_debrief_context": self._to_jsonable(module_debrief_context),
+            "professor_observations": self._observation_context(
+                knowledge,
+                module_results_by_index={module_index: module_results},
+            ),
         }
 
         return f"""
 You are writing the Module Debrief as the Professor after the final learning
 activity of a module has been completed.
 
-This is not an Activity Debrief and not a quiz review. The detailed
-question-by-question review already exists elsewhere. Your task is to interpret
-the educational meaning of the whole completed module.
+	This is not an Activity Debrief and not a quiz review. The detailed
+	question-by-question review already exists elsewhere. Your task is to interpret
+	the educational meaning of the whole completed module.
 
-Use only Professor Identity, ProfessorKnowledge, current_module, and
-module_debrief_context. Do not inspect or invent anything else.
+	{self._credibility_rules(
+	    "Use module_debrief_context, overall performance level, completed activity "
+	    "profile, current_module.teaching_context, module objective, Professor "
+	    "Debrief inputs, and Homework context if present. The debrief must include "
+	    "at least one observation that depends on this exact module result."
+	)}
+
+	Use only Professor Identity, ProfessorKnowledge, current_module, and
+	module_debrief_context. Do not inspect or invent anything else.
 current_module.teaching_context is the deterministic teaching interpretation
 for this module. module_debrief_context contains the available runtime module
 results.
 
-The Module Debrief must explain naturally:
-1. What has been consolidated during this module.
-2. What appears conceptually stable, if the results support that.
-3. What may still require reinforcement, if the results support that.
-4. Why the following module or next learning step naturally builds on this one.
+	The Module Debrief must explain naturally:
+	1. What has been consolidated during this module.
+	2. What appears conceptually stable, if the results directly support that.
+	3. What may still require reinforcement, if the results support that.
+	4. Why a following module or next learning step naturally builds on this one
+	   only if that following step is present in ProfessorKnowledge or the provided
+	   module context. Otherwise, speak conditionally.
 
 Speak directly to the learner. Always use second-person language such as
 "you", "your", and "you should".
 
 PERFORMANCE GROUNDING RULE:
-- High module performance means the module outcome suggests connected and
-  reliable foundations. Explain why the following module can introduce more
-  advanced reasoning without losing coherence.
-- Medium module performance means the main ideas are present but some
-  relationships need reinforcement. Explain how the next module can revisit
-  them in a broader context.
-- Low module performance means the underlying concepts still need
-  consolidation. Explain that the next step should strengthen the foundation
-  while gradually introducing new material.
-- If no score or mastery signal is available, interpret completion cautiously
-  and avoid claims about strengths or weaknesses.
+	- High module performance may support the interpretation that the assessed
+	  relationships are becoming connected and reliable. Use cautious language and
+	  explain this only through current_module.teaching_context and actual module
+	  results.
+	- Medium module performance may indicate that the main ideas are present while
+	  some relationships still deserve checking. Explain this as a supported
+	  interpretation, not a certainty.
+	- Low module performance may indicate that the assessed concepts need more
+	  consolidation. Do not say "you do not understand" or "your foundations are
+	  weak"; describe only what the result suggests.
+	- If no score or mastery signal is available, interpret completion cautiously
+	  and avoid claims about strengths or weaknesses.
 
 STYLE:
 - Experienced university professor.
@@ -1627,6 +1891,7 @@ STYLE:
 - Do not mention Planner, algorithm, GPT, AI, system, application, software,
   implementation, prompts, or internal codes.
 - Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 
 Return ONLY valid JSON with this shape:
 {{"debrief": "..."}}
@@ -1654,33 +1919,47 @@ INPUT:
             "professor_knowledge": self._to_jsonable(knowledge),
             "current_module": self._to_jsonable(module_context),
             "homework_context": self._to_jsonable(homework_context),
+            "professor_observations": self._observation_context(
+                knowledge,
+                module_results_by_index={module_index: module_results},
+            ),
         }
 
         return f"""
 You are writing ONE Homework recommendation as the Professor immediately after
 the Module Debrief.
 
-This is not a new activity and not a second debrief. It is one short,
-practical learning action the learner can do independently in approximately
-5-15 minutes.
+	This is not a new activity and not a second debrief. It is one short,
+	practical learning action the learner can do independently in approximately
+	5-15 minutes.
 
-Use only Professor Identity, ProfessorKnowledge, current_module, and
-homework_context. Do not inspect or invent anything else.
+	{self._credibility_rules(
+	    "Use homework_context, performance_level, current_module.teaching_context, "
+	    "module objective, and completed activity profile. The recommendation must "
+	    "be one action chosen because of this exact module result."
+	)}
+
+	Use only Professor Identity, ProfessorKnowledge, current_module, and
+	homework_context. Do not inspect or invent anything else.
 current_module.teaching_context is the deterministic teaching interpretation
 for this module. homework_context contains the runtime module result and
 performance level.
 
-The Homework recommendation must:
-1. Address the learner directly in second person.
-2. Describe exactly ONE concrete action.
-3. Take approximately 5-15 minutes.
-4. Reinforce weak areas when performance is low.
-5. Consolidate understanding when performance is high.
-6. Be educationally meaningful and connected to the module's teaching context.
+	The Homework recommendation must:
+	1. Address the learner directly in second person.
+	2. Describe exactly ONE concrete action.
+	3. Take approximately 5-15 minutes.
+	4. Use low performance only as evidence that some assessed relationships may
+	   deserve slower reconstruction.
+	5. Use high performance only as evidence that consolidation may preserve what
+	   appears stable.
+	6. Be educationally meaningful and connected to the module's teaching context.
 
-Do not simply say "review", "study again", "go over the material", or similar
-generic instructions. The recommendation must tell the learner what to do and
-how to do it, without enumerating categories or topics.
+	Do not simply say "review", "study again", "go over the material", or similar
+	generic instructions. The recommendation must tell the learner what to do and
+	how to do it, without enumerating categories or topics.
+	If the available evidence is insufficient for a specific diagnosis, prefer a
+	generic but honest study exercise grounded in the module objective.
 
 STYLE:
 - Experienced university professor.
@@ -1694,6 +1973,7 @@ STYLE:
 - Do not mention Planner, algorithm, GPT, AI, system, application, software,
   implementation, prompts, or internal codes.
 - Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 
 Return ONLY valid JSON with this shape:
 {{"homework": "..."}}
@@ -1725,17 +2005,28 @@ INPUT:
             "professor_knowledge": self._to_jsonable(knowledge),
             "current_module": self._to_jsonable(module_context),
             "module_question_context": self._to_jsonable(module_question_context),
+            "professor_observations": self._observation_context(
+                knowledge,
+                module_results_by_index={module_index: module_results},
+            ),
         }
 
         return f"""
 You are answering a learner's optional question after a completed Study Plan
 module.
 
-This is Ask the Professor for the Module Debrief. It is not a new planning
-decision, not a new activity, and not a general chatbot conversation.
+	This is Ask the Professor for the Module Debrief. It is not a new planning
+	decision, not a new activity, and not a general chatbot conversation.
 
-Use only Professor Identity, ProfessorKnowledge, current_module, and
-module_question_context. Do not inspect or invent anything else.
+	{self._credibility_rules(
+	    "Use module_question_context, the learner's question, conversation history, "
+	    "Professor Debrief, Homework recommendation, completed module result, and "
+	    "current_module.teaching_context. The answer must connect to the actual "
+	    "completed module whenever possible."
+	)}
+
+	Use only Professor Identity, ProfessorKnowledge, current_module, and
+	module_question_context. Do not inspect or invent anything else.
 current_module.teaching_context is the deterministic teaching interpretation
 for this module. module_question_context contains the completed module result,
 Professor Debrief, Homework recommendation, short conversation history, and
@@ -1759,6 +2050,7 @@ STYLE:
 - Do not mention Planner, algorithm, GPT, AI, system, application, software,
   implementation, prompts, or internal codes.
 - Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 
 Return ONLY valid JSON with this shape:
 {{"answer": "..."}}
@@ -1781,6 +2073,12 @@ INPUT:
             "professor_identity": self._to_jsonable(self.identity),
             "professor_knowledge": self._to_jsonable(knowledge),
             "study_plan_debrief_context": self._to_jsonable(study_plan_debrief_context),
+            "professor_observations": self._observation_context(
+                knowledge,
+                module_results_by_index=self._study_plan_results_by_index(
+                    study_plan_results
+                ),
+            ),
         }
 
         return f"""
@@ -1790,37 +2088,46 @@ Plan has been completed.
 This is not a Weekly Debrief. The Planner is not calendar-driven. Refer to the
 completed Study Plan, not to a week.
 
-This is not an Activity Debrief and not a Module Debrief. Your task is to
-interpret the educational meaning of the entire completed Study Plan.
+	This is not an Activity Debrief and not a Module Debrief. Your task is to
+	interpret the educational meaning of the entire completed Study Plan.
 
-Use only Professor Identity, ProfessorKnowledge, and
-study_plan_debrief_context. Do not inspect or invent anything else.
+	{self._credibility_rules(
+	    "Use study_plan_debrief_context, overall_accuracy, completed module "
+	    "results, activity profile, ProfessorKnowledge.teaching_contexts, "
+	    "additional_modules_remain, and remaining_topics_by_category. The debrief "
+	    "must include at least one observation about this exact completed Study "
+	    "Plan, not generic end-of-course reflection."
+	)}
+
+	Use only Professor Identity, ProfessorKnowledge, and
+	study_plan_debrief_context. Do not inspect or invent anything else.
 ProfessorKnowledge.teaching_contexts and study_plan_debrief_context contain the
 available deterministic planning and runtime results.
 
-The Study Plan Debrief must explain naturally:
-1. What has been genuinely consolidated across the Study Plan.
-2. How the learner's understanding has evolved.
-3. Which conceptual areas appear stable, if the results support that.
-4. Which areas may still deserve attention, if the results support that.
-5. How these results will influence the next Study Plan.
+	The Study Plan Debrief must explain naturally:
+	1. What has been genuinely consolidated across the Study Plan.
+	2. How the learner's understanding has evolved.
+	3. Which conceptual areas appear stable, if the results directly support that.
+	4. Which areas may still deserve attention, if the results support that.
+	5. How these results can be considered for a future Study Plan. Do not promise
+	   a specific future decision unless it is already present in the provided
+	   data.
 
 The final part should prepare the learner for continuation of the learning
 journey. Speak directly to the learner. Always use second-person language such
 as "you", "your", and "you should".
 
 PERFORMANCE GROUNDING RULE:
-- High overall mastery means the Study Plan outcome suggests coherent and
-  interconnected foundations. Explain why the next Study Plan can focus more on
-  demanding application and less on establishing foundations.
-- Medium overall mastery means clear progress exists, but some relationships
-  still deserve consolidation. Explain why the next Study Plan should reinforce
-  these concepts while extending them.
-- Low overall mastery means the fundamental concepts are still developing.
-  Explain why the next Study Plan should continue strengthening foundations
-  before moving toward more advanced material.
-- If no score or mastery signal is available, interpret completion cautiously
-  and avoid claims about strengths or weaknesses.
+	- High overall mastery may support the interpretation that the assessed
+	  relationships are becoming coherent. Explain this through actual completed
+	  module results and TeachingContext, not as generic praise.
+	- Medium overall mastery may indicate progress with some relationships still
+	  deserving consolidation. Phrase this as an interpretation from the current
+	  evidence.
+	- Low overall mastery may indicate that the assessed concepts need more
+	  support. Do not diagnose the learner; describe only what the results suggest.
+	- If no score or mastery signal is available, interpret completion cautiously
+	  and avoid claims about strengths or weaknesses.
 
 STYLE:
 - Experienced university professor.
@@ -1835,6 +2142,7 @@ STYLE:
 - Do not mention Planner, algorithm, GPT, AI, system, application, software,
   implementation, prompts, or internal codes.
 - Write entirely in ProfessorKnowledge.study_language.
+{self._language_output_rules(knowledge)}
 
 Return ONLY valid JSON with this shape:
 {{"debrief": "..."}}
@@ -1858,7 +2166,13 @@ INPUT:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are the Professor voice. Explain only deterministic planning knowledge.",
+                    "content": (
+                        "You are the Professor voice. Explain only deterministic "
+                        "planning knowledge. Every answer must include at least "
+                        "one observation grounded in the supplied DOUNO data, "
+                        "must separate facts from interpretations and hypotheses, "
+                        "and must not contain generic educational filler."
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -1893,6 +2207,78 @@ INPUT:
 
         return self._fallback_daily_english(knowledge, module_index)
 
+    def _append_short_duration_note(
+        self,
+        briefing: str,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+    ) -> str:
+        note = self._short_duration_note(knowledge, module_index)
+
+        if not note:
+            return briefing
+
+        lower_briefing = str(briefing or "").lower()
+        if any(
+            marker in lower_briefing
+            for marker in (
+                "shorter",
+                "selected session length",
+                "question quality",
+                "unnecessary repetition",
+                "durata",
+                "più breve",
+                "qualità delle domande",
+                "ripetizioni inutili",
+            )
+        ):
+            return briefing
+
+        return f"{briefing} {note}".strip()
+
+    def _short_duration_note(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+    ) -> str:
+        profile = self._module_duration_profile(
+            knowledge,
+            module_index,
+            tuple(
+                activity
+                for activity in knowledge.activity_sizes
+                if activity.module_index == module_index
+            ),
+        )
+
+        if not profile.get("effective_duration_may_be_shorter"):
+            return ""
+
+        has_next_module = module_index < int(getattr(knowledge, "module_count", 0) or 0)
+
+        if self._is_italian(knowledge.study_language):
+            next_step = (
+                "Una volta completato, puoi passare direttamente al modulo successivo."
+                if has_next_module
+                else "Una volta completato, puoi concludere questo Piano di Studio senza aggiungere ripetizioni artificiali."
+            )
+            return (
+                "La durata effettiva può essere più breve della sessione selezionata: "
+                "il materiale previsto per questo passaggio è stato coperto rispettando "
+                f"la qualità delle domande ed evitando ripetizioni inutili. {next_step}"
+            )
+
+        next_step = (
+            "Once completed, you can proceed directly to the next module."
+            if has_next_module
+            else "Once completed, you can finish this Study Plan without adding artificial repetition."
+        )
+        return (
+            "The effective duration may be shorter than the session length you selected: "
+            "the material planned for this step has been covered while preserving "
+            f"question quality and avoiding unnecessary repetition. {next_step}"
+        )
+
     def _fallback_module_objective(
         self,
         knowledge: ProfessorKnowledge,
@@ -1902,6 +2288,89 @@ INPUT:
             return self._fallback_module_objective_italian(knowledge, module_index)
 
         return self._fallback_module_objective_english(knowledge, module_index)
+
+    def _text_matches_study_language(
+        self,
+        text: str,
+        knowledge: ProfessorKnowledge,
+    ) -> bool:
+        """Return whether generated Professor text matches the plan language."""
+
+        if not self._is_italian(knowledge.study_language):
+            return True
+
+        text = " ".join(str(text or "").strip().lower().split())
+
+        if not text:
+            return False
+
+        return not self._text_has_english_markers(text)
+
+    def _text_has_english_markers(self, text: str) -> bool:
+        text = " ".join(str(text or "").strip().lower().split())
+
+        if not text:
+            return False
+
+        english_markers = (
+            "by the end",
+            "when you complete",
+            "after this session",
+            "today we'll",
+            "today you",
+            "in this session",
+            "we'll begin",
+            "we will",
+            "this module",
+            "this session",
+            "your work",
+            "your result",
+            "your question",
+            "you have",
+            "you will be able",
+            "you should be able",
+            "you should",
+            "you can",
+            "you need",
+            "you are",
+            "you completed",
+            "you identified",
+            "you developed",
+            "you made",
+            "you still",
+            "spend ten minutes",
+            "choose one",
+            "take ten",
+            "before the next",
+            "write down",
+            "the work",
+            "the quiz",
+            "the next step",
+            "the following module",
+            "the central point",
+            "the material",
+            "the objective",
+            "this study plan",
+            "throughout this study plan",
+            "learning path",
+            "current preparation",
+            "current module",
+            "current evidence",
+            "completed module",
+            "study material",
+            "central distinctions",
+            "central relationships",
+            "main ideas",
+            "useful evidence",
+            "more precise",
+            "stable",
+            "reinforcement",
+            "consolidation",
+            "foundation",
+            "foundations",
+        )
+
+        return any(marker in text for marker in english_markers)
 
     def _fallback_activity_debrief(
         self,
@@ -1965,6 +2434,9 @@ INPUT:
         focus = self._second_person_mastery(focus)
 
         if self._is_italian(knowledge.study_language):
+            if not self._text_matches_study_language(focus, knowledge):
+                focus = ""
+
             if focus:
                 return (
                     f"La domanda è utile perché riguarda il modo in cui dovresti orientare il ragionamento dopo questo modulo. "
@@ -2225,6 +2697,8 @@ INPUT:
             getattr(teaching_context, "expected_mastery", "") if teaching_context else ""
         )
         focus_phrase = self._second_person_mastery(focus_phrase).strip()
+        if self._text_has_english_markers(focus_phrase):
+            focus_phrase = ""
 
         if performance_level == "high":
             return (
@@ -2469,29 +2943,29 @@ INPUT:
         parts = []
 
         parts.append(
-            "Iniziamo dal punto che offre la base più utile per orientare il percorso: prima di avanzare, è importante capire quali passaggi sostengono davvero il resto del programma."
+            "Questo Piano di Studio è una porzione deliberata del percorso: serve a trasformare una parte del materiale in evidenze osservabili, senza fingere che tutto il syllabus possa essere valutato nello stesso ciclo."
         )
 
         if knowledge.activity_mix.quiz_count > 0 and knowledge.activity_mix.flashcard_count == 0:
             parts.append(
-                "I quiz sono la scelta più adatta perché danno un quadro oggettivo della preparazione attuale, distinguendo ciò che è già stabile da ciò che richiederà un intervento mirato."
+                "L'uso dei quiz è coerente con questa fase perché permette di raccogliere segnali oggettivi sulla preparazione attuale, invece di basarsi solo su impressioni o preferenze iniziali."
             )
         elif knowledge.activity_mix.flashcard_count > 0 and knowledge.activity_mix.quiz_count == 0:
             parts.append(
-                "Le flashcard sono la scelta più adatta perché l’obiettivo è rendere più pronta e duratura la memoria dei concetti essenziali prima di aumentare il carico di verifica."
+                "L'uso delle flashcard è coerente con questa fase perché privilegia il consolidamento e rende più leggibile ciò che viene richiamato con sicurezza rispetto a ciò che resta instabile."
             )
         elif knowledge.activity_mix.quiz_count > 0 and knowledge.activity_mix.flashcard_count > 0:
             parts.append(
-                "La combinazione tra verifica e consolidamento serve a distinguere ciò che sai già applicare da ciò che deve ancora diventare stabile."
+                "La combinazione tra verifica e consolidamento serve a distinguere ciò che può essere osservato tramite risposta applicata da ciò che richiede richiamo ripetuto."
             )
 
         parts.append(
-            "Alla fine dovresti avere una base più leggibile: non una certezza definitiva, ma indicazioni sufficienti per decidere se rinforzare, procedere o tornare sui passaggi meno sicuri."
+            "Completare questo ciclo serve a costruire un quadro più affidabile della preparazione, consolidare il materiale selezionato e rendere più precise le decisioni dei Piani di Studio successivi."
         )
 
         if knowledge.additional_modules_remain:
             parts.append(
-                "Ciò che resta fuori non viene ignorato: sarà ripreso con continuità quando avremo evidenze migliori su cui fondare la prossima scelta didattica."
+                "Il materiale rimasto fuori non viene scartato: conserva priorità nel percorso e sarà coperto progressivamente, con continuità, mentre le attività completate forniranno indicazioni su ciò che potrà ricevere meno attenzione e ciò che richiederà rinforzo."
             )
 
         return " ".join(parts)
@@ -2499,36 +2973,30 @@ INPUT:
     def _fallback_english(self, knowledge: ProfessorKnowledge) -> str:
         parts = []
 
-        first_context = self._teaching_context(knowledge, 1)
-
         parts.append(
-            first_context.learning_progression
-            if first_context
-            else "We begin where the work can build the most useful foundation: before moving further, we need to see which ideas can support the rest of the programme and which ones still need attention."
+            "This Study Plan is a deliberate slice of the syllabus: its purpose is to turn part of the available material into observable evidence without pretending that the whole programme can be evaluated in one cycle."
         )
 
         if knowledge.activity_mix.quiz_count > 0 and knowledge.activity_mix.flashcard_count == 0:
             parts.append(
-                "Quizzes are the right instrument here because they give an objective picture of your current preparation, separating what is already stable from what will need targeted reinforcement."
+                "Quizzes fit this phase because they give objective signals about current preparation, rather than relying only on initial impressions or preferences."
             )
         elif knowledge.activity_mix.flashcard_count > 0 and knowledge.activity_mix.quiz_count == 0:
             parts.append(
-                "Flashcards are the right instrument here because the immediate goal is to make essential concepts easier to recall before increasing the pressure of assessment."
+                "Flashcards fit this phase because they make consolidation visible: recall shows which material is becoming stable and which material still needs reinforcement."
             )
         elif knowledge.activity_mix.quiz_count > 0 and knowledge.activity_mix.flashcard_count > 0:
             parts.append(
-                "Combining assessment and consolidation helps distinguish what you can already apply from what still needs to become stable."
+                "Combining assessment and consolidation helps separate what can be observed through applied answers from what benefits from repeated recall."
             )
 
         parts.append(
-            self._second_person_mastery(first_context.expected_mastery)
-            if first_context
-            else "By the end, the goal is not a final judgement, but a clearer basis for the next teaching decision: reinforce, progress, or return to concepts that remain uncertain."
+            "Completing this cycle is meant to build a more reliable picture of preparation, consolidate the selected material, and make the next Study Plan more precise."
         )
 
         if knowledge.additional_modules_remain:
             parts.append(
-                "The material left outside this path is not being ignored; it can be taken up with continuity once the evidence from this work shows where the next priority should be."
+                "Material left outside this cycle is not being discarded; it keeps its priority in the path and can be covered progressively, with continuity, while completed activities show which areas may need less attention and which deserve reinforcement."
             )
 
         return " ".join(parts)
@@ -2805,6 +3273,45 @@ INPUT:
 
         return (study_plan_results,)
 
+    def _study_plan_results_by_index(
+        self,
+        study_plan_results: Any,
+    ) -> dict[int, Any]:
+        return {
+            module_index: module_result
+            for module_index, module_result in enumerate(
+                self._study_plan_module_results(study_plan_results),
+                start=1,
+            )
+        }
+
+    def _observation_context(
+        self,
+        knowledge: ProfessorKnowledge,
+        *,
+        module_results_by_index: Optional[Mapping[int, Mapping[str, Any]]] = None,
+        include_goal_observations: bool = True,
+    ) -> list[dict[str, Any]]:
+        observations = self.observation_builder.build(
+            knowledge=knowledge,
+            module_results_by_index=module_results_by_index,
+        )
+
+        if not include_goal_observations:
+            observations = tuple(
+                observation
+                for observation in observations
+                if not isinstance(observation, GoalNotYetDemonstrated)
+            )
+
+        return [
+            {
+                "type": observation.__class__.__name__,
+                **self._to_jsonable(observation),
+            }
+            for observation in observations
+        ]
+
     def _study_plan_activity_profile(
         self,
         knowledge: ProfessorKnowledge,
@@ -3032,6 +3539,11 @@ INPUT:
             for activity in knowledge.activity_sizes
             if activity.module_index == module_index
         )
+        duration_profile = self._module_duration_profile(
+            knowledge,
+            module_index,
+            activity_sizes,
+        )
         categories = tuple(
             dict.fromkeys(
                 [
@@ -3067,6 +3579,41 @@ INPUT:
             "teaching_context": self._teaching_context(knowledge, module_index),
             "planning_constraints": knowledge.planning_constraints,
             "study_language": knowledge.study_language,
+            **duration_profile,
+        }
+
+    def _module_duration_profile(
+        self,
+        knowledge: ProfessorKnowledge,
+        module_index: int,
+        activity_sizes: Sequence[Any],
+    ) -> dict[str, Any]:
+        target_duration = float(
+            getattr(knowledge.planning_constraints, "module_duration_minutes", 0)
+            or 0
+        )
+        estimated_duration = 0.0
+
+        for activity in activity_sizes:
+            try:
+                estimated_duration += float(
+                    getattr(activity, "estimated_duration_minutes", 0)
+                    or 0
+                )
+            except (TypeError, ValueError):
+                continue
+
+        duration_gap = max(0.0, target_duration - estimated_duration)
+
+        return {
+            "selected_duration_minutes": round(target_duration, 4),
+            "estimated_duration_minutes": round(estimated_duration, 4),
+            "duration_gap_minutes": round(duration_gap, 4),
+            "effective_duration_may_be_shorter": (
+                target_duration > 0
+                and estimated_duration > 0
+                and duration_gap > self.MODULE_SHORT_DURATION_NOTE_THRESHOLD_MINUTES
+            ),
         }
 
     def _teaching_context(

@@ -3338,8 +3338,13 @@ CREATE TABLE public.projects (
     topic_status text DEFAULT 'idle'::text,
     taxonomy_language text,
     study_mode text DEFAULT 'building'::text NOT NULL,
+    professor_mode text DEFAULT 'coverage'::text NOT NULL,
+    study_priority_categories jsonb DEFAULT '[]'::jsonb NOT NULL,
     CONSTRAINT projects_study_mode_check CHECK (
         study_mode = ANY (ARRAY['building'::text, 'learning'::text])
+    ),
+    CONSTRAINT projects_professor_mode_check CHECK (
+        professor_mode = ANY (ARRAY['coverage'::text, 'adaptive'::text])
     )
 );
 

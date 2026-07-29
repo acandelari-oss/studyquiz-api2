@@ -1,4 +1,5 @@
 import unittest
+import json
 from datetime import date
 
 from sqlalchemy import create_engine, text
@@ -185,6 +186,244 @@ class PlannerRepositoryTests(unittest.TestCase):
         self.assertEqual(loaded_week.weekly_statistics.quiz_accuracy, 0.8)
         self.assertEqual(loaded_week.weekly_statistics.study_time, 1)
         self.assertEqual(loaded_week.weekly_review, "The Study Plan debrief.")
+
+    def test_load_previously_scheduled_categories_deduplicates_and_scopes_project(self):
+        self.db.execute(
+            text("""
+                insert into planner_weeks
+                (
+                    id,
+                    project_id,
+                    start_date,
+                    end_date,
+                    status,
+                    planning_parameters,
+                    weekly_statistics
+                )
+                values
+                (
+                    'week-1',
+                    'project-1',
+                    '2026-06-29',
+                    '2026-07-05',
+                    'COMPLETED',
+                    :study_plan_parameters,
+                    '{}'
+                ),
+                (
+                    'week-2',
+                    'project-1',
+                    '2026-07-06',
+                    '2026-07-12',
+                    'COMPLETED',
+                    :assessment_parameters,
+                    '{}'
+                ),
+                (
+                    'week-other',
+                    'project-2',
+                    '2026-06-29',
+                    '2026-07-05',
+                    'COMPLETED',
+                    :study_plan_parameters,
+                    '{}'
+                )
+            """),
+            {
+                "study_plan_parameters": json.dumps({"plan_type": "study_plan"}),
+                "assessment_parameters": json.dumps({"plan_type": "assessment"}),
+            },
+        )
+        self.db.execute(
+            text("""
+                insert into planner_daily_plans
+                (
+                    id,
+                    week_id,
+                    session_index,
+                    plan_date,
+                    day_name,
+                    status,
+                    planned_allocations
+                )
+                values
+                (
+                    'day-1',
+                    'week-1',
+                    1,
+                    '2026-06-29',
+                    'Monday',
+                    'PLANNED',
+                    :first_allocations
+                ),
+                (
+                    'day-2',
+                    'week-1',
+                    2,
+                    '2026-06-30',
+                    'Tuesday',
+                    'PLANNED',
+                    :duplicate_allocations
+                ),
+                (
+                    'assessment-day',
+                    'week-2',
+                    1,
+                    '2026-07-06',
+                    'Monday',
+                    'PLANNED',
+                    :assessment_allocations
+                ),
+                (
+                    'other-day',
+                    'week-other',
+                    1,
+                    '2026-06-29',
+                    'Monday',
+                    'PLANNED',
+                    :other_project_allocations
+                )
+            """),
+            {
+                "first_allocations": json.dumps(
+                    [
+                        {"category": "Category A", "selected_topics": []},
+                        {"category": "Category B", "selected_topics": []},
+                    ]
+                ),
+                "duplicate_allocations": json.dumps(
+                    [{"category": " category a ", "selected_topics": []}]
+                ),
+                "assessment_allocations": json.dumps(
+                    [{"category": "Assessment Only", "selected_topics": []}]
+                ),
+                "other_project_allocations": json.dumps(
+                    [{"category": "Other Project", "selected_topics": []}]
+                ),
+            },
+        )
+        self.db.commit()
+
+        scheduled = PlannerRepository(self.db).load_previously_scheduled_categories(
+            project_id="project-1"
+        )
+
+        self.assertEqual(scheduled, ("category a", "category b"))
+
+    def test_load_completed_survey_categories_uses_completed_coverage_plans_only(self):
+        self.db.execute(
+            text("""
+                insert into planner_weeks
+                (
+                    id,
+                    project_id,
+                    start_date,
+                    end_date,
+                    status,
+                    planning_parameters,
+                    weekly_statistics
+                )
+                values
+                (
+                    'completed-coverage',
+                    'project-1',
+                    '2026-06-29',
+                    '2026-07-05',
+                    'COMPLETED',
+                    :coverage_parameters,
+                    :coverage_statistics
+                ),
+                (
+                    'active-coverage',
+                    'project-1',
+                    '2026-07-06',
+                    '2026-07-12',
+                    'ACTIVE',
+                    :coverage_parameters,
+                    :active_statistics
+                ),
+                (
+                    'completed-adaptive',
+                    'project-1',
+                    '2026-07-13',
+                    '2026-07-19',
+                    'COMPLETED',
+                    :adaptive_parameters,
+                    :adaptive_statistics
+                )
+            """),
+            {
+                "coverage_parameters": json.dumps(
+                    {"plan_type": "study_plan", "professor_mode": "coverage"}
+                ),
+                "coverage_statistics": json.dumps(
+                    {
+                        "metadata": {
+                            "professor_mode": "coverage",
+                            "coverage_accepted_categories": [
+                                "Category A",
+                                " Category B ",
+                            ],
+                        }
+                    }
+                ),
+                "active_statistics": json.dumps(
+                    {
+                        "metadata": {
+                            "professor_mode": "coverage",
+                            "coverage_accepted_categories": ["Active Only"],
+                        }
+                    }
+                ),
+                "adaptive_parameters": json.dumps(
+                    {"plan_type": "study_plan", "professor_mode": "adaptive"}
+                ),
+                "adaptive_statistics": json.dumps(
+                    {
+                        "metadata": {
+                            "professor_mode": "adaptive",
+                            "coverage_accepted_categories": ["Adaptive Only"],
+                        }
+                    }
+                ),
+            },
+        )
+        self.db.execute(
+            text("""
+                insert into planner_daily_plans
+                (
+                    id,
+                    week_id,
+                    session_index,
+                    plan_date,
+                    day_name,
+                    status,
+                    planned_allocations
+                )
+                values
+                (
+                    'completed-day',
+                    'completed-coverage',
+                    1,
+                    '2026-06-29',
+                    'Monday',
+                    'COMPLETED',
+                    :allocations
+                )
+            """),
+            {
+                "allocations": json.dumps(
+                    [{"category": "Category C", "selected_topics": []}]
+                )
+            },
+        )
+        self.db.commit()
+
+        completed = PlannerRepository(self.db).load_completed_survey_categories(
+            project_id="project-1"
+        )
+
+        self.assertEqual(completed, ("category a", "category b"))
 
 
 if __name__ == "__main__":

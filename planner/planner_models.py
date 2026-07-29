@@ -185,6 +185,7 @@ class PlannerPreferences:
 
     question_pace_seconds: Optional[int] = None
     question_style: Optional[str] = None
+    priority_categories: Sequence[str] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -206,3 +207,6 @@ class PlannerContext:
     planning_budget_minutes: float = 0.0
     week_start_date: Optional[date] = None
     week_id: Optional[str] = None
+    coverage_continuation_categories: Sequence[str] = field(default_factory=tuple)
+    previously_scheduled_categories: Sequence[str] = field(default_factory=tuple)
+    completed_survey_categories: Sequence[str] = field(default_factory=tuple)

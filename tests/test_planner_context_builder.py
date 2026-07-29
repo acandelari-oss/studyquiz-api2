@@ -1,4 +1,5 @@
 import unittest
+import json
 from datetime import date
 
 from sqlalchemy import create_engine, text
@@ -24,7 +25,8 @@ class PlannerContextBuilderTests(unittest.TestCase):
                 created_at text,
                 user_id text,
                 topic_status text,
-                taxonomy_language text
+                taxonomy_language text,
+                professor_mode text default 'coverage'
             )
         """))
         self.db.execute(text("""
@@ -71,6 +73,38 @@ class PlannerContextBuilderTests(unittest.TestCase):
                 topic text
             )
         """))
+        self.db.execute(text("""
+            create table planner_weeks (
+                id text primary key,
+                project_id text not null,
+                start_date text not null,
+                end_date text not null,
+                status text not null,
+                planning_parameters text not null,
+                weekly_briefing text,
+                weekly_statistics text not null,
+                weekly_review text,
+                next_week_options text,
+                created_at text default CURRENT_TIMESTAMP,
+                updated_at text default CURRENT_TIMESTAMP
+            )
+        """))
+        self.db.execute(text("""
+            create table planner_daily_plans (
+                id text primary key,
+                week_id text not null,
+                session_index integer not null,
+                plan_date text not null,
+                day_name text not null,
+                status text not null,
+                objective text,
+                briefing text,
+                planned_allocations text not null,
+                summary text,
+                created_at text default CURRENT_TIMESTAMP,
+                updated_at text default CURRENT_TIMESTAMP
+            )
+        """))
         self.db.commit()
 
     def test_builds_context_from_project_topics_and_learning_evidence(self):
@@ -108,6 +142,60 @@ class PlannerContextBuilderTests(unittest.TestCase):
             values
             ('review-1', 'project-1', 'user-1', false, '2026-06-29', 'Beni mobili')
         """))
+        self.db.execute(
+            text("""
+                insert into planner_weeks
+                (
+                    id,
+                    project_id,
+                    start_date,
+                    end_date,
+                    status,
+                    planning_parameters,
+                    weekly_statistics
+                )
+                values
+                (
+                    'week-1',
+                    'project-1',
+                    '2026-06-29',
+                    '2026-07-05',
+                    'COMPLETED',
+                    :planning_parameters,
+                    '{}'
+                )
+            """),
+            {"planning_parameters": json.dumps({"plan_type": "study_plan"})},
+        )
+        self.db.execute(
+            text("""
+                insert into planner_daily_plans
+                (
+                    id,
+                    week_id,
+                    session_index,
+                    plan_date,
+                    day_name,
+                    status,
+                    planned_allocations
+                )
+                values
+                (
+                    'day-1',
+                    'week-1',
+                    1,
+                    '2026-06-29',
+                    'Monday',
+                    'COMPLETED',
+                    :planned_allocations
+                )
+            """),
+            {
+                "planned_allocations": json.dumps(
+                    [{"category": "BENI", "selected_topics": []}]
+                )
+            },
+        )
         self.db.commit()
 
         context = build_real_planner_context(
@@ -129,14 +217,18 @@ class PlannerContextBuilderTests(unittest.TestCase):
         )
         self.assertEqual(context.analytics["BENI"].accuracy, 0.5)
         self.assertEqual(context.analytics["BENI"].coverage, 1.0)
+        self.assertEqual(context.analytics["BENI"].quiz_coverage, 0.5)
         self.assertEqual(context.analytics["BENI"].days_since_review, 2)
         self.assertIsNone(context.analytics["CONTRATTI"].accuracy)
         self.assertEqual(context.analytics["CONTRATTI"].coverage, 0.0)
+        self.assertEqual(context.analytics["CONTRATTI"].quiz_coverage, 0.0)
         self.assertEqual(context.preferences.question_pace_seconds, 60)
         self.assertEqual(context.preferences.question_style, "balanced")
         self.assertEqual(context.number_of_sessions, 4)
         self.assertEqual(context.planning_budget_minutes, 3)
         self.assertEqual(context.week_start_date, date(2026, 6, 29))
+        self.assertEqual(context.previously_scheduled_categories, ("beni",))
+        self.assertEqual(context.completed_survey_categories, ("beni",))
 
     def test_empty_database_returns_valid_empty_context_with_defaults(self):
         context = build_real_planner_context(

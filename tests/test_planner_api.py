@@ -39,7 +39,8 @@ class PlannerApiTests(unittest.TestCase):
                     created_at text,
                     user_id text,
                     topic_status text,
-                    taxonomy_language text
+                    taxonomy_language text,
+                    professor_mode text default 'coverage'
                 )
             """))
             db.execute(text("""
@@ -147,16 +148,16 @@ class PlannerApiTests(unittest.TestCase):
         with self.engine.begin() as db:
             db.execute(text("""
                 insert into projects
-                (id, name, created_at, user_id, topic_status, taxonomy_language)
+                (id, name, created_at, user_id, topic_status, taxonomy_language, professor_mode)
                 values
-                ('project-low', 'Low Coverage', '2026-06-28', 'user-1', 'completed', 'en'),
-                ('project-ready', 'Ready Coverage', '2026-06-29', 'user-1', 'completed', 'en'),
-                ('project-active', 'Active Week', '2026-06-30', 'user-1', 'completed', 'en'),
-                ('project-generated-only', 'Generated Only', '2026-07-01', 'user-1', 'completed', 'en'),
-                ('project-survey-only', 'Survey Only', '2026-07-02', 'user-1', 'completed', 'en'),
-                ('project-assessment', 'Assessment Project', '2026-07-03', 'user-1', 'completed', 'en'),
-                ('project-completion', 'Completion Project', '2026-07-04', 'user-1', 'completed', 'en'),
-                ('project-adaptive', 'Adaptive Project', '2026-07-05', 'user-1', 'completed', 'en')
+                ('project-low', 'Low Coverage', '2026-06-28', 'user-1', 'completed', 'en', 'coverage'),
+                ('project-ready', 'Ready Coverage', '2026-06-29', 'user-1', 'completed', 'en', 'coverage'),
+                ('project-active', 'Active Week', '2026-06-30', 'user-1', 'completed', 'en', 'coverage'),
+                ('project-generated-only', 'Generated Only', '2026-07-01', 'user-1', 'completed', 'en', 'coverage'),
+                ('project-survey-only', 'Survey Only', '2026-07-02', 'user-1', 'completed', 'en', 'coverage'),
+                ('project-assessment', 'Assessment Project', '2026-07-03', 'user-1', 'completed', 'en', 'coverage'),
+                ('project-completion', 'Completion Project', '2026-07-04', 'user-1', 'completed', 'en', 'coverage'),
+                ('project-adaptive', 'Adaptive Project', '2026-07-05', 'user-1', 'completed', 'en', 'coverage')
             """))
             db.execute(text("""
                 insert into topics
@@ -420,6 +421,50 @@ class PlannerApiTests(unittest.TestCase):
                 "/projects/project-completion/planner/week/generate",
                 json=payload,
             )
+            with self.engine.begin() as db:
+                db.execute(text("""
+                    insert into quizzes (id, project_id, user_id)
+                    values ('completion-coverage-quiz', 'project-completion', 'user-1')
+                """))
+                db.execute(text("""
+                    insert into quiz_questions (id, quiz_id, topic)
+                    values
+                    ('completion-coverage-question-1', 'completion-coverage-quiz', 'Completion 1'),
+                    ('completion-coverage-question-2', 'completion-coverage-quiz', 'Completion 2'),
+                    ('completion-coverage-question-3', 'completion-coverage-quiz', 'Completion 3')
+                """))
+                db.execute(text("""
+                    insert into quiz_answers
+                    (id, quiz_id, question_id, user_id, is_correct, created_at, topic)
+                    values
+                    (
+                        'completion-coverage-answer-1',
+                        'completion-coverage-quiz',
+                        'completion-coverage-question-1',
+                        'user-1',
+                        true,
+                        '2026-07-02',
+                        'Completion 1'
+                    ),
+                    (
+                        'completion-coverage-answer-2',
+                        'completion-coverage-quiz',
+                        'completion-coverage-question-2',
+                        'user-1',
+                        true,
+                        '2026-07-02',
+                        'Completion 2'
+                    ),
+                    (
+                        'completion-coverage-answer-3',
+                        'completion-coverage-quiz',
+                        'completion-coverage-question-3',
+                        'user-1',
+                        true,
+                        '2026-07-02',
+                        'Completion 3'
+                    )
+                """))
             completion_response = client.post(
                 "/projects/project-completion/planner/module/complete",
                 json={
@@ -445,6 +490,8 @@ class PlannerApiTests(unittest.TestCase):
         self.assertEqual(generation_response.status_code, 200)
         self.assertEqual(completion_response.status_code, 200)
         self.assertEqual(reload_response.status_code, 200)
+        self.assertTrue(completion_response.json()["coverage_complete"])
+        self.assertEqual(completion_response.json()["professor_mode"], "adaptive")
 
         data = reload_response.json()
         daily_plan = data["week"]["daily_plans"][0]
@@ -503,12 +550,20 @@ class PlannerApiTests(unittest.TestCase):
             "Complete the current Study Plan before creating a new one.",
         )
 
-    def test_generate_next_week_creates_new_active_plan_and_preserves_history(self):
+    def test_completed_incomplete_coverage_plan_requires_explicit_next_plan(self):
         client = TestClient(app)
+        extra_categories = [
+            f"ADAPTIVE_EXTRA_{index}"
+            for index in range(1, 51)
+        ]
         payload = {
             "survey": {
                 "QUIZ_WEAK": "practice",
                 "FLASH_WEAK": "practice",
+                **{
+                    category: "practice"
+                    for category in extra_categories
+                },
             },
             "study_language": "Italian",
             "preferences": {
@@ -519,17 +574,40 @@ class PlannerApiTests(unittest.TestCase):
         }
 
         with patch.object(main, "SessionLocal", self._session):
+            with self.engine.begin() as db:
+                db.execute(
+                    text("""
+                        insert into topics
+                        (id, project_id, category, topic, is_display_topic)
+                        values
+                        (:id, 'project-adaptive', :category, :topic, true)
+                    """),
+                    [
+                        {
+                            "id": f"adaptive-extra-topic-{index}",
+                            "category": extra_categories[index - 1],
+                            "topic": f"Adaptive Extra {index}",
+                        }
+                        for index in range(1, 51)
+                    ],
+                )
             generation_response = client.post(
                 "/projects/project-adaptive/planner/week/generate",
                 json=payload,
             )
             first_week = generation_response.json()["week"]
+            first_accepted_categories = set(
+                first_week["weekly_statistics"]["metadata"][
+                    "coverage_accepted_categories"
+                ]
+            )
 
+            completion_response = None
             for session_index, _daily_plan in enumerate(
                 first_week["daily_plans"],
                 start=1,
             ):
-                client.post(
+                completion_response = client.post(
                     "/projects/project-adaptive/planner/module/complete",
                     json={
                         "session_index": session_index,
@@ -547,41 +625,59 @@ class PlannerApiTests(unittest.TestCase):
                         "study_plan_debrief": "Completed Study Plan.",
                     },
                 )
-
+            reload_response = client.get(
+                "/projects/project-adaptive/planner/week",
+            )
             next_response = client.post(
                 "/projects/project-adaptive/planner/week/generate-next",
             )
 
         self.assertEqual(generation_response.status_code, 200)
-        self.assertEqual(next_response.status_code, 200)
+        self.assertIsNotNone(completion_response)
+        completion_data = completion_response.json()
+
+        self.assertEqual(completion_data["professor_mode"], "coverage")
+        self.assertEqual(completion_data["coverage_status"], "incomplete")
+        self.assertFalse(completion_data["coverage_complete"])
+        self.assertFalse(completion_data["next_plan_generated"])
+        self.assertTrue(completion_data["requires_new_plan"])
+
+        reloaded_completed_week = reload_response.json()["week"]
+        self.assertEqual(reloaded_completed_week["id"], first_week["id"])
+        self.assertEqual(reloaded_completed_week["status"], "ACTIVE")
+        self.assertEqual(
+            reloaded_completed_week["weekly_statistics"]["metadata"][
+                "coverage_status"
+            ],
+            "coverage_incomplete",
+        )
 
         data = next_response.json()
         next_week = data["week"]
+        next_categories = {
+            allocation["category"]
+            for daily_plan in next_week["daily_plans"]
+            for allocation in daily_plan["planned_allocations"]
+        }
 
+        self.assertEqual(next_response.status_code, 200)
         self.assertEqual(data["state"], "ACTIVE_WEEK")
         self.assertEqual(next_week["status"], "ACTIVE")
         self.assertNotEqual(next_week["id"], first_week["id"])
-        self.assertLessEqual(
-            len(next_week["daily_plans"]),
-            main.ADAPTIVE_STUDY_PLAN_MAX_MODULES,
-        )
+        self.assertTrue(data["next_plan_generated"])
+        self.assertFalse(data["requires_new_plan"])
         self.assertEqual(next_week["study_language"], "Italian")
         self.assertEqual(
             next_week["weekly_statistics"]["metadata"]["source_week_id"],
             first_week["id"],
         )
-
-        activity_types = [
-            activity["type"]
-            for daily_plan in next_week["daily_plans"]
-            for activity in daily_plan["activities"]
-        ]
-        self.assertIn("QUIZ", activity_types)
-        self.assertIn("FLASHCARDS", activity_types)
+        self.assertTrue(first_accepted_categories)
+        self.assertTrue(next_categories)
+        self.assertTrue(first_accepted_categories.isdisjoint(next_categories))
 
         with self.engine.connect() as db:
             rows = db.execute(text("""
-                select id, status, planning_parameters
+                select id, status, planning_parameters, weekly_statistics
                 from planner_weeks
                 where project_id = 'project-adaptive'
                 order by created_at asc, id asc
@@ -596,12 +692,20 @@ class PlannerApiTests(unittest.TestCase):
         next_parameters = json.loads(
             next(row[2] for row in rows if row[1] == "ACTIVE")
         )
-        self.assertEqual(next_parameters["onboarding_mode"], "adaptive_study_plan")
-        self.assertEqual(next_parameters["evidence_source"], "quiz_flashcard_only")
+        self.assertEqual(next_parameters["onboarding_mode"], "coverage_continuation")
+        self.assertEqual(
+            next_parameters["evidence_source"],
+            "completed_survey_plans_only",
+        )
         self.assertEqual(
             next_parameters["maxVisibleModules"],
-            main.ADAPTIVE_STUDY_PLAN_MAX_MODULES,
+            main.MAX_VISIBLE_PLANNER_MODULES,
         )
+        self.assertEqual(next_parameters["professor_mode"], "coverage")
+        active_statistics = json.loads(
+            next(row[3] for row in rows if row[1] == "ACTIVE")
+        )
+        self.assertFalse(active_statistics["metadata"]["coverage_complete"])
 
     def test_generate_week_from_ready_configuration_without_survey(self):
         client = TestClient(app)

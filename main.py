@@ -15,6 +15,7 @@ from fastapi import FastAPI, Depends, HTTPException, Header, Request, Background
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import JSON, bindparam
 from sqlalchemy import text as sql_text
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -49,12 +50,20 @@ from planner.planner_state_evaluator import (
     PlannerStateEvaluator,
     serialize_planner_state_evaluation,
 )
+from planner.coverage_state import (
+    COVERAGE_STATUS_COMPLETE,
+    COVERAGE_STATUS_INCOMPLETE,
+    PROFESSOR_MODE_ADAPTIVE,
+    PROFESSOR_MODE_COVERAGE,
+    evaluate_coverage_state,
+)
 from planner.professor_knowledge import ProfessorKnowledgeBuilder
 from planner.professor_voice import ProfessorVoiceService
 from planner.survey_bootstrap import (
     apply_survey_bootstrap_bias,
     should_apply_survey_bootstrap,
 )
+from planner.student_preferences import MAX_STUDY_PRIORITY_CATEGORIES
 import time
 import re
 import traceback
@@ -582,6 +591,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID")
+OPENAI_ORGANIZATION = os.getenv("OPENAI_ORG_ID") or os.getenv("OPENAI_ORGANIZATION")
 
 if not DATABASE_URL:
     raise Exception("DATABASE_URL missing")
@@ -603,6 +614,27 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+def _mask_secret(value):
+    if not value:
+        return None
+    value = str(value)
+    if len(value) < 14:
+        return "<too short>"
+    return f"{value[:8]}...{value[-6:]}"
+
+
+print(
+    "OPENAI CLIENT DIAGNOSTICS",
+    {
+        "pid": os.getpid(),
+        "api_key": _mask_secret(OPENAI_API_KEY),
+        "api_key_length": len(OPENAI_API_KEY or ""),
+        "openai_project": OPENAI_PROJECT_ID or None,
+        "openai_organization": OPENAI_ORGANIZATION or None,
+        "env_file_loaded": ".env via load_dotenv()",
+    }
 )
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -672,6 +704,11 @@ class PlannerGenerationPreferences(BaseModel):
     questionPaceSeconds: int
     sessionsPerWeek: Optional[int] = None
     questionStyle: str
+    priorityCategories: Optional[List[str]] = None
+
+class ProjectStudyPrioritiesRequest(BaseModel):
+    priority_categories: Optional[List[str]] = None
+    priorityCategories: Optional[List[str]] = None
 
 
 class PlannerGenerationConfiguration(BaseModel):
@@ -828,6 +865,7 @@ def generate_project_planner_week(
             preferences=PlannerPreferences(
                 question_pace_seconds=req.preferences.questionPaceSeconds,
                 question_style=req.preferences.questionStyle,
+                priority_categories=tuple(req.preferences.priorityCategories or ()),
             ),
             study_language=req.study_language or context.study_language,
             number_of_sessions=MAX_VISIBLE_PLANNER_MODULES,
@@ -836,6 +874,11 @@ def generate_project_planner_week(
             week_id=context.week_id,
         )
         week = PlannerEngine().generate_week(generation_context)
+        coverage_lifecycle = _planner_coverage_lifecycle_from_week(
+            db=db,
+            project_id=resolved_project_id,
+            week=week,
+        )
         additional_modules_remain = _planner_additional_modules_remain(
             context=context,
             week=week,
@@ -848,6 +891,7 @@ def generate_project_planner_week(
                     **dict(week.weekly_statistics.metadata or {}),
                     "max_visible_modules": MAX_VISIBLE_PLANNER_MODULES,
                     "additional_modules_remain": additional_modules_remain,
+                    **coverage_lifecycle,
                 },
             ),
         )
@@ -863,7 +907,9 @@ def generate_project_planner_week(
             "questionPaceSeconds": req.preferences.questionPaceSeconds,
             "maxVisibleModules": MAX_VISIBLE_PLANNER_MODULES,
             "additionalModulesRemain": additional_modules_remain,
+            **coverage_lifecycle,
             "questionStyle": req.preferences.questionStyle,
+            "priorityCategories": list(req.preferences.priorityCategories or ()),
             "studyLanguage": req.study_language or context.study_language,
             "survey": req.survey,
         }
@@ -880,6 +926,8 @@ def generate_project_planner_week(
             ).evaluate(project_id=resolved_project_id)
         )
         response["week"] = serialize_planner_domain(week)
+        response.update(coverage_lifecycle)
+        response["next_plan_generated"] = False
         return response
     finally:
         db.close()
@@ -919,6 +967,39 @@ def generate_next_project_planner_week(project_id: str):
                 detail="Complete the current Study Plan before creating a new one.",
             )
 
+        active_metadata = dict(
+            getattr(active_week.weekly_statistics, "metadata", {}) or {}
+        )
+        if (
+            active_metadata.get("professor_mode") == PROFESSOR_MODE_COVERAGE
+            and active_metadata.get("coverage_complete") is False
+        ):
+            next_week = _generate_next_coverage_week(
+                db=db,
+                project_id=resolved_project_id,
+                context=context,
+                source_week=active_week,
+            )
+            response = serialize_planner_state_evaluation(
+                PlannerStateEvaluator(
+                    db,
+                    repository=repository,
+                ).evaluate(project_id=resolved_project_id)
+            )
+            response["week"] = serialize_planner_domain(next_week)
+            response.update(
+                {
+                    "professor_mode": PROFESSOR_MODE_COVERAGE,
+                    "coverage_status": _planner_public_coverage_status(
+                        COVERAGE_STATUS_INCOMPLETE
+                    ),
+                    "coverage_complete": False,
+                    "next_plan_generated": True,
+                    "requires_new_plan": False,
+                }
+            )
+            return response
+
         previous_parameters = repository.load_week_planning_parameters(active_week.id)
         study_duration_minutes = _planner_parameter_int(
             previous_parameters,
@@ -937,6 +1018,11 @@ def generate_next_project_planner_week(project_id: str):
             or previous_parameters.get("question_style")
             or context.preferences.question_style
         )
+        priority_categories = (
+            previous_parameters.get("priorityCategories")
+            or previous_parameters.get("priority_categories")
+            or ()
+        )
         study_language = (
             previous_parameters.get("studyLanguage")
             or previous_parameters.get("study_language")
@@ -952,6 +1038,7 @@ def generate_next_project_planner_week(project_id: str):
             preferences=PlannerPreferences(
                 question_pace_seconds=question_pace_seconds,
                 question_style=question_style,
+                priority_categories=tuple(priority_categories or ()),
             ),
             study_language=study_language,
             number_of_sessions=ADAPTIVE_STUDY_PLAN_MAX_MODULES,
@@ -990,6 +1077,7 @@ def generate_next_project_planner_week(project_id: str):
             "maxVisibleModules": ADAPTIVE_STUDY_PLAN_MAX_MODULES,
             "additionalModulesRemain": additional_modules_remain,
             "questionStyle": question_style,
+            "priorityCategories": list(priority_categories or ()),
             "studyLanguage": study_language,
             "survey": None,
         }
@@ -1055,6 +1143,7 @@ def generate_project_planner_assessment(
             preferences=PlannerPreferences(
                 question_pace_seconds=req.preferences.questionPaceSeconds,
                 question_style=req.preferences.questionStyle,
+                priority_categories=(),
             ),
             study_language=req.study_language or context.study_language,
             number_of_sessions=0,
@@ -1162,6 +1251,14 @@ def complete_project_planner_module(
                 detail="No active Study Plan found for this project.",
             )
 
+        lifecycle = _maybe_advance_coverage_after_module_completion(
+            db=db,
+            project_id=str(context.project["id"]),
+            completed_week=week,
+        )
+        if lifecycle.get("week") is not None:
+            week = lifecycle["week"]
+
         response = serialize_planner_state_evaluation(
             PlannerStateEvaluator(
                 db,
@@ -1169,6 +1266,7 @@ def complete_project_planner_module(
             ).evaluate(project_id=str(context.project["id"]))
         )
         response["week"] = serialize_planner_domain(week)
+        response.update(lifecycle["response_fields"])
         return response
     finally:
         db.close()
@@ -1373,6 +1471,27 @@ def _validate_planner_generation_configuration(
             detail="Invalid quiz style.",
         )
 
+    priority_categories = list(req.preferences.priorityCategories or [])
+    unique_priority_categories = {
+        str(category or "").strip()
+        for category in priority_categories
+        if str(category or "").strip()
+    }
+
+    if len(unique_priority_categories) > MAX_STUDY_PRIORITY_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail="Too many priority categories.",
+        )
+
+    invalid_priority_categories = unique_priority_categories - project_categories
+
+    if invalid_priority_categories:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid priority category.",
+        )
+
     survey = req.survey or {}
     survey_categories = set(survey.keys())
     invalid_categories = survey_categories - project_categories
@@ -1492,6 +1611,349 @@ def _planner_additional_modules_remain(context: PlannerContext, week) -> bool:
     return bool(all_topic_ids - planned_topic_ids)
 
 
+def _planner_coverage_lifecycle_from_week(db, project_id: str, week) -> dict:
+    metadata = dict(getattr(week.weekly_statistics, "metadata", {}) or {})
+    professor_mode = _get_project_professor_mode(db, project_id)
+    coverage_complete = bool(metadata.get("coverage_complete"))
+    coverage_status = (
+        COVERAGE_STATUS_COMPLETE
+        if coverage_complete or professor_mode == PROFESSOR_MODE_ADAPTIVE
+        else COVERAGE_STATUS_INCOMPLETE
+    )
+
+    return {
+        "professor_mode": professor_mode,
+        "coverage_status": _planner_public_coverage_status(coverage_status),
+        "coverage_complete": coverage_status == COVERAGE_STATUS_COMPLETE,
+        "requires_new_plan": False,
+    }
+
+
+def _survey_completed_categories_from_week(week) -> tuple:
+    metadata = dict(getattr(week.weekly_statistics, "metadata", {}) or {})
+    categories = list(metadata.get("coverage_accepted_categories") or [])
+
+    if not categories:
+        categories = [
+            allocation.category
+            for daily_plan in getattr(week, "daily_plans", ()) or ()
+            for allocation in getattr(daily_plan, "planned_allocations", ()) or ()
+            if getattr(allocation, "category", None)
+        ]
+
+    completed = []
+    seen = set()
+    for category in categories:
+        identity = " ".join(str(category or "").strip().split()).casefold()
+        if not identity or identity in seen:
+            continue
+
+        completed.append(category)
+        seen.add(identity)
+
+    return tuple(completed)
+
+
+def _merge_survey_completed_categories(*category_groups) -> tuple:
+    completed = []
+    seen = set()
+
+    for categories in category_groups:
+        for category in categories or ():
+            identity = " ".join(str(category or "").strip().split()).casefold()
+            if not identity or identity in seen:
+                continue
+
+            completed.append(category)
+            seen.add(identity)
+
+    return tuple(completed)
+
+
+def _maybe_advance_coverage_after_module_completion(
+    db,
+    project_id: str,
+    completed_week,
+) -> dict:
+    response_fields = {
+        "professor_mode": _get_project_professor_mode(db, project_id),
+        "coverage_status": None,
+        "coverage_complete": False,
+        "next_plan_generated": False,
+        "requires_new_plan": False,
+    }
+
+    metadata = dict(getattr(completed_week.weekly_statistics, "metadata", {}) or {})
+    if metadata.get("professor_mode") != PROFESSOR_MODE_COVERAGE:
+        response_fields.update(
+            _planner_coverage_lifecycle_from_week(
+                db=db,
+                project_id=project_id,
+                week=completed_week,
+            )
+        )
+        return {"week": completed_week, "response_fields": response_fields}
+
+    if not _planner_week_all_modules_completed(completed_week):
+        response_fields.update(
+            _planner_coverage_lifecycle_from_week(
+                db=db,
+                project_id=project_id,
+                week=completed_week,
+            )
+        )
+        return {"week": completed_week, "response_fields": response_fields}
+
+    refreshed_context = build_real_planner_context(db, project_id=project_id)
+    refreshed_context = replace(
+        refreshed_context,
+        completed_survey_categories=_merge_survey_completed_categories(
+            refreshed_context.completed_survey_categories,
+            _survey_completed_categories_from_week(completed_week),
+        ),
+    )
+    coverage_state = evaluate_coverage_state(refreshed_context)
+
+    if coverage_state.complete:
+        _set_project_professor_mode(
+            db=db,
+            project_id=project_id,
+            professor_mode=PROFESSOR_MODE_ADAPTIVE,
+        )
+        completed_week = _update_week_coverage_lifecycle_metadata(
+            db=db,
+            week=completed_week,
+            metadata_updates={
+                "professor_mode": PROFESSOR_MODE_ADAPTIVE,
+                "coverage_status": COVERAGE_STATUS_COMPLETE,
+                "coverage_complete": True,
+                "coverage_covered_categories": list(
+                    coverage_state.covered_categories
+                ),
+                "coverage_categories_requiring_coverage": [],
+            },
+        )
+        response_fields.update(
+            {
+                "professor_mode": PROFESSOR_MODE_ADAPTIVE,
+                "coverage_status": _planner_public_coverage_status(
+                    COVERAGE_STATUS_COMPLETE
+                ),
+                "coverage_complete": True,
+                "next_plan_generated": False,
+                "requires_new_plan": False,
+            }
+        )
+        return {"week": completed_week, "response_fields": response_fields}
+
+    completed_week = _update_week_coverage_lifecycle_metadata(
+        db=db,
+        week=completed_week,
+        metadata_updates={
+            "professor_mode": PROFESSOR_MODE_COVERAGE,
+            "coverage_status": COVERAGE_STATUS_INCOMPLETE,
+            "coverage_complete": False,
+            "coverage_covered_categories": list(coverage_state.covered_categories),
+            "coverage_categories_requiring_coverage": list(
+                coverage_state.categories_requiring_coverage
+            ),
+        },
+    )
+    response_fields.update(
+        {
+            "professor_mode": PROFESSOR_MODE_COVERAGE,
+            "coverage_status": _planner_public_coverage_status(
+                COVERAGE_STATUS_INCOMPLETE
+            ),
+            "coverage_complete": False,
+            "next_plan_generated": False,
+            "requires_new_plan": True,
+        }
+    )
+    return {"week": completed_week, "response_fields": response_fields}
+
+
+def _generate_next_coverage_week(
+    db,
+    project_id: str,
+    context: PlannerContext,
+    source_week,
+):
+    repository = PlannerRepository(db)
+    previous_parameters = repository.load_week_planning_parameters(source_week.id)
+    previous_metadata = dict(
+        getattr(source_week.weekly_statistics, "metadata", {}) or {}
+    )
+    study_duration_minutes = _planner_parameter_int(
+        previous_parameters,
+        "studyDurationMinutes",
+        "planning_budget_minutes",
+        context.planning_budget_minutes,
+    )
+    question_pace_seconds = _planner_parameter_int(
+        previous_parameters,
+        "questionPaceSeconds",
+        "question_pace_seconds",
+        context.preferences.question_pace_seconds,
+    )
+    question_style = (
+        previous_parameters.get("questionStyle")
+        or previous_parameters.get("question_style")
+        or context.preferences.question_style
+    )
+    priority_categories = (
+        previous_parameters.get("priorityCategories")
+        or previous_parameters.get("priority_categories")
+        or ()
+    )
+    study_language = (
+        previous_parameters.get("studyLanguage")
+        or previous_parameters.get("study_language")
+        or source_week.study_language
+        or context.study_language
+    )
+
+    generation_context = PlannerContext(
+        project=context.project,
+        categories=context.categories,
+        topics_by_category=context.topics_by_category,
+        analytics=context.analytics,
+        preferences=PlannerPreferences(
+            question_pace_seconds=question_pace_seconds,
+            question_style=question_style,
+            priority_categories=tuple(priority_categories or ()),
+        ),
+        study_language=study_language,
+        number_of_sessions=MAX_VISIBLE_PLANNER_MODULES,
+        planning_budget_minutes=study_duration_minutes,
+        week_start_date=context.week_start_date,
+        week_id=f"{context.project['id']}-study-plan-{uuid.uuid4()}",
+        coverage_continuation_categories=tuple(
+            previous_metadata.get("coverage_continuation_order") or ()
+        ),
+        previously_scheduled_categories=context.previously_scheduled_categories,
+        completed_survey_categories=_merge_survey_completed_categories(
+            context.completed_survey_categories,
+            _survey_completed_categories_from_week(source_week),
+        ),
+    )
+    week = PlannerEngine().generate_week(generation_context)
+    coverage_lifecycle = _planner_coverage_lifecycle_from_week(
+        db=db,
+        project_id=project_id,
+        week=week,
+    )
+    additional_modules_remain = _planner_additional_modules_remain(
+        context=context,
+        week=week,
+    )
+    week = replace(
+        week,
+        weekly_statistics=replace(
+            week.weekly_statistics,
+            metadata={
+                **dict(week.weekly_statistics.metadata or {}),
+                "max_visible_modules": MAX_VISIBLE_PLANNER_MODULES,
+                "additional_modules_remain": additional_modules_remain,
+                "source_week_id": source_week.id,
+                **coverage_lifecycle,
+            },
+        ),
+    )
+    planning_parameters = {
+        **build_planning_parameters(generation_context),
+        "plan_type": "study_plan",
+        "onboarding_mode": "coverage_continuation",
+        "evidence_source": "completed_survey_plans_only",
+        "sourceWeekId": source_week.id,
+        "studyDurationMinutes": study_duration_minutes,
+        "questionPaceSeconds": question_pace_seconds,
+        "maxVisibleModules": MAX_VISIBLE_PLANNER_MODULES,
+        "additionalModulesRemain": additional_modules_remain,
+        **coverage_lifecycle,
+        "questionStyle": question_style,
+        "priorityCategories": list(priority_categories or ()),
+        "studyLanguage": study_language,
+        "survey": None,
+    }
+
+    repository.complete_active_week(project_id=project_id)
+    return repository.save_active_week(
+        project_id=project_id,
+        week=week,
+        planning_parameters=planning_parameters,
+    )
+
+
+def _planner_public_coverage_status(status: str) -> str:
+    if status == COVERAGE_STATUS_COMPLETE:
+        return "complete"
+
+    if status == COVERAGE_STATUS_INCOMPLETE:
+        return "incomplete"
+
+    return str(status or "")
+
+
+def _get_project_professor_mode(db, project_id: str) -> str:
+    row = db.execute(
+        text("""
+            select coalesce(professor_mode, 'coverage')
+            from projects
+            where id = :project_id
+        """),
+        {"project_id": project_id},
+    ).fetchone()
+
+    if not row:
+        return PROFESSOR_MODE_COVERAGE
+
+    return str(row[0] or PROFESSOR_MODE_COVERAGE)
+
+
+def _set_project_professor_mode(db, project_id: str, professor_mode: str) -> None:
+    db.execute(
+        text("""
+            update projects
+            set professor_mode = :professor_mode
+            where id = :project_id
+        """),
+        {
+            "project_id": project_id,
+            "professor_mode": professor_mode,
+        },
+    )
+    db.commit()
+
+
+def _update_week_coverage_lifecycle_metadata(
+    db,
+    week,
+    metadata_updates: dict,
+):
+    statistics = serialize_planner_domain(week.weekly_statistics)
+    statistics["metadata"] = {
+        **(statistics.get("metadata", {}) or {}),
+        **metadata_updates,
+    }
+    db.execute(
+        text("""
+            update planner_weeks
+            set weekly_statistics = :weekly_statistics,
+                updated_at = CURRENT_TIMESTAMP
+            where id = :week_id
+        """).bindparams(
+            bindparam("weekly_statistics", type_=JSON),
+        ),
+        {
+            "week_id": week.id,
+            "weekly_statistics": statistics,
+        },
+    )
+    db.commit()
+    return PlannerRepository(db).load_week(week.id) or week
+
+
 # ======================
 # CREATE PROJECT
 # ======================
@@ -1509,14 +1971,15 @@ def create_project(
 
     db.execute(
         text("""
-            insert into projects (id, name, user_id, study_mode)
-            values (:id, :name, :user_id, :study_mode)
+            insert into projects (id, name, user_id, study_mode, professor_mode)
+            values (:id, :name, :user_id, :study_mode, :professor_mode)
         """),
         {
             "id": project_id,
             "name": data.name,
             "user_id": user_id,
-            "study_mode": "building"
+            "study_mode": "building",
+            "professor_mode": PROFESSOR_MODE_COVERAGE,
         }
     )
 
@@ -1526,7 +1989,10 @@ def create_project(
     return {
         "project_id": project_id,
         "name": data.name,
-        "study_mode": "building"
+        "study_mode": "building",
+        "professor_mode": PROFESSOR_MODE_COVERAGE,
+        "study_priority_categories": [],
+        "priorityCategories": [],
     }
 
 
@@ -1544,7 +2010,12 @@ def list_projects(
 
     rows = db.execute(
         text("""
-            select id, name, coalesce(study_mode, 'building') as study_mode
+            select
+                id,
+                name,
+                coalesce(study_mode, 'building') as study_mode,
+                coalesce(professor_mode, 'coverage') as professor_mode,
+                coalesce(study_priority_categories, '[]'::jsonb) as study_priority_categories
             from projects
             where user_id = :user_id
             order by name
@@ -1556,10 +2027,115 @@ def list_projects(
 
     return {
         "projects": [
-            {"id": r[0], "name": r[1], "study_mode": r[2]}
+            {
+                "id": r[0],
+                "name": r[1],
+                "study_mode": r[2],
+                "professor_mode": r[3],
+                "study_priority_categories": r[4],
+                "priorityCategories": r[4],
+            }
             for r in rows
         ]
     }
+
+
+@app.put("/projects/{project_id}/study_priorities")
+def update_project_study_priorities(
+    project_id: str,
+    req: ProjectStudyPrioritiesRequest,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    db = SessionLocal()
+
+    try:
+        project = db.execute(
+            text("""
+                select id
+                from projects
+                where id = :project_id
+                  and user_id = :user_id
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user_id,
+            },
+        ).fetchone()
+
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+
+        raw_priority_categories = (
+            req.priority_categories
+            if req.priority_categories is not None
+            else req.priorityCategories
+        ) or []
+        priority_categories = []
+        seen = set()
+
+        for value in raw_priority_categories:
+            category = str(value or "").strip()
+            if not category or category in seen:
+                continue
+
+            seen.add(category)
+            priority_categories.append(category)
+
+        if len(priority_categories) > MAX_STUDY_PRIORITY_CATEGORIES:
+            raise HTTPException(
+                status_code=400,
+                detail="Too many priority categories.",
+            )
+
+        rows = db.execute(
+            text("""
+                select distinct category
+                from topics
+                where project_id = :project_id
+                  and category is not null
+            """),
+            {"project_id": project_id},
+        ).fetchall()
+        project_categories = {str(row[0]) for row in rows if row[0]}
+        invalid_categories = set(priority_categories) - project_categories
+
+        if invalid_categories:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid priority category.",
+            )
+
+        db.execute(
+            text("""
+                update projects
+                set study_priority_categories = cast(:priority_categories as jsonb)
+                where id = :project_id
+                  and user_id = :user_id
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user_id,
+                "priority_categories": json.dumps(priority_categories),
+            },
+        )
+        db.commit()
+
+        print(
+            "PROJECT STUDY PRIORITIES SAVED",
+            {
+                "project_id": project_id,
+                "priority_categories": priority_categories,
+            },
+        )
+
+        return {
+            "project_id": project_id,
+            "study_priority_categories": priority_categories,
+            "priorityCategories": priority_categories,
+        }
+    finally:
+        db.close()
 
 
 @app.post("/projects/{project_id}/begin_study")
@@ -1591,7 +2167,8 @@ def begin_project_study(
     db.execute(
         text("""
             update projects
-            set study_mode = 'learning'
+            set study_mode = 'learning',
+                professor_mode = coalesce(professor_mode, 'coverage')
             where id = :project_id
             and user_id = :user_id
         """),
@@ -1605,7 +2182,8 @@ def begin_project_study(
 
     return {
         "project_id": project_id,
-        "study_mode": "learning"
+        "study_mode": "learning",
+        "professor_mode": PROFESSOR_MODE_COVERAGE,
     }
 
 # ======================
@@ -4566,6 +5144,35 @@ def process_topics_task(
 
         print("✅ PROJECT TOPIC STATUS = COMPLETED")
         print("🔥 STATUS READBACK:", check[0])
+        try:
+            topic_count = final_db.execute(
+                text("""
+                    SELECT count(*)
+                    FROM topics
+                    WHERE project_id = :project_id
+                """),
+                {"project_id": project_id}
+            ).scalar() or 0
+            topic_chunk_count = final_db.execute(
+                text("""
+                    SELECT count(*)
+                    FROM topic_chunks tc
+                    JOIN topics t ON t.id = tc.topic_id
+                    WHERE t.project_id = :project_id
+                """),
+                {"project_id": project_id}
+            ).scalar() or 0
+            print("==================================================")
+            print("UPLOAD FLIGHT RECORDER — BACKGROUND COMPLETE")
+            print("==================================================")
+            print(f"Project ID: {project_id}")
+            print(f"topic_status: {check[0]}")
+            print(f"topics count: {topic_count}")
+            print(f"topic_chunks count: {topic_chunk_count}")
+            print(f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+            print("==================================================")
+        except Exception as diagnostics_error:
+            print("UPLOAD FLIGHT RECORDER — BACKGROUND COMPLETE diagnostics failed:", diagnostics_error)
         pipeline_log.end(
             "DATABASE COMMIT",
             topic_status=check[0],
@@ -5683,11 +6290,52 @@ async def ingest_stream(
                             chunks_on_page=len(chunks),
                             batch="single-chunk",
                         )
-                        emb = await asyncio.to_thread(
-                            client.embeddings.create,
-                            model="text-embedding-3-small",
-                            input=chunk
+                        embedding_model = "text-embedding-3-small"
+                        print(
+                            "OPENAI EMBEDDING REQUEST DIAGNOSTICS",
+                            {
+                                "pid": os.getpid(),
+                                "project_id": project_id,
+                                "filename": doc.title,
+                                "page": page_index + 1,
+                                "chunk_index": i + 1,
+                                "chunks_on_page": len(chunks),
+                                "model": embedding_model,
+                                "api_key": _mask_secret(OPENAI_API_KEY),
+                                "api_key_length": len(OPENAI_API_KEY or ""),
+                                "openai_project": OPENAI_PROJECT_ID or None,
+                                "openai_organization": OPENAI_ORGANIZATION or None,
+                                "source": "main.py:embedding_generation:ingest_stream",
+                            }
                         )
+                        try:
+                            emb = await asyncio.to_thread(
+                                client.embeddings.create,
+                                model=embedding_model,
+                                input=chunk
+                            )
+                        except Exception as embedding_error:
+                            print(
+                                "OPENAI EMBEDDING ERROR DIAGNOSTICS",
+                                {
+                                    "pid": os.getpid(),
+                                    "project_id": project_id,
+                                    "filename": doc.title,
+                                    "page": page_index + 1,
+                                    "chunk_index": i + 1,
+                                    "chunks_on_page": len(chunks),
+                                    "model": embedding_model,
+                                    "api_key": _mask_secret(OPENAI_API_KEY),
+                                    "api_key_length": len(OPENAI_API_KEY or ""),
+                                    "openai_project": OPENAI_PROJECT_ID or None,
+                                    "openai_organization": OPENAI_ORGANIZATION or None,
+                                    "exception_type": embedding_error.__class__.__name__,
+                                    "exception_message": str(embedding_error),
+                                    "source": "main.py:client.embeddings.create inside ingest_stream",
+                                    "traceback": traceback.format_exc(),
+                                }
+                            )
+                            raise
                         total_embedding_calls += 1
                         document_embedding_calls += 1
                         pipeline_log.end(
@@ -10440,6 +11088,14 @@ def get_topic_status(
             raise HTTPException(status_code=404, detail="Project not found")
 
         print("🔥 RAW STATUS FROM DB:", row[0])
+        print(
+            "UPLOAD FLIGHT RECORDER — TOPIC STATUS",
+            {
+                "project_id": project_id,
+                "returned_status": row[0] or "idle",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        )
 
         return {
             "status": row[0] or "idle",

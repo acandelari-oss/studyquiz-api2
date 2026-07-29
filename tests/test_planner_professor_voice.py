@@ -175,7 +175,8 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         briefing = service.generate_study_plan_briefing(self._knowledge())
 
         self.assertTrue(briefing)
-        self.assertIn("foundation", briefing)
+        self.assertIn("Study Plan", briefing)
+        self.assertIn("evidence", briefing)
 
     def test_validation_rejects_forbidden_words(self):
         validator = ProfessorVoiceValidator()
@@ -183,6 +184,13 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         self.assertFalse(
             validator.validate_study_plan_briefing(
                 "The Planner algorithm selected these categories.",
+                self._knowledge(),
+            )
+        )
+
+        self.assertFalse(
+            validator.validate_study_plan_briefing(
+                "The objective is to build a conceptual foundation around Property.",
                 self._knowledge(),
             )
         )
@@ -231,18 +239,52 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
 
         service.generate_study_plan_briefing(self._knowledge())
 
-        self.assertIn("Interpret the educational reasoning", captured["prompt"])
-        self.assertIn("Do not describe", captured["prompt"])
-        self.assertIn("what was generated", captured["prompt"])
+        self.assertIn("Present the strategy behind the Study Plan", captured["prompt"])
+        self.assertIn("not a lesson", captured["prompt"])
+        self.assertIn("Never infer subject importance", captured["prompt"])
+        self.assertIn("not to repeat what is visible", captured["prompt"])
         self.assertIn("Avoid repeating information already visible", captured["prompt"])
         self.assertIn("Every sentence must explain a deterministic educational decision", captured["prompt"])
         self.assertIn("If ProfessorKnowledge.activity_mix contains only quizzes", captured["prompt"])
-        self.assertIn("WHY WE START HERE", captured["prompt"])
+        self.assertIn("WHY THIS STUDY PLAN", captured["prompt"])
         self.assertIn("STUDY PLAN OBJECTIVE", captured["prompt"])
+        self.assertIn("must never depend on the title", captured["prompt"])
         self.assertIn("WHAT COMES NEXT", captured["prompt"])
         self.assertIn("ACTIVITY REASONING", captured["prompt"])
         self.assertIn("Never sound like documentation", captured["prompt"])
         self.assertIn("80-140 words", captured["prompt"])
+        self.assertIn("PROFESSOR CREDIBILITY RULES", captured["prompt"])
+        self.assertIn("at least ONE observation", captured["prompt"])
+        self.assertIn("could be written without access to ProfessorKnowledge", captured["prompt"])
+        self.assertIn("Do not promise future behaviour", captured["prompt"])
+        self.assertIn("Evidence hierarchy", captured["prompt"])
+        self.assertIn("LEVEL 1 FACTS", captured["prompt"])
+        self.assertIn("LEVEL 2 SUPPORTED INTERPRETATIONS", captured["prompt"])
+        self.assertIn("LEVEL 3 UNSUPPORTED DIAGNOSES", captured["prompt"])
+        self.assertNotIn("first category", captured["prompt"].lower())
+        self.assertNotIn("primary category", captured["prompt"].lower())
+        self.assertNotIn("first module", captured["prompt"].lower())
+        self.assertIn("professor_observations", captured["prompt"])
+        self.assertIn("preferred source of educational reasoning", captured["prompt"])
+
+    def test_study_plan_briefing_prompt_consumes_coverage_observation(self):
+        captured = {}
+
+        def capture_prompt(prompt):
+            captured["prompt"] = prompt
+            return (
+                '{"briefing":"I intentionally limited this path because some material remains outside the current plan; that observation should guide how continuity is explained without pretending everything has already been included."}'
+            )
+
+        service = ProfessorVoiceService(llm_generate=capture_prompt)
+
+        service.generate_study_plan_briefing(
+            self._knowledge(additional_modules_remain=True)
+        )
+
+        self.assertIn("professor_observations", captured["prompt"])
+        self.assertIn("CoverageIncomplete", captured["prompt"])
+        self.assertNotIn("GoalNotYetDemonstrated", captured["prompt"])
 
     def test_validation_rejects_category_list_style_output(self):
         validator = ProfessorVoiceValidator()
@@ -304,6 +346,16 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
             )
         )
 
+    def test_validation_rejects_first_lesson_framing(self):
+        validator = ProfessorVoiceValidator()
+
+        self.assertFalse(
+            validator.validate_study_plan_briefing(
+                "Let's start with this category because it is the foundation of the course.",
+                self._knowledge(),
+            )
+        )
+
     def test_fallback_explains_pedagogical_continuity(self):
         service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
 
@@ -311,10 +363,10 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
             self._knowledge(additional_modules_remain=True)
         )
 
-        self.assertIn("foundation", briefing)
-        self.assertIn("objective picture", briefing)
-        self.assertIn("next teaching decision", briefing)
-        self.assertIn("continuity", briefing)
+        self.assertIn("deliberate slice", briefing)
+        self.assertIn("objective signals", briefing)
+        self.assertIn("next Study Plan", briefing)
+        self.assertIn("covered progressively", briefing)
 
     def test_generate_daily_briefing_for_quiz_module(self):
         service = ProfessorVoiceService(
@@ -400,6 +452,10 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         self.assertIn("Speak directly to the learner", captured["prompt"])
         self.assertIn("Vary the opening", captured["prompt"])
         self.assertIn("40-80 words", captured["prompt"])
+        self.assertIn("PROFESSOR CREDIBILITY RULES", captured["prompt"])
+        self.assertIn("this exact module", captured["prompt"])
+        self.assertIn("MODULE DURATION RULE", captured["prompt"])
+        self.assertIn("effective_duration_may_be_shorter", captured["prompt"])
 
     def test_daily_briefing_prompt_uses_teaching_context(self):
         captured = {}
@@ -423,6 +479,31 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
 
         self.assertIn("verify conceptual stability", briefing)
 
+    def test_daily_briefing_adds_short_duration_note(self):
+        service = ProfessorVoiceService(
+            llm_generate=lambda _prompt: '{"briefing":"Today we use this module to collect evidence about the selected material."}'
+        )
+
+        briefing = service.generate_daily_briefing(self._knowledge(), 1)
+
+        self.assertIn("effective duration may be shorter", briefing)
+        self.assertIn("question quality", briefing)
+        self.assertIn("next module", briefing)
+
+    def test_daily_briefing_uses_italian_short_duration_note(self):
+        service = ProfessorVoiceService(
+            llm_generate=lambda _prompt: '{"briefing":"Oggi usiamo questo modulo per raccogliere evidenze sul materiale selezionato."}'
+        )
+
+        briefing = service.generate_daily_briefing(
+            self._knowledge(study_language="Italian"),
+            1,
+        )
+
+        self.assertIn("durata effettiva", briefing)
+        self.assertIn("qualità delle domande", briefing)
+        self.assertIn("modulo successivo", briefing)
+
     def test_generate_module_objective_for_quiz_module(self):
         service = ProfessorVoiceService(
             llm_generate=lambda _prompt: '{"objective":"By the end of this module, you should be able to distinguish the central legal relationships, explain the reasoning that connects them, and recognise which ideas are secure."}'
@@ -443,6 +524,19 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
 
         self.assertIn("Al termine di questo modulo", objective)
         self.assertIn("ragionamento", objective)
+
+    def test_module_objective_rejects_english_llm_text_for_italian_plan(self):
+        service = ProfessorVoiceService(
+            llm_generate=lambda _prompt: '{"objective":"By the end of this module, you should be able to distinguish the central legal relationships, explain the reasoning that connects them, and recognise which ideas are secure."}'
+        )
+
+        objective = service.generate_module_objective(
+            self._knowledge(study_language="Italian"),
+            1,
+        )
+
+        self.assertIn("Al termine di questo modulo", objective)
+        self.assertNotIn("By the end of this module", objective)
 
     def test_module_objective_validation_rejects_category_enumeration(self):
         validator = ProfessorVoiceValidator()
@@ -539,6 +633,29 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         self.assertIn("address the learner directly in second person", captured["prompt"])
         self.assertIn("avoid enumerating categories or topics", captured["prompt"])
         self.assertIn("40-80 words", captured["prompt"])
+        self.assertIn("PROFESSOR CREDIBILITY RULES", captured["prompt"])
+        self.assertIn("not a generic academic objective", captured["prompt"])
+        self.assertIn("professor_observations", captured["prompt"])
+
+    def test_module_objective_prompt_contains_italian_language_guard(self):
+        captured = {}
+
+        def capture_prompt(prompt):
+            captured["prompt"] = prompt
+            return '{"objective":"Al termine di questo modulo dovresti spiegare le distinzioni centrali e usarle in un ragionamento coerente."}'
+
+        service = ProfessorVoiceService(llm_generate=capture_prompt)
+
+        service.generate_module_objective(
+            self._knowledge(study_language="Italian"),
+            1,
+        )
+
+        self.assertIn("Italian examples", captured["prompt"])
+        self.assertIn("Al termine di questo modulo", captured["prompt"])
+        self.assertIn("if ProfessorKnowledge.study_language is Italian", captured["prompt"])
+        self.assertIn("do not use English objective", captured["prompt"])
+        self.assertNotIn("GoalNotYetDemonstrated", captured["prompt"])
 
     def test_module_objective_prompt_uses_teaching_context(self):
         captured = {}
@@ -625,6 +742,58 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         self.assertIn("performance_level", captured["prompt"])
         self.assertIn("Speak directly to the learner", captured["prompt"])
         self.assertIn("60-120 words", captured["prompt"])
+        self.assertIn("PROFESSOR CREDIBILITY RULES", captured["prompt"])
+        self.assertIn("this exact completed activity", captured["prompt"])
+        self.assertIn("may support the interpretation", captured["prompt"])
+        self.assertIn("not as a diagnosis", captured["prompt"])
+        self.assertIn("professor_observations", captured["prompt"])
+
+    def test_activity_debrief_prompt_consumes_goal_not_yet_demonstrated_observation(self):
+        captured = {}
+
+        def capture_prompt(prompt):
+            captured["prompt"] = prompt
+            return (
+                '{"debrief":"Your activity is recorded, but the module goal has not yet been demonstrated by quiz evidence; I will treat that as limited evidence rather than as a diagnosis of your understanding."}'
+            )
+
+        service = ProfessorVoiceService(llm_generate=capture_prompt)
+
+        service.generate_activity_debrief(
+            self._knowledge(),
+            1,
+            {
+                "activity_type": "quiz",
+                "completed": True,
+                "accuracy": 0.55,
+            },
+        )
+
+        self.assertIn("professor_observations", captured["prompt"])
+        self.assertIn("GoalNotYetDemonstrated", captured["prompt"])
+
+    def test_activity_debrief_prompt_does_not_duplicate_goal_observation_when_evidence_exists(self):
+        captured = {}
+
+        def capture_prompt(prompt):
+            captured["prompt"] = prompt
+            return (
+                '{"debrief":"Your answers suggest that the assessed relationships are becoming stable, so I will treat this as evidence for the module objective rather than repeat the score."}'
+            )
+
+        service = ProfessorVoiceService(llm_generate=capture_prompt)
+
+        service.generate_activity_debrief(
+            self._knowledge(),
+            1,
+            {
+                "activity_type": "quiz",
+                "accuracy": 0.85,
+            },
+        )
+
+        self.assertIn("professor_observations", captured["prompt"])
+        self.assertNotIn("GoalNotYetDemonstrated", captured["prompt"])
 
     def test_activity_debrief_fallback_varies_by_high_performance(self):
         service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
@@ -685,6 +854,24 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
 
         self.assertIn("Il risultato", debrief)
         self.assertIn("dovresti", debrief)
+
+    def test_activity_debrief_rejects_english_llm_text_for_italian_plan(self):
+        service = ProfessorVoiceService(
+            llm_generate=lambda _prompt: '{"debrief":"Your result in this activity indicates that the core ideas are not yet stable enough to support more complex work. This is useful evidence for the next step, because it shows where attention should become more precise."}'
+        )
+
+        debrief = service.generate_activity_debrief(
+            self._knowledge(study_language="Italian"),
+            1,
+            {
+                "activity_type": "quiz",
+                "accuracy": 0.35,
+                "completed": True,
+            },
+        )
+
+        self.assertIn("Il risultato", debrief)
+        self.assertNotIn("Your result", debrief)
 
     def test_activity_debrief_validation_rejects_score_repetition(self):
         validator = ProfessorVoiceValidator()
@@ -775,6 +962,10 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         self.assertIn("overall_accuracy", captured["prompt"])
         self.assertIn("following module", captured["prompt"])
         self.assertIn("80-140 words", captured["prompt"])
+        self.assertIn("PROFESSOR CREDIBILITY RULES", captured["prompt"])
+        self.assertIn("this exact module result", captured["prompt"])
+        self.assertIn("may support the interpretation", captured["prompt"])
+        self.assertIn("not a certainty", captured["prompt"])
 
     def test_module_debrief_fallback_varies_by_high_performance(self):
         service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
@@ -934,6 +1125,9 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         self.assertIn("5-15 minutes", captured["prompt"])
         self.assertIn("Do not simply say", captured["prompt"])
         self.assertIn("homework_context", captured["prompt"])
+        self.assertIn("PROFESSOR CREDIBILITY RULES", captured["prompt"])
+        self.assertIn("this exact module result", captured["prompt"])
+        self.assertIn("insufficient for a specific diagnosis", captured["prompt"])
 
     def test_homework_recommendation_fallback_varies_by_high_performance(self):
         service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
@@ -1070,8 +1264,11 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
         self.assertIn("not a Weekly Debrief", captured["prompt"])
         self.assertIn("study_plan_debrief_context", captured["prompt"])
         self.assertIn("overall_accuracy", captured["prompt"])
-        self.assertIn("next Study Plan", captured["prompt"])
+        self.assertIn("future Study Plan", captured["prompt"])
         self.assertIn("100-180 words", captured["prompt"])
+        self.assertIn("PROFESSOR CREDIBILITY RULES", captured["prompt"])
+        self.assertIn("this exact completed Study Plan", captured["prompt"])
+        self.assertIn("Do not diagnose the learner", captured["prompt"])
 
     def test_study_plan_debrief_fallback_varies_by_high_mastery(self):
         service = ProfessorVoiceService(llm_generate=lambda _prompt: "")
@@ -1275,6 +1472,108 @@ class PlannerProfessorVoiceTests(unittest.TestCase):
                 1,
             )
         )
+
+    def test_professor_voice_rejects_english_llm_text_for_all_italian_outputs(self):
+        module_results = {
+            "activity_results": [{"activity_type": "quiz", "accuracy": 0.35}],
+            "professor_debrief": "Il risultato è stato registrato.",
+            "homework_recommendation": "Scrivi un breve confronto.",
+        }
+        study_plan_results = {"module_results": [module_results]}
+
+        cases = (
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"briefing":"This Study Plan is a deliberate slice of the syllabus and gives useful evidence for the next Study Plan."}'
+                ).generate_study_plan_briefing(
+                    self._knowledge(study_language="Italian")
+                ),
+                "Questo Piano di Studio",
+                "This Study Plan",
+            ),
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"briefing":"Today you will focus on the current module and treat uncertainty as useful evidence."}'
+                ).generate_daily_briefing(
+                    self._knowledge(study_language="Italian"),
+                    1,
+                ),
+                "Oggi",
+                "Today",
+            ),
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"objective":"By the end of this module, you should be able to explain the central relationships."}'
+                ).generate_module_objective(
+                    self._knowledge(study_language="Italian"),
+                    1,
+                ),
+                "Al termine di questo modulo",
+                "By the end",
+            ),
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"debrief":"Your result in this activity indicates that the core ideas are not yet stable enough to support more complex work."}'
+                ).generate_activity_debrief(
+                    self._knowledge(study_language="Italian"),
+                    1,
+                    {"activity_type": "quiz", "accuracy": 0.35},
+                ),
+                "Il risultato",
+                "Your result",
+            ),
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"debrief":"Your work across this module suggests that the fundamental concepts still need consolidation before the next module."}'
+                ).generate_module_debrief(
+                    self._knowledge(study_language="Italian"),
+                    1,
+                    module_results,
+                ),
+                "Questo modulo",
+                "Your work",
+            ),
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"homework":"Choose one uncertain distinction and write a short two-column comparison from memory."}'
+                ).generate_homework_recommendation(
+                    self._knowledge(study_language="Italian"),
+                    1,
+                    module_results,
+                ),
+                "Prenditi dieci minuti",
+                "Choose one",
+            ),
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"answer":"Your question is useful, but you should connect the distinction to the concrete example from this module."}'
+                ).generate_module_question_answer(
+                    self._knowledge(study_language="Italian"),
+                    1,
+                    module_results,
+                    "Può chiarire questo punto?",
+                    [],
+                ),
+                "La domanda",
+                "Your question",
+            ),
+            (
+                lambda: ProfessorVoiceService(
+                    llm_generate=lambda _prompt: '{"debrief":"Throughout this Study Plan, you have developed a clearer direction for the next Study Plan."}'
+                ).generate_study_plan_debrief(
+                    self._knowledge(study_language="Italian"),
+                    study_plan_results,
+                ),
+                "Questo Piano di Studio",
+                "Throughout this Study Plan",
+            ),
+        )
+
+        for produce_text, expected_italian, rejected_english in cases:
+            with self.subTest(rejected_english=rejected_english):
+                text = produce_text()
+                self.assertIn(expected_italian, text)
+                self.assertNotIn(rejected_english, text)
 
 
 if __name__ == "__main__":
