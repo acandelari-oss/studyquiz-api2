@@ -11,7 +11,7 @@ from typing import List, Optional
 import json
 import requests
 import random
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -7524,6 +7524,79 @@ async def generate_quiz(
         for c in retrieved_chunks
         if c["topic"]
     }
+    chunk_source_map = {
+        str(c["chunk_id"]): {
+            "source_document": c.get("doc_title"),
+            "source_page": c.get("page"),
+        }
+        for c in retrieved_chunks
+        if c.get("chunk_id")
+    }
+
+    def _missing_quiz_source_value(value):
+        normalized = str(value or "").strip().lower()
+        return (
+            not normalized
+            or normalized in {
+                "exact file name",
+                "file name",
+                "source document",
+                "page number",
+                "source page",
+                "...",
+            }
+        )
+
+    def repair_quiz_question_source(question):
+        if (
+            not _missing_quiz_source_value(question.get("source_document"))
+            and not _missing_quiz_source_value(question.get("source_page"))
+        ):
+            return
+
+        source_chunk_ids = question.get("source_chunk_ids") or []
+        if not isinstance(source_chunk_ids, list):
+            source_chunk_ids = [source_chunk_ids]
+
+        for source_chunk_id in source_chunk_ids:
+            source = chunk_source_map.get(str(source_chunk_id).strip())
+            if not source:
+                continue
+
+            if (
+                _missing_quiz_source_value(question.get("source_document"))
+                and source.get("source_document")
+            ):
+                question["source_document"] = source["source_document"]
+
+            if (
+                _missing_quiz_source_value(question.get("source_page"))
+                and source.get("source_page") is not None
+            ):
+                question["source_page"] = source["source_page"]
+
+            if (
+                not _missing_quiz_source_value(question.get("source_document"))
+                and not _missing_quiz_source_value(question.get("source_page"))
+            ):
+                print(
+                    "✅ QUIZ SOURCE REPAIRED FROM CHUNK:",
+                    source_chunk_id,
+                    question.get("source_document"),
+                    question.get("source_page"),
+                )
+                return
+
+        if (
+            _missing_quiz_source_value(question.get("source_document"))
+            or _missing_quiz_source_value(question.get("source_page"))
+        ):
+            print(
+                "⚠️ QUIZ SOURCE STILL MISSING:",
+                question.get("question", "")[:120],
+                question.get("source_chunk_ids") or [],
+            )
+
     print("🧠 CHUNK TOPIC MAP SAMPLE:")
     print(list(chunk_topic_map.items())[:5])
 
@@ -9256,6 +9329,8 @@ async def generate_quiz(
             canonical_project_topics,
         )
         question["topic"] = attribution["topic"]
+        question["source_chunk_ids"] = attribution["source_chunk_ids"]
+        repair_quiz_question_source(question)
 
         if len(set(attribution["resolved_source_topics"])) > 1:
             print(
@@ -12316,36 +12391,24 @@ async def quiz_attempts_summary(project_id: str, user = Depends(verify_user)):
     finally:
         db.close()
 
-@app.post("/ask")
-async def ask_documents(req: AskRequest):
-    print("HISTORY RECEIVED:", req.history)
+def _build_ask_search_query(question: str, history: Optional[list] = None) -> str:
+    search_query = question
 
     # 🔥 STEP 1 — COSTRUISCI SEARCH QUERY CON HISTORY
-    search_query = req.question
-
-    if req.history:
+    if history:
         last_user_messages = [
             m.get("content")
-            for m in req.history
+            for m in history
             if m.get("role") == "user"
         ][-2:]
 
         if last_user_messages:
             search_query = " ".join(last_user_messages)
 
-    print("SEARCH QUERY:", search_query)
+    return search_query
 
-    # 🔥 STEP 2 — USA search_query (NON req.question)
-    chunks = search_project_chunks(
-        project_id=req.project_id,
-        query=search_query,   # 👈 QUESTA È LA MODIFICA CHIAVE
-        topics=req.topics,
-        k=12
-    )    
-    print("CHUNKS FOUND:", len(chunks))
-    if chunks:
-        print("SAMPLE CHUNK:", chunks[0]["text"][:200])
 
+def _extract_ask_sources(chunks: list) -> list:
     sources = []
     seen_sources = set()
     for c in chunks:
@@ -12364,8 +12427,10 @@ async def ask_documents(req: AskRequest):
             "page": page,
         })
 
-    
+    return sources
 
+
+def _build_ask_context(chunks: list) -> str:
     context_blocks = []
 
     for c in chunks:
@@ -12373,15 +12438,14 @@ async def ask_documents(req: AskRequest):
             f"DOCUMENT: {c['document']} | PAGE: {c['page']}\nCONTENT:\n{c['text'][:600]}"
         )
 
+    return "\n\n---\n\n".join(context_blocks)
 
-    context = "\n\n---\n\n".join(context_blocks) 
-    print("CONTEXT LENGTH:", len(context))
-    # 3️⃣ costruzione contesto
-    
+
+def _build_ask_history_text(history: Optional[list] = None) -> str:
     history_text = ""
 
-    if req.history:
-        for msg in req.history:
+    if history:
+        for msg in history:
             role = msg.get("role")
             content = msg.get("content")
 
@@ -12393,24 +12457,57 @@ async def ask_documents(req: AskRequest):
             elif role == "assistant":
                 history_text += f"Tutor: {content}\n"
 
-    if getattr(req, 'expand_search', False):
-        instruction_mode = """
-        - You are in 'GLOBAL KNOWLEDGE' mode.
-        - Start from the provided Context, but if it's not enough or you can explain better, 
-          use your full AI knowledge base.
-        - Provide a rich, detailed, and helpful explanation.
-        """
-        current_temp = 0.6 # Più creativo
-    else:
-        instruction_mode = """
-        - You are in 'STRICT MODE'.
-        - Use ONLY the material provided in the Context.
-        - If the answer is not in the material, say: 'I'm sorry, I can't find this in your documents.'
-        - DO NOT use external knowledge.
-        """
-        current_temp = 0.1 # Più preciso e fedele al testo
+    return history_text
 
-    prompt = f"""
+
+def _build_ask_prompt(
+    question: str,
+    context: str,
+    history_text: str,
+    expand_search: bool = False,
+    has_image: bool = False,
+) -> str:
+    image_instruction = ""
+    if has_image:
+        image_instruction = """
+        Temporary attached image — visual tutoring rules:
+        - The attached image is not the subject of the conversation by itself.
+          It is part of the student's study material and temporary context for
+          this Ask conversation.
+        - Behave as if you are sitting next to the student looking at the same
+          textbook page, slide, diagram, table, chart, handwritten note, or
+          illustration.
+        - If the student's question refers to something visible in the image,
+          inspect the image first and start from what is actually visible before
+          adding theory.
+        - Do not simply describe the image. Teach the student how to read it:
+          explain how the visible diagram, labels, arrows, colors, boxes,
+          structures, positions, or relationships represent the underlying
+          concept.
+        - Naturally refer to visual elements when useful, for example: at the
+          top, at the bottom, on the left, on the right, in the center, next to
+          the label, the highlighted area, this arrow, this box, this color, or
+          the connection between these elements.
+        - Clearly distinguish what the image explicitly shows, what the image
+          simplifies, and any additional theoretical information.
+        - If the student asks whether the diagram is correct, simplified, or
+          inaccurate, evaluate the diagram itself first. Only then add extra
+          theoretical information if it helps explain the simplification.
+        - The retrieved project documents remain the primary knowledge source.
+          Use the image only as temporary visual context. Keep source citation
+          behavior exactly as before.
+        - Use a calm university tutor style. Guide attention with phrases such
+          as "Notice that...", "Look at...", "You can see...", "This arrow
+          indicates...", "This part represents...", or "This diagram
+          simplifies..." when appropriate.
+        - Never claim the image contains elements that are not actually visible.
+          If something cannot be seen or read clearly, say so explicitly.
+        - Do not treat the image as indexed project material.
+        - Do not imply that the image has been saved, embedded, or added to the
+          project taxonomy.
+        """
+
+    return f"""
     You are an expert study tutor helping a student understand material deeply.
 
     IMPORTANT:
@@ -12423,6 +12520,8 @@ async def ask_documents(req: AskRequest):
       identify the language of that quiz question and answer entirely in that
       same language. Do not infer the response language from UI labels or these
       prompt instructions.
+
+    {image_instruction}
 
     Rules:
     - If relevant info exists, explain it clearly
@@ -12438,26 +12537,132 @@ async def ask_documents(req: AskRequest):
     {history_text}
 
     Current question:
-    {req.question}
+    {question}
 
     Answer as a tutor helping the student progressively understand the topic.
     """
 
+
+def answer_ask_question(
+    project_id: str,
+    question: str,
+    topics: Optional[List[str]] = None,
+    history: Optional[list] = None,
+    expand_search: bool = False,
+    image_data_url: Optional[str] = None,
+) -> dict:
+    print("HISTORY RECEIVED:", history or [])
+
+    search_query = _build_ask_search_query(question, history or [])
+    print("SEARCH QUERY:", search_query)
+
+    # 🔥 STEP 2 — USA search_query (NON req.question)
+    chunks = search_project_chunks(
+        project_id=project_id,
+        query=search_query,   # 👈 QUESTA È LA MODIFICA CHIAVE
+        topics=topics or [],
+        k=12
+    )    
+    print("CHUNKS FOUND:", len(chunks))
+    if chunks:
+        print("SAMPLE CHUNK:", chunks[0]["text"][:200])
+
+    sources = _extract_ask_sources(chunks)
+    context = _build_ask_context(chunks)
+    print("CONTEXT LENGTH:", len(context))
+    # 3️⃣ costruzione contesto
+    history_text = _build_ask_history_text(history or [])
+    prompt = _build_ask_prompt(
+        question=question,
+        context=context,
+        history_text=history_text,
+        expand_search=expand_search,
+        has_image=bool(image_data_url),
+    )
+
+    user_content = prompt
+    if image_data_url:
+        user_content = [
+            {"type": "text", "text": prompt},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": image_data_url,
+                    "detail": "auto",
+                },
+            },
+        ]
 
     # 4️⃣ GPT
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a helpful study tutor."},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": user_content}
         ]
     )
 
     return {
         "answer": response.choices[0].message.content,
         "sources": sources,
-        "used_global_knowledge": bool(getattr(req, 'expand_search', False)),
+        "used_global_knowledge": bool(expand_search),
+        "used_image": bool(image_data_url),
     }
+
+
+@app.post("/ask")
+async def ask_documents(req: AskRequest):
+    return answer_ask_question(
+        project_id=req.project_id,
+        question=req.question,
+        topics=req.topics,
+        history=req.history,
+        expand_search=bool(getattr(req, 'expand_search', False)),
+    )
+
+
+@app.post("/ask_with_image")
+async def ask_documents_with_image(
+    project_id: str = Form(...),
+    question: str = Form(...),
+    topics: str = Form("[]"),
+    history: str = Form("[]"),
+    expand_search: bool = Form(False),
+    image: UploadFile = File(...),
+    user = Depends(verify_user),
+):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
+
+    image_bytes = await image.read()
+    if len(image_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image must be 8 MB or smaller")
+
+    try:
+        parsed_topics = json.loads(topics or "[]")
+        if not isinstance(parsed_topics, list):
+            parsed_topics = []
+    except Exception:
+        parsed_topics = []
+
+    try:
+        parsed_history = json.loads(history or "[]")
+        if not isinstance(parsed_history, list):
+            parsed_history = []
+    except Exception:
+        parsed_history = []
+
+    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+    image_data_url = f"data:{image.content_type};base64,{encoded_image}"
+
+    return answer_ask_question(
+        project_id=project_id,
+        question=question,
+        topics=parsed_topics,
+        history=parsed_history,
+        expand_search=bool(expand_search),
+        image_data_url=image_data_url,
+    )
 
 
 
