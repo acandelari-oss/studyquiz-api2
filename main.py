@@ -7,11 +7,11 @@ import math
 import unicodedata
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
-from typing import List, Optional
+from typing import Dict, List, Optional
 import json
 import requests
 import random
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks, File, Form, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks, File, Form, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -29,7 +29,6 @@ from PIL import Image
 from urllib.parse import unquote
 from fastapi import HTTPException
 from fastapi import Body
-from typing import Optional, List
 from language_registry import (
     get_enabled_language,
     get_enabled_languages,
@@ -64,6 +63,10 @@ from planner.survey_bootstrap import (
     should_apply_survey_bootstrap,
 )
 from planner.student_preferences import MAX_STUDY_PRIORITY_CATEGORIES
+from learning_intelligence_service import get_learning_intelligence
+from learning_journal_service import get_learning_journal
+from learning_preferences_service import get_learning_preferences
+from learning_summary_service import get_learning_summary
 import time
 import re
 import traceback
@@ -674,6 +677,50 @@ class ProjectCreate(BaseModel):
     name: str
 
 
+class QuizAccuracyHistoryResponse(BaseModel):
+    completed_at: str
+    accuracy: float
+
+
+class LearningSummaryResponse(BaseModel):
+    total_sessions: int
+    completed_sessions: int
+    abandoned_sessions: int
+    completion_rate: float
+    total_study_seconds: int
+    current_streak: int
+    quiz_accuracy_history: List[QuizAccuracyHistoryResponse]
+    favorite_activity: Optional[str]
+    activities: Dict[str, int]
+
+
+class LearningJournalEntryResponse(BaseModel):
+    id: str
+    project_id: str
+    session_type: str
+    started_at: Optional[str]
+    completed_at: Optional[str]
+    status: Optional[str]
+    duration_seconds: Optional[int]
+
+
+class LearningIntelligenceInsightResponse(BaseModel):
+    type: str
+    level: str
+    title: str
+    message: str
+
+
+class LearningPreferencesResponse(BaseModel):
+    total_sessions_observed: int
+    completed_sessions_observed: int
+    preferred_activity: Optional[str]
+    typical_session_seconds: Optional[int]
+    session_duration_profile: Optional[str]
+    completion_rate_by_activity: Dict[str, Optional[float]]
+    most_reliable_activity: Optional[str]
+
+
 class QuizRequest(BaseModel):
     num_questions: int
     difficulty: str
@@ -768,6 +815,51 @@ class PlannerModuleCompletionRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/learning/summary", response_model=LearningSummaryResponse)
+def learning_summary(user = Depends(verify_user)):
+    db = SessionLocal()
+    try:
+        return get_learning_summary(db, user["id"])
+    finally:
+        db.close()
+
+
+@app.get("/learning/journal", response_model=List[LearningJournalEntryResponse])
+def learning_journal(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user = Depends(verify_user),
+):
+    db = SessionLocal()
+    try:
+        return get_learning_journal(
+            db,
+            user["id"],
+            limit=limit,
+            offset=offset,
+        )
+    finally:
+        db.close()
+
+
+@app.get("/learning/intelligence", response_model=List[LearningIntelligenceInsightResponse])
+def learning_intelligence(user = Depends(verify_user)):
+    db = SessionLocal()
+    try:
+        return get_learning_intelligence(db, user["id"])
+    finally:
+        db.close()
+
+
+@app.get("/learning/preferences", response_model=LearningPreferencesResponse)
+def learning_preferences(user = Depends(verify_user)):
+    db = SessionLocal()
+    try:
+        return get_learning_preferences(db, user["id"])
+    finally:
+        db.close()
 
 
 @app.get("/planner/week")
