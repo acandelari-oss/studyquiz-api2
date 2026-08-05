@@ -11,3 +11,5 @@ pypdf
 pytesseract
 pdf2image
 Pillow
+python-docx
+python-pptx

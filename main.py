@@ -67,6 +67,10 @@ from learning_intelligence_service import get_learning_intelligence
 from learning_journal_service import get_learning_journal
 from learning_preferences_service import get_learning_preferences
 from learning_summary_service import get_learning_summary
+from document_extractors import (
+    DocumentExtractionError,
+    extract_uploaded_document,
+)
 import time
 import re
 import traceback
@@ -6199,24 +6203,27 @@ async def ingest_stream(
                 document_ocr_pages = 0
                 yield f"Processing document: {doc.title}\n"
 
+                file_bytes = base64.b64decode(doc.file_bytes)
                 pipeline_log.start(
-                    "PDF LOADING",
+                    "DOCUMENT EXTRACTION",
                     filename=doc.title,
                 )
-                pdf_bytes = base64.b64decode(doc.file_bytes)
-                pdf_stream = io.BytesIO(pdf_bytes)
-
-                reader = PdfReader(pdf_stream)
-
-                total_pages = len(reader.pages)
+                extracted_document = extract_uploaded_document(
+                    file_bytes,
+                    doc.title,
+                )
+                total_pages = extracted_document.pages_detected or 0
+                total_blocks = len(extracted_document.blocks)
                 pipeline_log.end(
-                    "PDF LOADING",
+                    "DOCUMENT EXTRACTION",
                     filename=doc.title,
-                    file_size_bytes=len(pdf_bytes),
+                    file_format=extracted_document.file_format,
+                    file_size_bytes=extracted_document.file_size_bytes,
                     pages_detected=total_pages,
+                    blocks_detected=total_blocks,
                 )
 
-                yield f"FILE_ANALYSIS|pages={total_pages}\n"
+                yield f"FILE_ANALYSIS|pages={total_pages}|blocks={total_blocks}\n"
 
                 pipeline_log.start(
                     "DATABASE COMMIT",
@@ -6251,7 +6258,7 @@ async def ingest_stream(
                 db.commit()
                 pipeline_log.end("DATABASE COMMIT")
 
-                if total_pages > MAX_WARNING_PAGES:
+                if total_pages and total_pages > MAX_WARNING_PAGES:
                     yield (
                         "LARGE_FILE_WARNING|"
                         f"pages={total_pages}|"
@@ -6264,78 +6271,96 @@ async def ingest_stream(
                     clean_text(doc.title)
                     .upper()
                 )
-                for page_index, page in enumerate(reader.pages):
+                for block_index, extracted_block in enumerate(extracted_document.blocks):
                     page_start = _upload_timer()
+                    page_number = extracted_block.page
+                    block_number = extracted_block.block_index or (block_index + 1)
                     
-                    print(f"📄 PROCESSING PAGE {page_index+1}/{len(reader.pages)}")
-                    yield f"Page {page_index+1}\n"
-                    pipeline_log.start(
-                        "DATABASE COMMIT",
-                        operation="update last_processed_page",
-                        page=page_index + 1,
-                    )
-                    db.execute(
-                        text("""
-                            UPDATE projects
-                            SET last_processed_page = :page
-                            WHERE id = :project_id
-                        """),
-                        {
-                            "page": page_index + 1,
-                            "project_id": project_id
-                        }
-                    )
+                    if page_number is not None:
+                        print(f"📄 PROCESSING PAGE {page_number}/{total_pages}")
+                        yield f"Page {page_number}\n"
+                        pipeline_log.start(
+                            "DATABASE COMMIT",
+                            operation="update last_processed_page",
+                            page=page_number,
+                        )
+                        db.execute(
+                            text("""
+                                UPDATE projects
+                                SET last_processed_page = :page
+                                WHERE id = :project_id
+                            """),
+                            {
+                                "page": page_number,
+                                "project_id": project_id
+                            }
+                        )
 
-                    db.commit()
-                    pipeline_log.end("DATABASE COMMIT")
+                        db.commit()
+                        pipeline_log.end("DATABASE COMMIT")
+                    else:
+                        print(f"📄 PROCESSING DOCUMENT BLOCK {block_number}/{total_blocks}")
+                        yield f"Document block {block_number}\n"
 
                     pdf_extract_start = _upload_timer()
-                    raw_page_text = page.extract_text()
+                    raw_page_text = extracted_block.raw_text
                     print(
-                        "[PDF TEXT EXTRACTION]",
+                        "[DOCUMENT TEXT EXTRACTION]",
                         "page:",
-                        page_index + 1,
+                        page_number,
+                        "block:",
+                        block_number,
                         "text_chars:",
                         len(raw_page_text or ""),
                         "Elapsed:",
                         f"{_upload_elapsed(pdf_extract_start):.3f} sec",
                     )
 
-                    current_section = detect_section_title(
-                        raw_page_text,
-                        current_section
+                    current_section = (
+                        extracted_block.section
+                        or detect_section_title(
+                            raw_page_text,
+                            current_section
+                        )
                     )
 
                     section_title = current_section
                     print(f"📚 DETECTED SECTION: {section_title}")
 
-                    page_text = clean_text(raw_page_text)
+                    page_text = clean_text(extracted_block.text)
 
-                    if not page_text or not page_text.strip():
+                    if (
+                        page_number is not None
+                        and (not page_text or not page_text.strip())
+                    ):
                         total_ocr_pages += 1
                         document_ocr_pages += 1
                         pipeline_log.start(
                             "OCR",
-                            page=page_index + 1,
+                            page=page_number,
                             filename=doc.title,
                             pages_requiring_ocr=document_ocr_pages,
                         )
-                        yield f"OCR page {page_index+1}\n"
-                        page_text = ocr_pdf_page(pdf_bytes, page_index)
+                        yield f"OCR page {page_number}\n"
+                        page_text = ocr_pdf_page(file_bytes, page_number - 1)
                         pipeline_log.end(
                             "OCR",
-                            page=page_index + 1,
+                            page=page_number,
                             text_chars=len(page_text or ""),
                         )
 
                         if not page_text:
                             continue
 
+                    if not page_text or not page_text.strip():
+                        continue
+
                     document_text_parts.append(page_text)
 
                     pipeline_log.start(
                         "CHUNK GENERATION",
-                        page=page_index + 1,
+                        page=page_number,
+                        block=block_number,
                         filename=doc.title,
                         page_text_chars=len(page_text or ""),
                     )
@@ -6353,13 +6378,14 @@ async def ingest_stream(
                     )
                     pipeline_log.end(
                         "CHUNK GENERATION",
-                        page=page_index + 1,
+                        page=page_number,
+                        block=block_number,
                         chunks_created=len(chunks),
                         average_chunk_size=average_chunk_size,
                     )
 
                     print(
-                        f"📦 PAGE {page_index+1} -> {len(chunks)} CHUNKS"
+                        f"📦 SOURCE BLOCK {block_number} -> {len(chunks)} CHUNKS"
                     )
 
                     yield f"{len(chunks)} chunks created\n"
@@ -6369,7 +6395,7 @@ async def ingest_stream(
                         await asyncio.sleep(0)
                         chunk_role = classify_chunk_role(
                             chunk,
-                            page_number=page_index + 1,
+                            page_number=page_number,
                             doc_title=doc.title,
                         )
                         project_chunk_roles.append(chunk_role)
@@ -6377,7 +6403,8 @@ async def ingest_stream(
                         pipeline_log.start(
                             "EMBEDDING GENERATION",
                             filename=doc.title,
-                            page=page_index + 1,
+                            page=page_number,
+                            block=block_number,
                             chunk_index=i + 1,
                             chunks_on_page=len(chunks),
                             batch="single-chunk",
@@ -6389,7 +6416,8 @@ async def ingest_stream(
                                 "pid": os.getpid(),
                                 "project_id": project_id,
                                 "filename": doc.title,
-                                "page": page_index + 1,
+                                "page": page_number,
+                                "block": block_number,
                                 "chunk_index": i + 1,
                                 "chunks_on_page": len(chunks),
                                 "model": embedding_model,
@@ -6413,7 +6441,8 @@ async def ingest_stream(
                                     "pid": os.getpid(),
                                     "project_id": project_id,
                                     "filename": doc.title,
-                                    "page": page_index + 1,
+                                    "page": page_number,
+                                    "block": block_number,
                                     "chunk_index": i + 1,
                                     "chunks_on_page": len(chunks),
                                     "model": embedding_model,
@@ -6448,7 +6477,8 @@ async def ingest_stream(
                             "DATABASE COMMIT",
                             operation="insert chunk",
                             filename=doc.title,
-                            page=page_index + 1,
+                            page=page_number,
+                            block=block_number,
                             chunk_index=i + 1,
                         )
                         db.execute(
@@ -6484,7 +6514,7 @@ async def ingest_stream(
                                 "doc_title": doc.title,
                                 "chunk_text": chunk,
                                 "embedding": embedding_str,
-                                "page": page_index + 1,      
+                                "page": page_number,
                                 "topic": None,
                                 "section": section_title,
                                 "chunk_role": chunk_role,
@@ -6499,7 +6529,9 @@ async def ingest_stream(
                         "[PAGE PROCESSING]",
                         "END",
                         "page:",
-                        page_index + 1,
+                        page_number,
+                        "block:",
+                        block_number,
                         "chunks_created:",
                         len(chunks),
                         "Elapsed:",
@@ -7640,10 +7672,7 @@ async def generate_quiz(
         )
 
     def repair_quiz_question_source(question):
-        if (
-            not _missing_quiz_source_value(question.get("source_document"))
-            and not _missing_quiz_source_value(question.get("source_page"))
-        ):
+        if not _missing_quiz_source_value(question.get("source_document")):
             return
 
         source_chunk_ids = question.get("source_chunk_ids") or []
@@ -7667,10 +7696,7 @@ async def generate_quiz(
             ):
                 question["source_page"] = source["source_page"]
 
-            if (
-                not _missing_quiz_source_value(question.get("source_document"))
-                and not _missing_quiz_source_value(question.get("source_page"))
-            ):
+            if not _missing_quiz_source_value(question.get("source_document")):
                 print(
                     "✅ QUIZ SOURCE REPAIRED FROM CHUNK:",
                     source_chunk_id,
@@ -7679,10 +7705,7 @@ async def generate_quiz(
                 )
                 return
 
-        if (
-            _missing_quiz_source_value(question.get("source_document"))
-            or _missing_quiz_source_value(question.get("source_page"))
-        ):
+        if _missing_quiz_source_value(question.get("source_document")):
             print(
                 "⚠️ QUIZ SOURCE STILL MISSING:",
                 question.get("question", "")[:120],
@@ -8885,7 +8908,7 @@ async def generate_quiz(
                         "explanation": "Short explanation",
                         "explanation_long": "2-3 sentences maximum",
                         "source_document": "Exact file name",
-                        "source_page": "Page number",
+                        "source_page": "Page number or null when the source has no page metadata",
                         "source_chunk_ids": ["Supporting chunk ID"]
                     }},
                     {{
@@ -8896,7 +8919,7 @@ async def generate_quiz(
                         "explanation": "Short explanation",
                         "explanation_long": "2-3 sentences maximum",
                         "source_document": "Exact file name",
-                        "source_page": "Page number",
+                        "source_page": "Page number or null when the source has no page metadata",
                         "source_chunk_ids": ["Supporting chunk ID"]
                     }},
                     {{
@@ -8907,7 +8930,7 @@ async def generate_quiz(
                         "explanation": "Short explanation",
                         "explanation_long": "2-3 sentences maximum",
                         "source_document": "Exact file name",
-                        "source_page": "Page number",
+                        "source_page": "Page number or null when the source has no page metadata",
                         "source_chunk_ids": ["Supporting chunk ID"]
                     }}
                 ]
@@ -12506,18 +12529,20 @@ def _extract_ask_sources(chunks: list) -> list:
     for c in chunks:
         document = c.get("document")
         page = c.get("page")
-        if not document or page is None:
+        if not document:
             continue
 
-        source_key = (str(document), str(page))
+        source_key = (str(document), str(page) if page is not None else "")
         if source_key in seen_sources:
             continue
 
         seen_sources.add(source_key)
-        sources.append({
+        source = {
             "document": str(document),
-            "page": page,
-        })
+        }
+        if page is not None:
+            source["page"] = page
+        sources.append(source)
 
     return sources
 
@@ -12526,8 +12551,14 @@ def _build_ask_context(chunks: list) -> str:
     context_blocks = []
 
     for c in chunks:
+        page = c.get("page")
+        source_label = (
+            f"DOCUMENT: {c['document']} | PAGE: {page}"
+            if page is not None
+            else f"DOCUMENT: {c['document']}"
+        )
         context_blocks.append(
-            f"DOCUMENT: {c['document']} | PAGE: {c['page']}\nCONTENT:\n{c['text'][:600]}"
+            f"{source_label}\nCONTENT:\n{c['text'][:600]}"
         )
 
     return "\n\n---\n\n".join(context_blocks)
@@ -12887,7 +12918,12 @@ async def active_recall_question(project_id: str, req: ActiveRecallRequest, user
     
     context_blocks = []
     for r in selected_rows:
-        block = f"SOURCE: {r[1]} (Page {r[2]}) | TOPIC: {r[3]}\nCONTENT: {r[0]}"
+        source_label = (
+            f"SOURCE: {r[1]} (Page {r[2]})"
+            if r[2] is not None
+            else f"SOURCE: {r[1]}"
+        )
+        block = f"{source_label} | TOPIC: {r[3]}\nCONTENT: {r[0]}"
         context_blocks.append(block)
 
     context = "\n\n---\n\n".join(context_blocks)
@@ -12915,7 +12951,7 @@ async def active_recall_question(project_id: str, req: ActiveRecallRequest, user
     "concept": "{current_focus}",
     "difficulty": "medium",
     "source_document": "...",
-    "source_page": "..."
+    "source_page": "Page number or null when unavailable"
     }}
     """
 
