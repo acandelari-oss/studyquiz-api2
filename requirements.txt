@@ -8,6 +8,7 @@ pgvector
 openai
 requests
 pypdf
+cryptography>=42.0.0,<46.0.0
 pytesseract
 pdf2image
 Pillow

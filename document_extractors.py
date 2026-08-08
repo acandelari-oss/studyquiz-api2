@@ -5,10 +5,17 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from pypdf import PdfReader
+from pypdf.errors import DependencyError, FileNotDecryptedError, WrongPasswordError
 
 
 class DocumentExtractionError(ValueError):
     pass
+
+
+PDF_PASSWORD_PROTECTED_MESSAGE = (
+    "This PDF is password protected. "
+    "Please remove the password protection and upload it again."
+)
 
 
 @dataclass
@@ -54,7 +61,19 @@ def extract_pdf_document(file_bytes: bytes, filename: str) -> ExtractedDocument:
     try:
         pdf_stream = io.BytesIO(file_bytes)
         reader = PdfReader(pdf_stream)
+        if reader.is_encrypted:
+            decrypt_result = reader.decrypt("")
+            if not decrypt_result:
+                raise DocumentExtractionError(PDF_PASSWORD_PROTECTED_MESSAGE)
         pages_detected = len(reader.pages)
+    except DocumentExtractionError:
+        raise
+    except (FileNotDecryptedError, WrongPasswordError) as exc:
+        raise DocumentExtractionError(PDF_PASSWORD_PROTECTED_MESSAGE) from exc
+    except DependencyError as exc:
+        raise DocumentExtractionError(
+            "This PDF uses encryption that requires additional server support."
+        ) from exc
     except Exception as exc:
         raise DocumentExtractionError(
             "The uploaded PDF could not be opened. The file may be corrupted."
@@ -64,16 +83,23 @@ def extract_pdf_document(file_bytes: bytes, filename: str) -> ExtractedDocument:
         raise DocumentExtractionError("The uploaded PDF does not contain any pages.")
 
     blocks = []
-    for page_index, page in enumerate(reader.pages):
-        raw_page_text = page.extract_text()
-        blocks.append(
-            ExtractedBlock(
-                text=raw_page_text or "",
-                raw_text=raw_page_text or "",
-                page=page_index + 1,
-                block_index=page_index + 1,
+    try:
+        for page_index, page in enumerate(reader.pages):
+            raw_page_text = page.extract_text()
+            blocks.append(
+                ExtractedBlock(
+                    text=raw_page_text or "",
+                    raw_text=raw_page_text or "",
+                    page=page_index + 1,
+                    block_index=page_index + 1,
+                )
             )
-        )
+    except (FileNotDecryptedError, WrongPasswordError) as exc:
+        raise DocumentExtractionError(PDF_PASSWORD_PROTECTED_MESSAGE) from exc
+    except DependencyError as exc:
+        raise DocumentExtractionError(
+            "This PDF uses encryption that requires additional server support."
+        ) from exc
 
     return ExtractedDocument(
         filename=filename,
