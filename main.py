@@ -67,6 +67,14 @@ from learning_intelligence_service import get_learning_intelligence
 from learning_journal_service import get_learning_journal
 from learning_preferences_service import get_learning_preferences
 from learning_summary_service import get_learning_summary
+from relationship_explanation_service import generate_relationship_explanation
+from topic_relationship_service import (
+    DEFAULT_MIN_SEMANTIC_SIMILARITY,
+    DEFAULT_MIN_SHARED_CHUNKS,
+    DEFAULT_TOP_K_PER_TOPIC,
+    TopicRelationshipFilters,
+    get_topic_relationship_graph,
+)
 from document_extractors import (
     DocumentExtractionError,
     extract_uploaded_document,
@@ -804,6 +812,78 @@ class PlannerProfessorStudyPlanDebriefRequest(BaseModel):
     study_language: Optional[str] = None
 
 
+class TopicRelationshipNodeResponse(BaseModel):
+    id: str
+    topic: Optional[str] = None
+    category: Optional[str] = None
+    source_section: Optional[str] = None
+    associated_chunk_count: int
+    document_count: int
+    section_count: int
+    total_associated_text_length: int
+
+
+class TopicRelationshipEdgeResponse(BaseModel):
+    topic_a_id: str
+    topic_b_id: str
+    topic_a: Optional[str] = None
+    topic_b: Optional[str] = None
+    category_a: Optional[str] = None
+    category_b: Optional[str] = None
+    semantic_similarity: Optional[float] = None
+    shared_chunks: int
+    chunks_a: int
+    chunks_b: int
+    chunk_jaccard: float
+    shared_sections: int
+    shared_documents: int
+
+
+class TopicRelationshipGraphResponse(BaseModel):
+    project_id: str
+    node_count: int
+    edge_count: int
+    candidate_pairs_evaluated: int
+    candidate_edge_count_before_top_k: int
+    isolated_node_count: int
+    filters: dict
+    nodes: List[TopicRelationshipNodeResponse]
+    edges: List[TopicRelationshipEdgeResponse]
+    execution_time_ms: float
+
+
+class TopicRelationshipExplanationRequest(BaseModel):
+    topic_a_id: str
+    topic_b_id: str
+    study_language: Optional[str] = "English"
+
+
+class TopicRelationshipExplanationTopicResponse(BaseModel):
+    id: str
+    topic: str
+    category: Optional[str] = None
+    description: Optional[str] = None
+
+
+class TopicRelationshipExplanationEvidenceResponse(BaseModel):
+    chunk_id: str
+    document: Optional[str] = None
+    page: Optional[int] = None
+    section: Optional[str] = None
+    topic: Optional[str] = None
+    evidence_type: Optional[str] = None
+    preview: str
+
+
+class TopicRelationshipExplanationResponse(BaseModel):
+    topic_a: TopicRelationshipExplanationTopicResponse
+    topic_b: TopicRelationshipExplanationTopicResponse
+    why_connected: str
+    study_relevance: str
+    evidence_summary: str
+    evidence: List[TopicRelationshipExplanationEvidenceResponse]
+
+
 class PlannerModuleCompletionRequest(BaseModel):
     session_index: int
     session_results: dict
@@ -862,6 +942,102 @@ def learning_preferences(user = Depends(verify_user)):
     db = SessionLocal()
     try:
         return get_learning_preferences(db, user["id"])
+    finally:
+        db.close()
+
+
+@app.get(
+    "/projects/{project_id}/topic-relationships",
+    response_model=TopicRelationshipGraphResponse,
+)
+def project_topic_relationships(
+    project_id: str,
+    min_semantic_similarity: float = Query(
+        DEFAULT_MIN_SEMANTIC_SIMILARITY,
+        ge=-1,
+        le=1,
+    ),
+    min_shared_chunks: int = Query(
+        DEFAULT_MIN_SHARED_CHUNKS,
+        ge=0,
+    ),
+    top_k_per_topic: int = Query(
+        DEFAULT_TOP_K_PER_TOPIC,
+        ge=1,
+        le=50,
+    ),
+    focus_topic_id: Optional[str] = Query(None),
+    focus_topic: Optional[str] = Query(None),
+    user = Depends(verify_user),
+):
+    db = SessionLocal()
+    try:
+        project = db.execute(
+            text("""
+                select id
+                from projects
+                where id = :project_id
+                and user_id = :user_id
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user["id"],
+            },
+        ).fetchone()
+
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        return get_topic_relationship_graph(
+            db,
+            project_id,
+            filters=TopicRelationshipFilters(
+                min_semantic_similarity=min_semantic_similarity,
+                min_shared_chunks=min_shared_chunks,
+                top_k_per_topic=top_k_per_topic,
+                focus_topic_id=focus_topic_id,
+                focus_topic=focus_topic,
+            ),
+        )
+    finally:
+        db.close()
+
+
+@app.post(
+    "/projects/{project_id}/topic-relationships/explain",
+    response_model=TopicRelationshipExplanationResponse,
+)
+def explain_project_topic_relationship(
+    project_id: str,
+    req: TopicRelationshipExplanationRequest,
+    user = Depends(verify_user),
+):
+    db = SessionLocal()
+    try:
+        project = db.execute(
+            text("""
+                select id
+                from projects
+                where id = :project_id
+                and user_id = :user_id
+            """),
+            {
+                "project_id": project_id,
+                "user_id": user["id"],
+            },
+        ).fetchone()
+
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        return generate_relationship_explanation(
+            db,
+            client,
+            project_id=project_id,
+            topic_a_id=req.topic_a_id,
+            topic_b_id=req.topic_b_id,
+            study_language=req.study_language or "English",
+        )
     finally:
         db.close()
 
