@@ -75,9 +75,15 @@ from topic_relationship_service import (
     TopicRelationshipFilters,
     get_topic_relationship_graph,
 )
+from project_deletion_service import delete_project_owned_data
 from document_extractors import (
     DocumentExtractionError,
     extract_uploaded_document,
+)
+from source_structure import (
+    analyze_source_structure,
+    format_source_structure_tree,
+    source_structure_to_dict,
 )
 import time
 import re
@@ -218,10 +224,17 @@ class UploadPipelineLogger:
         print("Project ID:", snapshot.get("project_id") or "-")
         print("Filename:", counter("filename", "filenames", default="-"))
         print()
-        row("Pages processed", counter("pages_processed", "chunks_processed"))
+        taxonomy_chunks_loaded = counter("taxonomy_chunks_loaded", default=None)
+        if taxonomy_chunks_loaded is not None:
+            row("Taxonomy chunks loaded", taxonomy_chunks_loaded)
+        else:
+            row("Pages processed", counter("pages_processed", "chunks_processed"))
         row("OCR pages", counter("ocr_pages", default=0))
         print()
-        row("Chunks generated", counter("chunks_created", "chunks_processed"))
+        if taxonomy_chunks_loaded is not None:
+            row("Document chunks generated", counter("chunks_created", default=0))
+        else:
+            row("Chunks generated", counter("chunks_created", "chunks_processed"))
         row("Embeddings", counter("embeddings_created", default=0))
         print()
         row("Sections", counter("sections", default=0))
@@ -295,6 +308,10 @@ def _merge_upload_diagnostic_snapshots(*snapshots):
     return merged
 
 
+def _topic_generation_timeout_reached(start_time: float) -> bool:
+    return time.time() - start_time > MAX_TOPIC_PROCESSING_SECONDS
+
+
 def _unique_sorted(values):
     return sorted({
         str(value).strip()
@@ -318,29 +335,50 @@ def _get_taxonomy_diagnostic_snapshot(
     db,
     project_id: str,
     document_id: Optional[str] = None,
+    module_id: Optional[str] = None,
 ):
     document_filter = ""
+    document_join = ""
+    chunk_filter = ""
     params = {"project_id": project_id}
 
-    if document_id:
+    if module_id:
+        document_join = """
+            JOIN documents d
+              ON d.id = chunks.document_id
+             AND d.project_id = chunks.project_id
+        """
+        chunk_filter = "AND d.module_id = :module_id"
+        document_filter = "AND module_id = :module_id"
+        params["module_id"] = module_id
+    elif document_id:
+        chunk_filter = "AND document_id = :document_id"
         document_filter = "AND document_id = :document_id"
         params["document_id"] = document_id
 
+    document_count_filter = ""
+    if document_id:
+        document_count_filter = "AND id = :document_id"
+    elif module_id:
+        document_count_filter = "AND module_id = :module_id"
+
     documents_count = db.execute(
-        text("""
+        text(f"""
             SELECT count(*)
             FROM documents
             WHERE project_id = :project_id
+            {document_count_filter}
         """),
-        {"project_id": project_id}
+        params
     ).scalar()
 
     chunks_count = db.execute(
         text(f"""
             SELECT count(*)
             FROM chunks
-            WHERE project_id = :project_id
-            {document_filter}
+            {document_join}
+            WHERE chunks.project_id = :project_id
+            {chunk_filter}
         """),
         params
     ).scalar()
@@ -366,6 +404,7 @@ def _get_taxonomy_diagnostic_snapshot(
     return {
         "project_id": project_id,
         "document_id": document_id,
+        "module_id": module_id,
         "documents_count": documents_count,
         "chunks_count": chunks_count,
         "macro_categories": macro_categories,
@@ -381,6 +420,8 @@ def _print_taxonomy_state_snapshot(title, snapshot):
     print("Project ID:", snapshot["project_id"])
     if snapshot.get("document_id"):
         print("Document ID:", snapshot["document_id"])
+    if snapshot.get("module_id"):
+        print("Module ID:", snapshot["module_id"])
     print("Documents:", snapshot["documents_count"])
     print("Chunks:", snapshot["chunks_count"])
     print("Existing macro-categories:", len(snapshot["macro_categories"]))
@@ -455,6 +496,9 @@ def _print_taxonomy_evolution_summary(before_snapshot, after_snapshot):
     print("=====================================")
 
 MAX_TOPIC_PROCESSING_SECONDS = 600
+TAXONOMY_PLANNER_REQUEST_TIMEOUT_SECONDS = 240
+TAXONOMY_PLANNER_MAX_OUTPUT_TOKENS = 3000
+TAXONOMY_PLANNER_MODEL = "gpt-4o-mini"
 MAX_ASSIGNMENT_MATCHES = 30000
 HARD_ACCEPTED_DIAGNOSTIC_SAMPLE_SIZE = 10
 PRIMARY_ASSIGNMENT_THRESHOLD = 0.54
@@ -526,21 +570,37 @@ def ensure_project_chunk_roles(
     db,
     project_id,
     document_id: Optional[str] = None,
+    module_id: Optional[str] = None,
 ):
     document_filter = ""
+    document_join = ""
     params = {"project_id": project_id}
 
-    if document_id:
+    if module_id:
+        document_join = """
+            join documents d
+              on d.id = chunks.document_id
+             and d.project_id = chunks.project_id
+        """
+        document_filter = "and d.module_id = :module_id"
+        params["module_id"] = module_id
+    elif document_id:
         document_filter = "and document_id = :document_id"
         params["document_id"] = document_id
 
     rows = db.execute(
         text(f"""
-            select id, chunk_text, page, doc_title, chunk_role
+            select
+                chunks.id,
+                chunks.chunk_text,
+                chunks.page,
+                chunks.doc_title,
+                chunks.chunk_role
             from chunks
-            where project_id = :project_id
+            {document_join}
+            where chunks.project_id = :project_id
             {document_filter}
-            order by page, id
+            order by chunks.page, chunks.id
         """),
         params
     ).fetchall()
@@ -756,6 +816,10 @@ class IngestDocument(BaseModel):
 
 class IngestRequest(BaseModel):
     documents: List[IngestDocument]
+    module_name: Optional[str] = None
+    organization_mode: Optional[str] = None
+    organization_blueprint: Optional[dict] = None
+    organization_source_title: Optional[str] = None
 
 
 class PlannerGenerationPreferences(BaseModel):
@@ -768,6 +832,59 @@ class PlannerGenerationPreferences(BaseModel):
 class ProjectStudyPrioritiesRequest(BaseModel):
     priority_categories: Optional[List[str]] = None
     priorityCategories: Optional[List[str]] = None
+
+
+class TopicCategoryUpdateRequest(BaseModel):
+    category: Optional[str] = None
+    topic: Optional[str] = None
+
+
+class TopicCategoryRenameRequest(BaseModel):
+    current_category: str
+    new_category: str
+    module_id: Optional[str] = None
+
+
+class TopicMergeRequest(BaseModel):
+    source_topic_id: str
+    target_topic_id: str
+    new_topic_name: str
+
+
+class StudyModuleCreateRequest(BaseModel):
+    name: str
+    organization_mode: Optional[str] = None
+    organization_blueprint: Optional[dict] = None
+    organization_source_title: Optional[str] = None
+
+
+class StudyModuleUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    status: Optional[str] = None
+    taxonomy_status: Optional[str] = None
+    accepted_for_study: Optional[bool] = None
+    organization_mode: Optional[str] = None
+    organization_blueprint: Optional[dict] = None
+    organization_source_title: Optional[str] = None
+
+
+class StudyModuleResponse(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    order_index: int
+    created_at: Optional[str] = None
+    status: str
+    taxonomy_status: str
+    accepted_for_study: bool
+    accepted_at: Optional[str] = None
+    organization_mode: Optional[str] = None
+    organization_blueprint: Optional[dict] = None
+    organization_source_title: Optional[str] = None
+
+
+class StudyModuleListResponse(BaseModel):
+    modules: List[StudyModuleResponse]
 
 
 class PlannerGenerationConfiguration(BaseModel):
@@ -878,6 +995,9 @@ class TopicRelationshipExplanationEvidenceResponse(BaseModel):
 class TopicRelationshipExplanationResponse(BaseModel):
     topic_a: TopicRelationshipExplanationTopicResponse
     topic_b: TopicRelationshipExplanationTopicResponse
+    support_level: str
+    relationship_form: str
+    explanation: str
     why_connected: str
     study_relevance: str
     evidence_summary: str
@@ -902,10 +1022,13 @@ def health():
 
 
 @app.get("/learning/summary", response_model=LearningSummaryResponse)
-def learning_summary(user = Depends(verify_user)):
+def learning_summary(
+    project_id: Optional[str] = Query(None),
+    user = Depends(verify_user),
+):
     db = SessionLocal()
     try:
-        return get_learning_summary(db, user["id"])
+        return get_learning_summary(db, user["id"], project_id=project_id)
     finally:
         db.close()
 
@@ -914,6 +1037,7 @@ def learning_summary(user = Depends(verify_user)):
 def learning_journal(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    project_id: Optional[str] = Query(None),
     user = Depends(verify_user),
 ):
     db = SessionLocal()
@@ -923,25 +1047,32 @@ def learning_journal(
             user["id"],
             limit=limit,
             offset=offset,
+            project_id=project_id,
         )
     finally:
         db.close()
 
 
 @app.get("/learning/intelligence", response_model=List[LearningIntelligenceInsightResponse])
-def learning_intelligence(user = Depends(verify_user)):
+def learning_intelligence(
+    project_id: Optional[str] = Query(None),
+    user = Depends(verify_user),
+):
     db = SessionLocal()
     try:
-        return get_learning_intelligence(db, user["id"])
+        return get_learning_intelligence(db, user["id"], project_id=project_id)
     finally:
         db.close()
 
 
 @app.get("/learning/preferences", response_model=LearningPreferencesResponse)
-def learning_preferences(user = Depends(verify_user)):
+def learning_preferences(
+    project_id: Optional[str] = Query(None),
+    user = Depends(verify_user),
+):
     db = SessionLocal()
     try:
-        return get_learning_preferences(db, user["id"])
+        return get_learning_preferences(db, user["id"], project_id=project_id)
     finally:
         db.close()
 
@@ -2272,6 +2403,1747 @@ def create_project(
 # LIST PROJECTS
 # ======================
 
+STUDY_MODULE_STATUSES = {
+    "building",
+    "taxonomy_ready",
+    "pending_study",
+    "accepted_for_study",
+}
+STUDY_MODULE_TAXONOMY_STATUSES = {
+    "not_started",
+    "building",
+    "ready",
+    "failed",
+}
+STUDY_MODULE_ORGANIZATION_MODES = {
+    "infer",
+    "manual",
+    "syllabus",
+}
+STUDY_MODULE_ORGANIZATION_COLUMNS = {
+    "organization_mode",
+    "organization_blueprint",
+    "organization_source_title",
+}
+
+
+def _table_column_available(db, table_name: str, column_name: str) -> bool:
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table_name or ""):
+        return False
+
+    try:
+        count = db.execute(
+            text("""
+                select count(*)
+                from information_schema.columns
+                where table_schema = 'public'
+                  and table_name = :table_name
+                  and column_name = :column_name
+            """),
+            {
+                "table_name": table_name,
+                "column_name": column_name,
+            },
+        ).scalar()
+        if int(count or 0) > 0:
+            return True
+    except Exception:
+        pass
+
+    try:
+        rows = db.execute(
+            text(f"PRAGMA table_info({table_name})")
+        ).fetchall()
+        return any(row[1] == column_name for row in rows)
+    except Exception:
+        return False
+
+
+def _normalize_study_module_organization(
+    mode: Optional[str],
+    blueprint: Optional[dict],
+    source_title: Optional[str],
+) -> dict:
+    organization_mode = (mode or "infer").strip().lower()
+    if organization_mode not in STUDY_MODULE_ORGANIZATION_MODES:
+        raise HTTPException(status_code=400, detail="Invalid module organization mode")
+
+    organization_source_title = (source_title or "").strip() or None
+    organization_blueprint = blueprint if isinstance(blueprint, dict) else None
+
+    if organization_mode == "manual":
+        categories = (organization_blueprint or {}).get("categories")
+        if not isinstance(categories, list) or len(categories) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Manual organization requires at least one category",
+            )
+
+        cleaned_categories = []
+        for category in categories:
+            if not isinstance(category, dict):
+                continue
+            name = str(category.get("name") or "").strip()
+            description = str(category.get("description") or "").strip()
+            if name:
+                cleaned_categories.append({
+                    "name": name,
+                    "description": description,
+                })
+
+        if not cleaned_categories:
+            raise HTTPException(
+                status_code=400,
+                detail="Manual organization requires at least one category",
+            )
+
+        organization_blueprint = {
+            "version": 1,
+            "categories": cleaned_categories,
+        }
+
+    elif organization_mode == "syllabus":
+        syllabus_text = str((organization_blueprint or {}).get("syllabus_text") or "").strip()
+        if not syllabus_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Syllabus organization requires index or syllabus text",
+            )
+        organization_blueprint = {
+            "version": 1,
+            "syllabus_text": syllabus_text,
+        }
+
+    else:
+        organization_blueprint = None
+        organization_source_title = None
+
+    return {
+        "organization_mode": organization_mode,
+        "organization_blueprint": organization_blueprint,
+        "organization_source_title": organization_source_title,
+    }
+
+
+def _study_module_organization_columns_available(db) -> bool:
+    try:
+        count = db.execute(
+            text("""
+                select count(*)
+                from information_schema.columns
+                where table_schema = 'public'
+                  and table_name = 'study_modules'
+                  and column_name in (
+                    'organization_mode',
+                    'organization_blueprint',
+                    'organization_source_title'
+                  )
+            """)
+        ).scalar()
+        return int(count or 0) == len(STUDY_MODULE_ORGANIZATION_COLUMNS)
+    except Exception:
+        return False
+
+
+def _study_module_organization_select_columns(db) -> str:
+    if _study_module_organization_columns_available(db):
+        return """
+                organization_mode,
+                organization_blueprint,
+                organization_source_title
+        """
+
+    return """
+                null as organization_mode,
+                null as organization_blueprint,
+                null as organization_source_title
+    """
+
+
+def _update_study_module_organization_metadata(
+    db,
+    module_id: str,
+    project_id: str,
+    organization: dict,
+) -> None:
+    if not _study_module_organization_columns_available(db):
+        return
+
+    db.execute(
+        text("""
+            update study_modules
+            set
+                organization_mode = :organization_mode,
+                organization_blueprint = CAST(:organization_blueprint AS jsonb),
+                organization_source_title = :organization_source_title
+            where id = :module_id
+              and project_id = :project_id
+        """),
+        {
+            "module_id": module_id,
+            "project_id": project_id,
+            "organization_mode": organization["organization_mode"],
+            "organization_blueprint": json.dumps(organization["organization_blueprint"])
+                if organization["organization_blueprint"] is not None
+                else None,
+            "organization_source_title": organization["organization_source_title"],
+        },
+    )
+
+
+def _get_study_module_organization_metadata(
+    db,
+    module_id: Optional[str],
+) -> dict:
+    if not module_id or not _study_module_organization_columns_available(db):
+        return {
+            "organization_mode": "infer",
+            "organization_blueprint": None,
+            "organization_source_title": None,
+        }
+
+    row = db.execute(
+        text("""
+            select
+                organization_mode,
+                organization_blueprint,
+                organization_source_title
+            from study_modules
+            where id = :module_id
+        """),
+        {"module_id": module_id},
+    ).fetchone()
+
+    if not row:
+        return {
+            "organization_mode": "infer",
+            "organization_blueprint": None,
+            "organization_source_title": None,
+        }
+
+    return {
+        "organization_mode": row[0] or "infer",
+        "organization_blueprint": row[1],
+        "organization_source_title": row[2],
+    }
+
+
+def _extract_blueprint_categories(organization: Optional[dict]) -> List[dict]:
+    if not organization:
+        return []
+
+    blueprint = organization.get("organization_blueprint")
+    if not isinstance(blueprint, dict):
+        return []
+
+    mode = (organization.get("organization_mode") or "infer").strip().lower()
+    categories: List[dict] = []
+    seen = set()
+
+    if mode == "manual":
+        for category in blueprint.get("categories") or []:
+            if not isinstance(category, dict):
+                continue
+            name = str(category.get("name") or "").strip()
+            if not name:
+                continue
+            normalized_name = name.upper()
+            if normalized_name in seen:
+                continue
+            seen.add(normalized_name)
+            description = str(category.get("description") or "").strip()
+            categories.append({
+                "name": normalized_name,
+                "description": re.sub(r"\s+", " ", description),
+                "topic_anchors": _extract_manual_topic_anchors(description),
+            })
+        return categories
+
+    return []
+
+
+def _extract_manual_topic_anchors(description: str) -> List[str]:
+    text_value = str(description or "").strip()
+    if not text_value:
+        return []
+
+    # Manual organization descriptions often use semicolons as an intentional
+    # mini-syllabus: "Category: anchor; anchor; anchor". Treat those entries as
+    # preferred coverage anchors, not as casual prose.
+    if ";" in text_value:
+        raw_items = re.split(r";+", text_value)
+    else:
+        raw_items = re.split(r"\n+", text_value)
+
+    anchors = []
+    seen = set()
+    for raw_item in raw_items:
+        item = re.sub(r"\s+", " ", str(raw_item or "")).strip(" .•-*")
+        if not item:
+            continue
+        if len(item) < 3 or len(item) > 120:
+            continue
+        normalized = item.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        anchors.append(item)
+        if len(anchors) >= 24:
+            break
+
+    return anchors
+
+
+def _extract_blueprint_category_names(organization: Optional[dict]) -> List[str]:
+    return [
+        category["name"]
+        for category in _extract_blueprint_categories(organization)
+    ]
+
+
+def _manual_category_anchor_map(organization: Optional[dict]) -> dict:
+    return {
+        category["name"]: category.get("topic_anchors") or []
+        for category in _extract_blueprint_categories(organization)
+    }
+
+
+def _taxonomy_anchor_tokens(text_value: str) -> set:
+    stopwords = {
+        "a", "an", "and", "as", "at", "by", "for", "in", "into", "of",
+        "on", "or", "the", "to", "with", "vs", "versus", "and/or",
+        "structure", "function", "physiology", "mechanism", "mechanisms",
+        "regulation", "system", "systems",
+    }
+    tokens = {
+        token
+        for token in re.findall(
+            r"[a-zA-ZÀ-ÖØ-öø-ÿ0-9]+",
+            str(text_value or "").casefold(),
+        )
+        if len(token) >= 3 and token not in stopwords
+    }
+    return tokens
+
+
+def _taxonomy_topic_stems(tokens: set) -> set:
+    canonical_tokens = {
+        "anatomical": "anatomy",
+        "articulations": "articulation",
+        "characteristics": "characteristic",
+        "features": "feature",
+        "ribs": "rib",
+        "vertebrae": "vertebra",
+    }
+    stems = set()
+    for token in tokens:
+        canonical_token = canonical_tokens.get(token, token)
+        stems.add(canonical_token)
+        for suffix in (
+            "zione",
+            "zioni",
+            "mente",
+            "mento",
+            "menti",
+            "azione",
+            "azioni",
+            "ing",
+            "ed",
+            "s",
+        ):
+            if canonical_token.endswith(suffix) and len(canonical_token) > len(suffix) + 3:
+                stems.add(canonical_token[:-len(suffix)])
+                break
+    return stems
+
+
+def _taxonomy_normalized_phrase(text_value: str) -> str:
+    text_value = unicodedata.normalize("NFKC", str(text_value or ""))
+    text_value = re.sub(r"[^a-zA-ZÀ-ÖØ-öø-ÿ0-9]+", " ", text_value.casefold())
+    return re.sub(r"\s+", " ", text_value).strip()
+
+
+def _taxonomy_class_labels(text_value: str) -> set:
+    normalized = _taxonomy_normalized_phrase(text_value)
+    return set(re.findall(r"\bclass\s+(a|b|ab|c)\b", normalized))
+
+
+def _manual_anchor_match_score(topic: dict, anchors: List[str]) -> float:
+    if not anchors:
+        return 0.0
+
+    topic_text = " ".join(
+        str(topic.get(field) or "")
+        for field in ("title", "topic", "description")
+    )
+    normalized_topic_text = re.sub(r"\s+", " ", topic_text.casefold())
+    topic_tokens = _taxonomy_anchor_tokens(topic_text)
+    if not topic_tokens:
+        return 0.0
+
+    best_score = 0.0
+    for anchor in anchors:
+        anchor_text = str(anchor or "").strip()
+        if not anchor_text:
+            continue
+
+        normalized_anchor = re.sub(r"\s+", " ", anchor_text.casefold())
+        anchor_tokens = _taxonomy_anchor_tokens(anchor_text)
+        if not anchor_tokens:
+            continue
+
+        overlap = topic_tokens & anchor_tokens
+        coverage = len(overlap) / max(1, len(anchor_tokens))
+        score = coverage
+
+        if normalized_anchor and normalized_anchor in normalized_topic_text:
+            score = max(score, 1.0)
+        elif len(overlap) >= 2:
+            score = max(score, coverage + 0.15)
+
+        best_score = max(best_score, min(score, 1.0))
+
+    return best_score
+
+
+def _manual_category_name_match_score(topic: dict, category_name: str) -> float:
+    topic_text = " ".join(
+        str(topic.get(field) or "")
+        for field in ("title", "topic", "description")
+    )
+    normalized_topic = _taxonomy_normalized_phrase(topic_text)
+    normalized_category = _taxonomy_normalized_phrase(category_name)
+    if not normalized_topic or not normalized_category:
+        return 0.0
+
+    topic_class_labels = _taxonomy_class_labels(topic_text)
+    category_class_labels = _taxonomy_class_labels(category_name)
+    if topic_class_labels or category_class_labels:
+        if topic_class_labels & category_class_labels:
+            return 0.82
+        if topic_class_labels and category_class_labels:
+            return 0.0
+
+    category_tokens = _taxonomy_anchor_tokens(category_name)
+    topic_tokens = _taxonomy_anchor_tokens(topic_text)
+    if not category_tokens or not topic_tokens:
+        return 0.0
+
+    overlap = category_tokens & topic_tokens
+    if not overlap:
+        return 0.0
+
+    category_coverage = len(overlap) / max(1, len(category_tokens))
+    topic_coverage = len(overlap) / max(1, len(topic_tokens))
+    score = max(category_coverage, min(0.8, topic_coverage + 0.1))
+
+    if normalized_category in normalized_topic:
+        score = max(score, 1.0)
+    elif len(overlap) >= 2:
+        score = max(score, category_coverage + 0.1)
+
+    return min(score, 1.0)
+
+
+def _manual_category_alias_score(candidate_name: str, allowed_name: str) -> float:
+    candidate_phrase = _taxonomy_normalized_phrase(candidate_name)
+    allowed_phrase = _taxonomy_normalized_phrase(allowed_name)
+    if not candidate_phrase or not allowed_phrase:
+        return 0.0
+    if candidate_phrase == allowed_phrase:
+        return 1.0
+    if candidate_phrase in allowed_phrase or allowed_phrase in candidate_phrase:
+        return 0.92
+
+    candidate_class_labels = _taxonomy_class_labels(candidate_name)
+    allowed_class_labels = _taxonomy_class_labels(allowed_name)
+    if candidate_class_labels or allowed_class_labels:
+        if candidate_class_labels and allowed_class_labels and not (
+            candidate_class_labels & allowed_class_labels
+        ):
+            return 0.0
+
+    candidate_tokens = _taxonomy_anchor_tokens(candidate_name)
+    allowed_tokens = _taxonomy_anchor_tokens(allowed_name)
+    if not candidate_tokens or not allowed_tokens:
+        return 0.0
+
+    overlap = candidate_tokens & allowed_tokens
+    if not overlap:
+        return 0.0
+
+    candidate_coverage = len(overlap) / max(1, len(candidate_tokens))
+    allowed_coverage = len(overlap) / max(1, len(allowed_tokens))
+    sequence_score = SequenceMatcher(None, candidate_phrase, allowed_phrase).ratio()
+
+    score = max(
+        min(1.0, candidate_coverage * 0.75 + allowed_coverage * 0.25),
+        sequence_score * 0.8,
+    )
+    if len(candidate_tokens) <= 2 and candidate_coverage >= 1.0:
+        score = max(score, 0.82)
+    return min(score, 1.0)
+
+
+def _resolve_manual_category_name(category_name: str, allowed_categories: List[str]) -> str:
+    normalized_name = str(category_name or "UNASSIGNED").strip().upper()
+    if normalized_name == "UNASSIGNED":
+        return "UNASSIGNED"
+    if normalized_name in allowed_categories:
+        return normalized_name
+
+    scored = sorted(
+        (
+            (_manual_category_alias_score(normalized_name, allowed_name), allowed_name)
+            for allowed_name in allowed_categories
+        ),
+        reverse=True,
+    )
+    if not scored:
+        return "UNASSIGNED"
+
+    best_score, best_name = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    if best_score >= 0.58 and (best_score - second_score >= 0.12 or best_score >= 0.86):
+        return best_name
+    return "UNASSIGNED"
+
+
+def _topic_title_text(topic: dict) -> str:
+    return str(topic.get("title") or topic.get("topic") or "").strip()
+
+
+def _topic_description_text(topic: dict) -> str:
+    return str(topic.get("description") or "").strip()
+
+
+def _topics_have_conflicting_class_labels(topic_a: dict, topic_b: dict) -> bool:
+    labels_a = _taxonomy_class_labels(_topic_title_text(topic_a))
+    labels_b = _taxonomy_class_labels(_topic_title_text(topic_b))
+    return bool(labels_a and labels_b and not (labels_a & labels_b))
+
+
+def _topic_core_tokens(title: str) -> set:
+    generic_topic_words = {
+        "anatomy",
+        "characteristic",
+        "composition",
+        "definition",
+        "difference",
+        "feature",
+        "function",
+        "functional",
+        "general",
+        "introduction",
+        "overview",
+        "structure",
+        "structural",
+        "type",
+    }
+    tokens = _taxonomy_topic_stems(_taxonomy_anchor_tokens(title))
+    core_tokens = tokens - generic_topic_words
+    return core_tokens or tokens
+
+
+def _manual_duplicate_topic_similarity(topic_a: dict, topic_b: dict) -> float:
+    if _topics_have_conflicting_class_labels(topic_a, topic_b):
+        return 0.0
+
+    title_a = _topic_title_text(topic_a)
+    title_b = _topic_title_text(topic_b)
+    phrase_a = _taxonomy_normalized_phrase(title_a)
+    phrase_b = _taxonomy_normalized_phrase(title_b)
+    if not phrase_a or not phrase_b:
+        return 0.0
+    if phrase_a == phrase_b:
+        return 1.0
+    if phrase_a in phrase_b or phrase_b in phrase_a:
+        return 0.92
+
+    tokens_a = _taxonomy_anchor_tokens(title_a)
+    tokens_b = _taxonomy_anchor_tokens(title_b)
+    if not tokens_a or not tokens_b:
+        return SequenceMatcher(None, phrase_a, phrase_b).ratio()
+
+    comparable_a = _taxonomy_topic_stems(tokens_a)
+    comparable_b = _taxonomy_topic_stems(tokens_b)
+    overlap = comparable_a & comparable_b
+    if len(overlap) < 2:
+        core_a = _topic_core_tokens(title_a)
+        core_b = _topic_core_tokens(title_b)
+        core_overlap = core_a & core_b
+        if (
+            len(core_overlap) == 1
+            and min(len(core_a), len(core_b)) == 1
+            and max(len(core_a), len(core_b)) <= 2
+        ):
+            return 0.68
+        return 0.0
+
+    containment = len(overlap) / max(1, min(len(comparable_a), len(comparable_b)))
+    jaccard = len(overlap) / max(1, len(comparable_a | comparable_b))
+    sequence_score = SequenceMatcher(None, phrase_a, phrase_b).ratio()
+    score = max(jaccard, containment * 0.82, sequence_score * 0.78)
+
+    core_a = _topic_core_tokens(title_a)
+    core_b = _topic_core_tokens(title_b)
+    core_overlap = core_a & core_b
+    if core_overlap:
+        core_containment = len(core_overlap) / max(1, min(len(core_a), len(core_b)))
+        if core_a == core_b:
+            score = max(score, 0.86)
+        elif len(core_overlap) >= 2 and core_containment >= 0.67:
+            score = max(score, 0.68)
+
+    return score
+
+
+def _merge_manual_duplicate_topic(primary: dict, duplicate: dict) -> dict:
+    merged = dict(primary)
+    primary_description = _topic_description_text(primary)
+    duplicate_description = _topic_description_text(duplicate)
+    if duplicate_description:
+        if not primary_description:
+            merged["description"] = duplicate_description
+        elif (
+            duplicate_description.casefold() not in primary_description.casefold()
+            and primary_description.casefold() not in duplicate_description.casefold()
+        ):
+            merged["description"] = f"{primary_description} {duplicate_description}"
+    return merged
+
+
+def _deduplicate_manual_category_topics(topics: List[dict]) -> List[dict]:
+    deduplicated: List[dict] = []
+    for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+
+        duplicate_index = None
+        for index, existing_topic in enumerate(deduplicated):
+            if _manual_duplicate_topic_similarity(existing_topic, topic) >= 0.62:
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            deduplicated.append(topic)
+        else:
+            deduplicated[duplicate_index] = _merge_manual_duplicate_topic(
+                deduplicated[duplicate_index],
+                topic,
+            )
+
+    return deduplicated
+
+
+def _deduplicate_taxonomy_topics(final_data: dict) -> dict:
+    cleaned_categories = []
+    for category in final_data.get("categories", []) or []:
+        if not isinstance(category, dict):
+            continue
+        cleaned_categories.append({
+            **category,
+            "topics": _deduplicate_manual_category_topics(
+                category.get("topics") or []
+            ),
+        })
+
+    return {
+        **final_data,
+        "categories": cleaned_categories,
+    }
+
+
+def _rescue_manual_unassigned_topics(
+    grouped_topics: dict,
+    organization: Optional[dict],
+) -> None:
+    unassigned_topics = list(grouped_topics.get("UNASSIGNED") or [])
+    if not unassigned_topics:
+        return
+
+    anchor_map = _manual_category_anchor_map(organization)
+    if not anchor_map:
+        return
+
+    rescued = []
+    remaining = []
+
+    for topic in unassigned_topics:
+        best_category = None
+        best_score = 0.0
+        for category_name, anchors in anchor_map.items():
+            score = max(
+                _manual_anchor_match_score(topic, anchors),
+                _manual_category_name_match_score(topic, category_name),
+            )
+            if score > best_score:
+                best_category = category_name
+                best_score = score
+
+        if best_category and best_score >= 0.45:
+            grouped_topics.setdefault(best_category, []).append(topic)
+            rescued.append((topic, best_category, best_score))
+        else:
+            remaining.append(topic)
+
+    grouped_topics["UNASSIGNED"] = remaining
+    if rescued:
+        print(
+            "🧭 MODULE ORGANIZATION GUARD: rescued UNASSIGNED topics",
+            [
+                {
+                    "topic": (
+                        topic.get("title")
+                        or topic.get("topic")
+                        or ""
+                    ),
+                    "category": category_name,
+                    "score": round(score, 3),
+                }
+                for topic, category_name, score in rescued
+            ],
+        )
+
+
+def _uses_authoritative_student_organization(
+    organization: Optional[dict],
+) -> bool:
+    mode = (organization or {}).get("organization_mode") or "infer"
+    return (
+        str(mode).strip().lower() == "manual"
+        and bool(_extract_blueprint_categories(organization))
+    )
+
+
+def _syllabus_text(organization: Optional[dict]) -> str:
+    if not organization:
+        return ""
+
+    if str(organization.get("organization_mode") or "").strip().lower() != "syllabus":
+        return ""
+
+    blueprint = organization.get("organization_blueprint")
+    if not isinstance(blueprint, dict):
+        return ""
+
+    return str(blueprint.get("syllabus_text") or "").strip()
+
+
+def _clean_syllabus_line(raw_line: str) -> str:
+    line = str(raw_line or "").strip()
+    line = re.sub(r"^[\-\*\u2022]\s+", "", line)
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def _classify_syllabus_line(line: str) -> dict:
+    upper_line = line.upper()
+
+    if re.match(r"^(PARTE|PART)\s+", upper_line):
+        return {"level": 1, "kind": "part"}
+
+    if re.match(r"^(CAPITOLO|CHAPTER)\s+", upper_line):
+        return {"level": 2, "kind": "chapter"}
+
+    if re.match(
+        r"^(SEZIONE|SECTION|UNIT[ÀA]?|MODULO|MODULE|LEZIONE|LESSON)\s+",
+        upper_line,
+    ):
+        return {"level": 2, "kind": "section"}
+
+    dotted_match = re.match(r"^(\d+(?:\.\d+)+)\s*[\).\-\–\—:]?\s+", line)
+    if dotted_match:
+        return {
+            "level": 3 + dotted_match.group(1).count("."),
+            "kind": "numbered_subsection",
+        }
+
+    integer_match = re.match(r"^(\d+)\s*[\).\-\–\—:]\s+", line)
+    if integer_match:
+        return {"level": 3, "kind": "numbered_item"}
+
+    return {"level": 3, "kind": "heading"}
+
+
+def _syllabus_display_title(line: str, kind: str) -> str:
+    title = str(line or "").strip()
+
+    if kind == "part":
+        title = re.sub(
+            r"^(PARTE|PART)\s+[^\-–—:]+[\-–—:]\s*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+    elif kind == "chapter":
+        title = re.sub(
+            r"^(CAPITOLO|CHAPTER)\s+[^\-–—:]+[\-–—:]\s*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+    elif kind == "section":
+        title = re.sub(
+            r"^(SEZIONE|SECTION|UNIT[ÀA]?|MODULO|MODULE|LEZIONE|LESSON)\s+[^\-–—:]+[\-–—:]\s*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+    elif kind in {"numbered_item", "numbered_subsection"}:
+        title = re.sub(
+            r"^\d+(?:\.\d+)*\s*[\).\-\–\—:]?\s+",
+            "",
+            title,
+        ).strip()
+
+    title = title.strip(" .")
+    return re.sub(r"\s+", " ", title).strip() or line
+
+
+def _is_structural_syllabus_label(title: str) -> bool:
+    normalized = _taxonomy_normalized_phrase(title)
+    if not normalized:
+        return False
+    return bool(re.match(
+        r"^(capitolo|chapter|parte|part|sezione|section|unit[àa]?|modulo|module|lezione|lesson)(?:\s+[ivxlcdm0-9]+)?$",
+        normalized,
+    ))
+
+
+def _parse_syllabus_outline(organization: Optional[dict]) -> List[dict]:
+    text_value = _syllabus_text(organization)
+    if not text_value:
+        return []
+
+    outline = []
+    for raw_line in text_value.splitlines():
+        line = _clean_syllabus_line(raw_line)
+        if not line:
+            continue
+        if len(line) > 180:
+            line = line[:180].rstrip() + "..."
+
+        classification = _classify_syllabus_line(line)
+        display_title = _syllabus_display_title(
+            line,
+            classification["kind"],
+        )
+        outline.append({
+            "text": line,
+            "display_title": display_title,
+            "level": classification["level"],
+            "kind": classification["kind"],
+        })
+
+    return outline[:120]
+
+
+def _syllabus_likely_category_items(outline: List[dict]) -> List[dict]:
+    explicit_categories = [
+        item
+        for item in outline
+        if item["kind"] in {"chapter", "section"}
+        and item.get("display_title")
+        and not _is_structural_syllabus_label(item.get("display_title") or "")
+    ]
+    if explicit_categories:
+        return explicit_categories[:30]
+
+    numbered_items = [
+        item
+        for item in outline
+        if item["kind"] == "numbered_item"
+        and item.get("display_title")
+        and not _is_structural_syllabus_label(item.get("display_title") or "")
+    ]
+    parts = [item for item in outline if item["kind"] == "part"]
+
+    # Many university syllabi use PART as a broad container and then place the
+    # real course units at integer-numbered level: PART -> 1, 2, 3 -> details.
+    # In that shape the numbered units are the best visible DOUNO categories,
+    # while PART remains macro context.
+    if parts and len(numbered_items) >= 3:
+        return numbered_items[:30]
+
+    return []
+
+
+def _build_syllabus_structure_instruction(
+    organization: Optional[dict],
+) -> str:
+    outline = _parse_syllabus_outline(organization)
+    if not outline:
+        return ""
+
+    rendered_lines = []
+    for item in outline:
+        indent = "  " * max(0, min(item["level"] - 1, 4))
+        rendered_lines.append(
+            (
+                f"{indent}- [{item['kind']}, level {item['level']}] "
+                f"{item['text']} "
+                f"(display title: {item['display_title']})"
+            )
+        )
+
+    rendered_outline = "\n".join(rendered_lines)
+    likely_category_items = _syllabus_likely_category_items(outline)
+    likely_category_titles = [
+        item["display_title"].upper()
+        for item in likely_category_items
+        if item.get("display_title")
+    ][:30]
+    category_level_explanation = (
+        "The index contains explicit chapter/section headings; those are the "
+        "best category-level candidates."
+        if likely_category_items
+        and likely_category_items[0]["kind"] in {"chapter", "section"}
+        else (
+            "The index uses PART headings as broad containers and integer "
+            "numbered items as the real course units. Use the numbered items "
+            "as the visible category-level study blocks; keep PART headings "
+            "only as macro context."
+        )
+        if likely_category_items
+        else "No clear category-level candidates were detected."
+    )
+    likely_category_text = (
+        "\n".join(f"- {title}" for title in likely_category_titles)
+        if likely_category_titles
+        else "- No clear chapter/category headings detected."
+    )
+
+    return f"""
+                STUDENT-PROVIDED INDEX / SYLLABUS:
+                - The pasted text below is structural evidence, not a flat
+                  category list.
+                - Preserve its source order and hierarchy when useful.
+                - Do NOT turn every index line into a category.
+                - Interpret likely hierarchy levels:
+                  PARTE / PART = broad area or macro context, not normally the
+                  visible category if it contains numbered course units.
+                  CAPITOLO / CHAPTER = likely category-level teaching block.
+                  Numbered items under a PART = likely category-level teaching
+                  blocks when no CHAPTER / SECTION headings are present.
+                  Numbered items under a CHAPTER / SECTION = likely topic-level
+                  material.
+                  Dotted numbering = likely subtopic/detail material.
+                - If the index is too detailed, create a compact taxonomy by
+                  grouping numbered items under the relevant chapter/category.
+                - Use the uploaded material to confirm whether an index heading
+                  is important enough to become a category or should remain a
+                  topic/detail.
+                - When a category comes from an index heading, preserve the
+                  source title as written in the index.
+                - You may remove structural prefixes such as "CAPITOLO PRIMO –"
+                  or "SEZIONE 1 –", but do NOT paraphrase, shorten, or rename
+                  the actual title.
+                - Example: "CAPITOLO TERZO – Le operazioni di gestione: prime
+                  riflessioni" should become "LE OPERAZIONI DI GESTIONE: PRIME
+                  RIFLESSIONI", not just "OPERAZIONI DI GESTIONE".
+                - For topic-level items, the index is a guide to the correct
+                  source structure, not text to copy literally.
+                - Convert long topic-level index headings into concise,
+                  study-friendly topic titles while preserving their meaning and
+                  source order.
+                - Do not drift away from the index: a student should recognize
+                  where each topic came from in the original outline.
+                - Generic index labels such as "Premessa", "Introduzione",
+                  "Conclusioni", or "Riepilogo" should usually become context
+                  inside the nearest real topic, not standalone topics, unless
+                  the uploaded material clearly teaches substantial content
+                  under that heading.
+                - If two adjacent index lines express the same learning unit,
+                  merge them into one topic and preserve the extra detail in
+                  the description.
+
+                Category-level interpretation:
+                {category_level_explanation}
+
+                Likely category display titles from the index:
+                {likely_category_text}
+
+                Parsed syllabus outline:
+                {rendered_outline}
+            """
+
+
+def _build_module_organization_instruction(
+    organization: Optional[dict],
+) -> str:
+    mode = (organization or {}).get("organization_mode") or "infer"
+    if str(mode).strip().lower() == "syllabus":
+        return _build_syllabus_structure_instruction(organization)
+
+    categories = _extract_blueprint_categories(organization)
+    if not categories:
+        return ""
+
+    category_lines = []
+    for category in categories:
+        line = f"- {category['name']}"
+        if category.get("description"):
+            line += f": {category['description']}"
+        anchors = category.get("topic_anchors") or []
+        if anchors:
+            line += (
+                "\n  Preferred topic anchors: "
+                + "; ".join(anchors)
+            )
+        category_lines.append(line)
+
+    category_list = "\n".join(category_lines)
+
+    return f"""
+                STUDENT-PROVIDED MODULE ORGANIZATION:
+                - Organization mode: {mode}.
+                - Treat the following category list as the authoritative
+                  organization for this Study Module.
+                - Do NOT invent alternative category names when a generated
+                  topic fits one of these categories.
+                - Assign each generated topic to exactly one of these
+                  categories whenever possible.
+                - Use the category descriptions as semantic assignment hints.
+                  A topic should be assigned by the intended meaning of the
+                  category, not only by exact word matching.
+                - When a category description contains a semicolon-separated
+                  list, treat those items as the student's preferred topic
+                  anchors for that category.
+                - Prefer creating topics that match or consolidate those
+                  anchors before inventing different topic titles.
+                - Do not copy an anchor if the uploaded material provides no
+                  meaningful evidence for it.
+                - Create an additional topic outside the anchors only when the
+                  uploaded material clearly contains substantial study content
+                  that is not covered by the student's anchor list.
+                - If a topic is meaningful but does not clearly fit any listed
+                  category, place it in the category UNASSIGNED.
+                - Keep topic titles and descriptions grounded in the uploaded
+                  study material.
+
+                ALLOWED CATEGORIES:
+                {category_list}
+                - UNASSIGNED
+            """
+
+
+def _build_student_taxonomy_granularity_instruction(
+    organization: Optional[dict],
+) -> str:
+    if not _uses_authoritative_student_organization(organization):
+        return ""
+
+    anchor_map = _manual_category_anchor_map(organization)
+    anchor_lines = []
+    for category_name, anchors in anchor_map.items():
+        if anchors:
+            anchor_lines.append(
+                f"- {category_name}: " + "; ".join(anchors)
+            )
+    anchor_text = (
+        "\n".join(anchor_lines)
+        if anchor_lines
+        else "- No explicit preferred topic anchors were provided."
+    )
+
+    return f"""
+                STUDENT TAXONOMY GRANULARITY:
+                - The student-provided categories are broad study containers.
+                  Do not fragment them into one topic per definition, paragraph,
+                  heading, list item, legal article, example, or procedural step.
+                - If preferred topic anchors are provided for a category, use
+                  them as the first candidate topic set for that category.
+                - Prefer matching, merging, or lightly normalizing those anchor
+                  titles instead of generating a different topic map from
+                  scratch.
+                - Before finalizing a category, verify that its preferred
+                  anchors with meaningful source evidence are represented by
+                  either a matching topic title or a clearly broader topic
+                  description.
+                - Do not collapse a category to only two or three topics when
+                  the student provided many distinct anchors and the uploaded
+                  material contains enough evidence for them.
+                - Treat anchors as coverage targets: source content related to
+                  an anchor should be assigned to that anchor's topic whenever
+                  the match is pedagogically reasonable.
+                - If multiple anchors are tightly overlapping in the uploaded
+                  material, merge them into one broader topic and mention both
+                  anchors in the description.
+                - If the uploaded material has major content not represented
+                  by any anchor, create a new grounded topic rather than hiding
+                  that material.
+                - A Study Topic should be a meaningful learning unit that can
+                  support multiple quiz questions, flashcards, and a focused
+                  study session.
+                - When several terms or definitions are explained together in
+                  the same local passage, merge them into one broader topic and
+                  mention the grouped concepts in the description.
+                - Prefer fewer, stronger topics inside each student category.
+                  As a guideline, compact modules should usually have about
+                  3-8 substantial topics per category unless the source clearly
+                  contains more independent teaching blocks.
+                - Keep topics separate only when they represent distinct
+                  learning objectives, different procedural phases, or clearly
+                  independent source sections with enough material.
+                - Use UNASSIGNED only for meaningful material that genuinely
+                  does not fit any student-provided category.
+                - In manual mode, UNASSIGNED is a last resort. If a topic
+                  overlaps a category anchor, place it in that category rather
+                  than UNASSIGNED.
+
+                PREFERRED TOPIC ANCHORS BY CATEGORY:
+                {anchor_text}
+            """
+
+
+def _build_student_taxonomy_category_first_instruction(
+    organization: Optional[dict],
+) -> str:
+    if not _uses_authoritative_student_organization(organization):
+        return ""
+
+    return """
+                STUDENT TAXONOMY STRATEGY:
+                - Because the student supplied the module organization, the
+                  allowed categories are the PRIMARY structure.
+                - First decide which allowed student category the source
+                  material belongs to.
+                - Only after that, create compact Study Topics inside that
+                  category.
+                - Do not create a topic first and then loosely fit it into a
+                  category. Category assignment comes first.
+                - Do not let temporary source headings override the
+                  student-provided category structure.
+                - If the source contains many small headings or definitions
+                  inside one student category, consolidate them into a smaller
+                  number of broader topics.
+                - The final taxonomy should feel like the student's category
+                  list filled with meaningful study units, not like a
+                  fragmented index of every sentence or heading in the file.
+                - If the student provided preferred topic anchors inside a
+                  category description, keep topic generation inside that
+                  category aligned with those anchors whenever the uploaded
+                  source supports them.
+            """
+
+
+def _build_taxonomy_planning_material(
+    all_chunks: List[dict],
+    max_chunks: int = 90,
+    max_chars_per_chunk: int = 700,
+) -> str:
+    sampled_chunks = _sample_taxonomy_planning_chunks(
+        all_chunks,
+        max_chunks=max_chunks,
+    )
+
+    material_parts = []
+    for chunk in sampled_chunks:
+        text_sample = re.sub(
+            r"\s+",
+            " ",
+            str(chunk.get("text") or "")
+        ).strip()
+        if len(text_sample) > max_chars_per_chunk:
+            text_sample = text_sample[:max_chars_per_chunk].rstrip() + "..."
+
+        material_parts.append(
+            (
+                f"SECTION: {chunk.get('section') or 'GENERAL'}\n"
+                f"SOURCE: {chunk.get('document') or 'Document'}"
+                f" | PAGE: {chunk.get('page') if chunk.get('page') is not None else 'n/a'}"
+                f" | SOURCE_BLOCK: {chunk.get('chunk_id')}\n"
+                f"{text_sample}"
+            )
+        )
+
+    return "\n\n---\n\n".join(material_parts)
+
+
+def _sample_taxonomy_planning_chunks(
+    all_chunks: List[dict],
+    max_chunks: int = 90,
+) -> List[dict]:
+    if not all_chunks:
+        return []
+
+    if len(all_chunks) <= max_chunks:
+        return list(all_chunks)
+
+    sampled_chunks = []
+    step = max(1, math.floor(len(all_chunks) / max_chunks))
+    for index in range(0, len(all_chunks), step):
+        sampled_chunks.append(all_chunks[index])
+        if len(sampled_chunks) >= max_chunks:
+            break
+
+    return sampled_chunks
+
+
+def _normalize_taxonomy_planning_result(
+    raw_plan: dict,
+    organization: Optional[dict],
+) -> dict:
+    blueprint_categories = _extract_blueprint_category_names(organization)
+    anchor_map = _manual_category_anchor_map(organization)
+    allowed_categories = (
+        set(blueprint_categories)
+        if _uses_authoritative_student_organization(organization)
+        else set()
+    )
+    categories = []
+    seen = set()
+
+    for category in raw_plan.get("categories") or []:
+        if not isinstance(category, dict):
+            continue
+
+        name = str(category.get("name") or "").strip().upper()
+        if not name:
+            continue
+
+        if allowed_categories and name not in allowed_categories:
+            if name != "UNASSIGNED":
+                continue
+
+        if name in seen:
+            continue
+
+        seen.add(name)
+        try:
+            target_topic_count = int(category.get("target_topic_count") or 0)
+        except Exception:
+            target_topic_count = 0
+
+        target_topic_count = max(1, min(target_topic_count or 5, 12))
+        anchors = anchor_map.get(name) or []
+        anchor_guidance = (
+            " Preferred topic anchors: " + "; ".join(anchors)
+            if anchors
+            else ""
+        )
+
+        categories.append({
+            "name": name,
+            "role": re.sub(
+                r"\s+",
+                " ",
+                (str(category.get("role") or "").strip() + anchor_guidance)
+            )[:350],
+            "source_focus": re.sub(
+                r"\s+",
+                " ",
+                (str(category.get("source_focus") or "").strip() + anchor_guidance)
+            )[:350],
+            "topic_granularity": re.sub(
+                r"\s+",
+                " ",
+                (
+                    str(category.get("topic_granularity") or "").strip()
+                    + anchor_guidance
+                )
+            )[:350],
+            "target_topic_count": target_topic_count,
+        })
+
+    if allowed_categories:
+        planned_names = {category["name"] for category in categories}
+        for category_name in blueprint_categories:
+            if category_name not in planned_names:
+                categories.append({
+                    "name": category_name,
+                    "role": "Student-provided category.",
+                    "source_focus": "Assign relevant source material by meaning.",
+                    "topic_granularity": (
+                        "Create a compact set of broad study topics, not one "
+                        "topic per local heading or definition."
+                        + (
+                            " Preferred topic anchors: "
+                            + "; ".join(anchor_map.get(category_name) or [])
+                            if anchor_map.get(category_name)
+                            else ""
+                        )
+                    ),
+                    "target_topic_count": 5,
+                })
+
+    return {
+        "strategy": re.sub(
+            r"\s+",
+            " ",
+            str(raw_plan.get("strategy") or "").strip()
+        )[:600],
+        "categories": categories[:30],
+        "merge_guidance": re.sub(
+            r"\s+",
+            " ",
+            str(raw_plan.get("merge_guidance") or "").strip()
+        )[:600],
+    }
+
+
+def _build_taxonomy_plan_instruction(plan: Optional[dict]) -> str:
+    if not plan or not plan.get("categories"):
+        return ""
+
+    category_lines = []
+    for category in plan["categories"]:
+        category_lines.append(
+            (
+                f"- {category['name']} "
+                f"(target topics: about {category['target_topic_count']}): "
+                f"{category.get('role') or 'Study category.'} "
+                f"Source focus: {category.get('source_focus') or 'Relevant source material.'} "
+                f"Granularity: {category.get('topic_granularity') or 'Compact study topics.'}"
+            )
+        )
+
+    categories_text = "\n".join(category_lines)
+    strategy = plan.get("strategy") or (
+        "Use source structure and student organization to create compact, "
+        "recognizable study units."
+    )
+    merge_guidance = plan.get("merge_guidance") or (
+        "Merge local headings, definitions, and examples when they belong to "
+        "the same learning objective."
+    )
+
+    return f"""
+                TAXONOMY PLANNING GUIDE:
+                - Before generating topics, follow this module-level plan.
+                - This plan is guidance for taxonomy shape and granularity; it
+                  does not replace the source content.
+                - Do not create categories or topic granularity that contradicts
+                  this plan unless the source material clearly requires it.
+
+                Overall strategy:
+                {strategy}
+
+                Planned categories and topic granularity:
+                {categories_text}
+
+                Merge guidance:
+                {merge_guidance}
+            """
+
+
+def _generate_taxonomy_plan(
+    client: OpenAI,
+    all_chunks: List[dict],
+    language_instruction: str,
+    module_organization_instruction: str,
+    student_taxonomy_category_first_instruction: str,
+    student_taxonomy_granularity_instruction: str,
+    organization: Optional[dict],
+    diagnostics: Optional[dict] = None,
+) -> Optional[dict]:
+    planning_material = _build_taxonomy_planning_material(all_chunks)
+    if not planning_material:
+        if diagnostics is not None:
+            diagnostics.update({
+                "planner_status": "skipped",
+                "planner_reason": "no_planning_material",
+                "planner_sampled_chunks": 0,
+                "planner_prompt_chars": 0,
+            })
+        return None
+
+    organization_mode = (organization or {}).get("organization_mode") or "infer"
+    sampled_chunks = _sample_taxonomy_planning_chunks(all_chunks)
+    organization_blueprint = (
+        (organization or {}).get("organization_blueprint")
+        if isinstance((organization or {}).get("organization_blueprint"), dict)
+        else {}
+    )
+    has_student_categories = bool(_extract_blueprint_category_names(organization))
+    has_student_index = bool(
+        str(organization_blueprint.get("syllabus_text") or "").strip()
+    )
+
+    student_mode_instruction = ""
+    if _uses_authoritative_student_organization(organization):
+        student_mode_instruction = """
+        MANUAL STUDENT ORGANIZATION MODE:
+        - The student-provided categories are authoritative.
+        - Do not invent alternative categories.
+        - Preserve the exact student category names; do not shorten,
+          translate, rename, or paraphrase them.
+        - Build a plan that fills each student category with a compact number
+          of broad, useful study topics.
+        - Merge local duplicate or overlapping source items into one useful
+          study topic instead of creating repeated topics.
+        - If source material does not fit any student category, reserve it for
+          UNASSIGNED.
+        """
+    elif str(organization_mode).strip().lower() == "syllabus":
+        student_mode_instruction = """
+        SYLLABUS / INDEX MODE:
+        - The pasted index is authoritative structural evidence, not a flat
+          allowed-category list.
+        - Infer a compact category plan from the index hierarchy and the
+          uploaded material.
+        - Usually, broad chapter-like headings become categories and numbered
+          items become topics or topic details.
+        - Do not create one category for every index line.
+        - Do not preserve excessive index detail if it would fragment the study
+          taxonomy.
+        - For categories derived from chapter/section headings, preserve the
+          source title from the index. Remove only structural prefixes such as
+          "CAPITOLO PRIMO –"; do not paraphrase or shorten the actual heading.
+        - For topic-level index lines, preserve the meaning and source order,
+          but rewrite very long headings into concise study-friendly topic
+          titles.
+        - Generic lines such as "Premessa", "Introduzione", "Conclusioni", or
+          "Riepilogo" should normally be absorbed into the nearest meaningful
+          topic rather than becoming standalone topics.
+        - The final plan should remain visibly derived from the index, but it
+          should not look like a raw table of contents.
+        """
+    else:
+        student_mode_instruction = """
+        AUTOMATIC ORGANIZATION MODE:
+        - Infer only the major category-level teaching blocks from the source.
+        - Do not promote every heading, paragraph title, definition, article,
+          numbered item, example, or local list into a category.
+        - Smaller headings should usually become topics or details inside a
+          broader category.
+        - Prefer a compact category plan that a student can recognize and use.
+        - Prefer fewer, stronger categories and topics over a fragmented map.
+        - Treat examples, brief applications, local warnings, and one-off
+          observations as topic details unless they are taught as independent
+          study units with substantial source material.
+        """
+
+    prompt = f"""
+    Act as a document-aware educational taxonomist.
+
+    Your task is NOT to generate the final taxonomy yet.
+    Your task is to create a compact TAXONOMY PLAN that will guide later topic
+    generation.
+
+    Read the source samples in order and decide:
+    - the intended category-level organization;
+    - which kind of material belongs in each category;
+    - the approximate number of broad Study Topics each category should contain;
+    - which local headings, definitions, lists, examples, or legal/article items
+      should be merged instead of becoming standalone topics.
+
+    IMPORTANT PRINCIPLE:
+    Headings are evidence, not automatic taxonomy nodes.
+    Depending on content, a heading may represent:
+    - a category;
+    - a topic;
+    - a local detail inside a topic;
+    - or only contextual text.
+
+    {language_instruction}
+
+    {module_organization_instruction}
+
+    {student_taxonomy_category_first_instruction}
+
+    {student_taxonomy_granularity_instruction}
+
+    {student_mode_instruction}
+
+    OUTPUT RULES:
+    - Return ONLY valid JSON.
+    - Keep the plan compact.
+    - Do not list final topics.
+    - Do not summarize the whole document.
+    - Use category names in the requested taxonomy language.
+    - Use UPPERCASE category names.
+    - target_topic_count is a guideline, not a hard cap.
+    - For compact documents, avoid plans that would produce dozens of topics
+      unless the source clearly contains many independent study units.
+    - The plan should explicitly encourage merging local examples, repeated
+      phase names, small heading variants, and narrow details into broader
+      study topics when they serve the same learning objective.
+
+    JSON FORMAT:
+    {{
+      "strategy": "short overall strategy",
+      "categories": [
+        {{
+          "name": "CATEGORY NAME",
+          "role": "what this category should contain",
+          "source_focus": "which source areas or concepts belong here",
+          "topic_granularity": "how broad topics should be inside this category",
+          "target_topic_count": 5
+        }}
+      ],
+      "merge_guidance": "what kinds of small items should be merged"
+    }}
+
+    ORGANIZATION MODE:
+    {organization_mode}
+
+    SOURCE SAMPLES:
+    {planning_material}
+    """
+    prompt_chars = len(prompt)
+    planner_started = time.perf_counter()
+    planner_diagnostics = {
+        "planner_model": TAXONOMY_PLANNER_MODEL,
+        "planner_timeout_seconds": TAXONOMY_PLANNER_REQUEST_TIMEOUT_SECONDS,
+        "planner_max_output_tokens": TAXONOMY_PLANNER_MAX_OUTPUT_TOKENS,
+        "planner_sampled_chunks": len(sampled_chunks),
+        "planner_prompt_chars": prompt_chars,
+        "planner_organization_mode": organization_mode,
+        "planner_has_student_categories": has_student_categories,
+        "planner_has_student_index": has_student_index,
+    }
+    if diagnostics is not None:
+        diagnostics.update(planner_diagnostics)
+
+    print(
+        "🧭 TAXONOMY PLANNER REQUEST:",
+        {
+            "model": TAXONOMY_PLANNER_MODEL,
+            "timeout_seconds": TAXONOMY_PLANNER_REQUEST_TIMEOUT_SECONDS,
+            "max_output_tokens": TAXONOMY_PLANNER_MAX_OUTPUT_TOKENS,
+            "sampled_chunks": len(sampled_chunks),
+            "prompt_chars": prompt_chars,
+            "organization_mode": organization_mode,
+            "has_student_categories": has_student_categories,
+            "has_student_index": has_student_index,
+        },
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=TAXONOMY_PLANNER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            timeout=TAXONOMY_PLANNER_REQUEST_TIMEOUT_SECONDS,
+            max_tokens=TAXONOMY_PLANNER_MAX_OUTPUT_TOKENS,
+        )
+        raw_plan = json.loads(
+            response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+        )
+        normalized_plan = _normalize_taxonomy_planning_result(raw_plan, organization)
+        target_topic_total = sum(
+            int(category.get("target_topic_count") or 0)
+            for category in normalized_plan.get("categories") or []
+        )
+        elapsed = time.perf_counter() - planner_started
+        success_diagnostics = {
+            "planner_status": "success",
+            "planner_elapsed_seconds": round(elapsed, 3),
+            "planner_category_count": len(normalized_plan.get("categories") or []),
+            "planner_target_topic_total": target_topic_total,
+        }
+        if diagnostics is not None:
+            diagnostics.update(success_diagnostics)
+        print("🧭 TAXONOMY PLANNER SUCCESS:", success_diagnostics)
+        return normalized_plan
+    except Exception as exc:
+        elapsed = time.perf_counter() - planner_started
+        error_diagnostics = {
+            "planner_status": "error",
+            "planner_elapsed_seconds": round(elapsed, 3),
+            "planner_error_type": exc.__class__.__name__,
+            "planner_error_message": str(exc)[:300],
+        }
+        if diagnostics is not None:
+            diagnostics.update(error_diagnostics)
+        print("🧭 TAXONOMY PLANNER ERROR:", error_diagnostics)
+        raise
+
+
+def _apply_module_organization_category_guard(
+    final_data: dict,
+    organization: Optional[dict],
+) -> dict:
+    if not _uses_authoritative_student_organization(organization):
+        return final_data
+
+    allowed_category_names = _extract_blueprint_category_names(organization)
+    if not allowed_category_names:
+        return final_data
+
+    guarded_categories = []
+    grouped_topics = {}
+
+    for category in final_data.get("categories", []) or []:
+        category_name = str(category.get("name") or "UNASSIGNED").strip().upper()
+        category_name = _resolve_manual_category_name(
+            category_name,
+            allowed_category_names,
+        )
+
+        grouped_topics.setdefault(category_name, []).extend(
+            category.get("topics") or []
+        )
+
+    _rescue_manual_unassigned_topics(grouped_topics, organization)
+
+    for category_name in allowed_category_names:
+        topics = grouped_topics.pop(category_name, [])
+        if topics:
+            guarded_categories.append({
+                "name": category_name,
+                "topics": _deduplicate_manual_category_topics(topics),
+            })
+
+    if grouped_topics.get("UNASSIGNED"):
+        guarded_categories.append({
+            "name": "UNASSIGNED",
+            "topics": _deduplicate_manual_category_topics(
+                grouped_topics["UNASSIGNED"]
+            ),
+        })
+
+    return {
+        **final_data,
+        "categories": guarded_categories,
+    }
+
+
+def _syllabus_structural_category_replacements(
+    organization: Optional[dict],
+) -> List[str]:
+    outline = _parse_syllabus_outline(organization)
+    replacements = []
+    for index, item in enumerate(outline):
+        display_title = item.get("display_title") or ""
+        if not _is_structural_syllabus_label(display_title):
+            continue
+
+        for next_item in outline[index + 1:]:
+            next_title = str(next_item.get("display_title") or "").strip()
+            if not next_title:
+                continue
+            if _is_structural_syllabus_label(next_title):
+                break
+            if next_item.get("kind") in {
+                "chapter",
+                "section",
+                "heading",
+                "numbered_item",
+            }:
+                replacements.append(next_title.upper())
+                break
+
+    return replacements
+
+
+def _apply_syllabus_category_guard(
+    final_data: dict,
+    organization: Optional[dict],
+) -> dict:
+    if str((organization or {}).get("organization_mode") or "").strip().lower() != "syllabus":
+        return final_data
+
+    replacements = _syllabus_structural_category_replacements(organization)
+    if not replacements:
+        return _deduplicate_taxonomy_topics(final_data)
+
+    replacement_index = 0
+    guarded_categories = []
+    used_names = set()
+
+    for category in final_data.get("categories", []) or []:
+        if not isinstance(category, dict):
+            continue
+
+        category_name = str(category.get("name") or "").strip().upper()
+        if _is_structural_syllabus_label(category_name) and replacement_index < len(replacements):
+            category_name = replacements[replacement_index]
+            replacement_index += 1
+
+        if not category_name:
+            continue
+
+        if category_name in used_names:
+            for existing_category in guarded_categories:
+                if existing_category["name"] == category_name:
+                    existing_category["topics"].extend(category.get("topics") or [])
+                    break
+            continue
+
+        used_names.add(category_name)
+        guarded_categories.append({
+            **category,
+            "name": category_name,
+            "topics": category.get("topics") or [],
+        })
+
+    return _deduplicate_taxonomy_topics({
+        **final_data,
+        "categories": guarded_categories,
+    })
+
+
+def _serialize_study_module(row) -> dict:
+    return {
+        "id": str(row[0]),
+        "project_id": str(row[1]),
+        "name": row[2],
+        "order_index": int(row[3]),
+        "created_at": str(row[4]) if row[4] is not None else None,
+        "status": row[5],
+        "taxonomy_status": row[6],
+        "accepted_for_study": bool(row[7]),
+        "accepted_at": str(row[8]) if row[8] is not None else None,
+        "organization_mode": row[9] if len(row) > 9 else None,
+        "organization_blueprint": row[10] if len(row) > 10 else None,
+        "organization_source_title": row[11] if len(row) > 11 else None,
+    }
+
+
+def _require_owned_project(db, project_id: str, user_id: str) -> None:
+    project = db.execute(
+        text("""
+            select id
+            from projects
+            where id = :project_id
+              and user_id = :user_id
+        """),
+        {
+            "project_id": project_id,
+            "user_id": user_id,
+        },
+    ).fetchone()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
+def _fetch_owned_study_module(db, project_id: str, module_id: str, user_id: str):
+    organization_columns = _study_module_organization_select_columns(db)
+    row = db.execute(
+        text(f"""
+            select
+                m.id,
+                m.project_id,
+                m.name,
+                m.order_index,
+                m.created_at,
+                m.status,
+                m.taxonomy_status,
+                m.accepted_for_study,
+                m.accepted_at,
+                {organization_columns}
+            from study_modules m
+            join projects p on p.id = m.project_id
+            where m.id = :module_id
+              and m.project_id = :project_id
+              and p.user_id = :user_id
+        """),
+        {
+            "module_id": module_id,
+            "project_id": project_id,
+            "user_id": user_id,
+        },
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Study module not found")
+
+    return row
+
+
 @app.get("/projects")
 def list_projects(
     user = Depends(verify_user)
@@ -2310,6 +4182,225 @@ def list_projects(
             for r in rows
         ]
     }
+
+
+@app.get("/projects/{project_id}/modules", response_model=StudyModuleListResponse)
+def list_study_modules(
+    project_id: str,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    db = SessionLocal()
+
+    try:
+        _require_owned_project(db, project_id, user_id)
+        organization_columns = _study_module_organization_select_columns(db)
+
+        rows = db.execute(
+            text(f"""
+                select
+                    id,
+                    project_id,
+                    name,
+                    order_index,
+                    created_at,
+                    status,
+                    taxonomy_status,
+                    accepted_for_study,
+                    accepted_at,
+                    {organization_columns}
+                from study_modules
+                where project_id = :project_id
+                order by order_index asc, created_at asc, id asc
+            """),
+            {"project_id": project_id},
+        ).fetchall()
+
+        return {"modules": [_serialize_study_module(row) for row in rows]}
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/modules", response_model=StudyModuleResponse)
+def create_study_module(
+    project_id: str,
+    data: StudyModuleCreateRequest,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    module_name = (data.name or "").strip()
+
+    if not module_name:
+        raise HTTPException(status_code=400, detail="Module name is required")
+
+    organization = _normalize_study_module_organization(
+        data.organization_mode,
+        data.organization_blueprint,
+        data.organization_source_title,
+    )
+
+    db = SessionLocal()
+    module_id = str(uuid.uuid4())
+
+    try:
+        _require_owned_project(db, project_id, user_id)
+
+        order_index = db.execute(
+            text("""
+                select coalesce(max(order_index), 0) + 1
+                from study_modules
+                where project_id = :project_id
+            """),
+            {"project_id": project_id},
+        ).scalar()
+
+        db.execute(
+            text("""
+                insert into study_modules (
+                    id,
+                    project_id,
+                    name,
+                    order_index,
+                    status,
+                    taxonomy_status,
+                    accepted_for_study
+                )
+                values (
+                    :id,
+                    :project_id,
+                    :name,
+                    :order_index,
+                    'building',
+                    'not_started',
+                    false
+                )
+            """),
+            {
+                "id": module_id,
+                "project_id": project_id,
+                "name": module_name,
+                "order_index": order_index,
+            },
+        )
+        _update_study_module_organization_metadata(
+            db,
+            module_id,
+            project_id,
+            organization,
+        )
+        db.commit()
+
+        row = _fetch_owned_study_module(db, project_id, module_id, user_id)
+        return _serialize_study_module(row)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.get("/projects/{project_id}/modules/{module_id}", response_model=StudyModuleResponse)
+def get_study_module(
+    project_id: str,
+    module_id: str,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    db = SessionLocal()
+
+    try:
+        row = _fetch_owned_study_module(db, project_id, module_id, user_id)
+        return _serialize_study_module(row)
+    finally:
+        db.close()
+
+
+@app.patch("/projects/{project_id}/modules/{module_id}", response_model=StudyModuleResponse)
+def update_study_module(
+    project_id: str,
+    module_id: str,
+    data: StudyModuleUpdateRequest,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    db = SessionLocal()
+
+    try:
+        _fetch_owned_study_module(db, project_id, module_id, user_id)
+
+        updates = {}
+        if data.name is not None:
+            module_name = data.name.strip()
+            if not module_name:
+                raise HTTPException(status_code=400, detail="Module name is required")
+            updates["name"] = module_name
+
+        if data.status is not None:
+            if data.status not in STUDY_MODULE_STATUSES:
+                raise HTTPException(status_code=400, detail="Invalid module status")
+            updates["status"] = data.status
+
+        if data.taxonomy_status is not None:
+            if data.taxonomy_status not in STUDY_MODULE_TAXONOMY_STATUSES:
+                raise HTTPException(status_code=400, detail="Invalid taxonomy status")
+            updates["taxonomy_status"] = data.taxonomy_status
+
+        if data.accepted_for_study is not None:
+            updates["accepted_for_study"] = data.accepted_for_study
+
+        organization_updates_requested = (
+            data.organization_mode is not None
+            or data.organization_blueprint is not None
+            or data.organization_source_title is not None
+        )
+
+        if updates:
+            set_clauses = []
+            params = {
+                "module_id": module_id,
+                "project_id": project_id,
+            }
+            for key, value in updates.items():
+                set_clauses.append(f"{key} = :{key}")
+                params[key] = value
+
+            if data.accepted_for_study is True:
+                set_clauses.append("accepted_at = coalesce(accepted_at, CURRENT_TIMESTAMP)")
+            elif data.accepted_for_study is False:
+                set_clauses.append("accepted_at = null")
+
+            db.execute(
+                text(f"""
+                    update study_modules
+                    set {", ".join(set_clauses)}
+                    where id = :module_id
+                      and project_id = :project_id
+                """),
+                params,
+            )
+            db.commit()
+
+        if organization_updates_requested:
+            organization = _normalize_study_module_organization(
+                data.organization_mode,
+                data.organization_blueprint,
+                data.organization_source_title,
+            )
+            _update_study_module_organization_metadata(
+                db,
+                module_id,
+                project_id,
+                organization,
+            )
+            db.commit()
+
+        row = _fetch_owned_study_module(db, project_id, module_id, user_id)
+        return _serialize_study_module(row)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @app.put("/projects/{project_id}/study_priorities")
@@ -2449,6 +4540,20 @@ def begin_project_study(
             "user_id": user_id
         }
     )
+    db.execute(
+        text("""
+            update study_modules
+            set
+                status = 'accepted_for_study',
+                accepted_for_study = true,
+                accepted_at = coalesce(accepted_at, CURRENT_TIMESTAMP)
+            where project_id = :project_id
+              and accepted_for_study = false
+        """),
+        {
+            "project_id": project_id
+        }
+    )
     db.commit()
     db.close()
 
@@ -2489,30 +4594,14 @@ def delete_project(
         db.close()
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # cancella i dati collegati
-    db.execute(
-        text("delete from chunks where project_id = :project_id"),
-        {"project_id": project_id}
-    )
-
-    db.execute(
-        text("delete from quizzes where project_id = :project_id"),
-        {"project_id": project_id}
-    )
-
-    db.execute(
-        text("delete from flashcards where project_id = :project_id"),
-        {"project_id": project_id}
-    )
-
-    # cancella il progetto
-    db.execute(
-        text("delete from projects where id = :project_id"),
-        {"project_id": project_id}
-    )
-
-    db.commit()
-    db.close()
+    try:
+        delete_project_owned_data(db, project_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
     return {"status": "deleted"}
 # ======================
@@ -4301,6 +6390,7 @@ def process_topics_task(
     document_id: Optional[str] = None,
     document_title: Optional[str] = None,
     mark_project_completed: bool = True,
+    module_id: Optional[str] = None,
 ):
     db = SessionLocal()
     pipeline_log = UploadPipelineLogger(
@@ -4312,6 +6402,8 @@ def process_topics_task(
         print("BACKGROUND TOPICS START:", project_id)
         if document_id:
             print("BACKGROUND TOPICS DOCUMENT SCOPE:", document_id)
+        if module_id:
+            print("BACKGROUND TOPICS MODULE SCOPE:", module_id)
         if document_title:
             print("BACKGROUND TOPICS DOCUMENT TITLE:", document_title)
         
@@ -4322,6 +6414,7 @@ def process_topics_task(
             db,
             project_id,
             document_id=document_id,
+            module_id=module_id,
         )
         _print_taxonomy_state_snapshot(
             "TAXONOMY STATE BEFORE GENERATION",
@@ -4351,20 +6444,57 @@ def process_topics_task(
         print("Updated topics:")
         print("- none")
         db.execute(text("update projects set topic_status = 'processing' where id = :project_id"), {"project_id": project_id})
+        if module_id:
+            db.execute(
+                text("""
+                    update study_modules
+                    set status = 'building',
+                        taxonomy_status = 'building'
+                    where id = :module_id
+                      and project_id = :project_id
+                """),
+                {
+                    "module_id": module_id,
+                    "project_id": project_id,
+                }
+            )
         ensure_project_chunk_roles(
             db,
             project_id,
             document_id=document_id,
+            module_id=module_id,
         )
         db.commit()
         pipeline_log.end("DATABASE COMMIT")
 
         document_filter = ""
+        document_join = ""
+        topic_filter = ""
         topic_alias_filter = ""
+        chunk_alias_filter = ""
+        chunk_order_clause = "chunks.page asc nulls last, chunks.id asc"
         topic_scope_params = {"project_id": project_id}
-        if document_id:
+        if module_id:
+            document_join = """
+                join documents d
+                  on d.id = chunks.document_id
+                 and d.project_id = chunks.project_id
+            """
+            document_filter = "and d.module_id = :module_id"
+            topic_filter = "and module_id = :module_id"
+            topic_alias_filter = "and t.module_id = :module_id"
+            chunk_alias_filter = "and d.module_id = :module_id"
+            chunk_order_clause = """
+                    coalesce(d.module_order_index, 2147483647) asc,
+                    chunks.page asc nulls last,
+                    chunks.id asc
+            """
+            topic_scope_params["module_id"] = module_id
+        elif document_id:
             document_filter = "and document_id = :document_id"
+            topic_filter = "and document_id = :document_id"
             topic_alias_filter = "and t.document_id = :document_id"
+            chunk_alias_filter = "and c.document_id = :document_id"
             topic_scope_params["document_id"] = document_id
 
         # Fetch only the uploaded document chunks to analyze.
@@ -4374,12 +6504,19 @@ def process_topics_task(
         )
         rows = db.execute(
             text(f"""
-                select chunk_text, section, chunk_role
+                select
+                    chunks.chunk_text,
+                    chunks.section,
+                    chunks.chunk_role,
+                    chunks.page,
+                    chunks.id,
+                    chunks.doc_title
                 from chunks
-                where project_id = :project_id
+                {document_join}
+                where chunks.project_id = :project_id
                 {document_filter}
-                and chunk_role = 'teaching'
-                order by page asc
+                and chunks.chunk_role = 'teaching'
+                order by {chunk_order_clause}
                 limit 400
             """),
             topic_scope_params
@@ -4390,6 +6527,9 @@ def process_topics_task(
                 "text": r[0],
                 "section": r[1] or "GENERAL",
                 "chunk_role": r[2],
+                "page": r[3],
+                "chunk_id": r[4],
+                "document": r[5],
             }
             for r in rows
             if r[0]
@@ -4398,13 +6538,14 @@ def process_topics_task(
             text(f"""
                 select
                     count(*) filter (
-                        where chunk_role = 'teaching'
+                        where chunks.chunk_role = 'teaching'
                     ) as eligible_chunks,
                     count(*) filter (
-                        where chunk_role <> 'teaching'
+                        where chunks.chunk_role <> 'teaching'
                     ) as excluded_chunks
                 from chunks
-                where project_id = :project_id
+                {document_join}
+                where chunks.project_id = :project_id
                 {document_filter}
             """),
             topic_scope_params
@@ -4423,6 +6564,7 @@ def process_topics_task(
         pipeline_log.end(
             "CHUNK LOADING",
             chunks_processed=len(all_chunks),
+            taxonomy_chunks_loaded=len(all_chunks),
             eligible_chunks=chunk_eligibility_counts[0],
             excluded_chunks=chunk_eligibility_counts[1],
         )
@@ -4526,14 +6668,102 @@ def process_topics_task(
                   educational scope, granularity, or factual meaning.
             """
 
+        module_organization = _get_study_module_organization_metadata(
+            db,
+            module_id,
+        )
+        module_organization_instruction = (
+            _build_module_organization_instruction(
+                module_organization
+            )
+        )
+        student_taxonomy_granularity_instruction = (
+            _build_student_taxonomy_granularity_instruction(
+                module_organization
+            )
+        )
+        student_taxonomy_category_first_instruction = (
+            _build_student_taxonomy_category_first_instruction(
+                module_organization
+            )
+        )
+
+        if module_organization_instruction:
+            pipeline_log.start(
+                "MODULE ORGANIZATION BLUEPRINT",
+                mode=module_organization.get("organization_mode"),
+                categories=len(
+                    _extract_blueprint_category_names(
+                        module_organization
+                    )
+                ),
+            )
+            pipeline_log.end(
+                "MODULE ORGANIZATION BLUEPRINT",
+                status="loaded",
+            )
+
+        taxonomy_plan = None
+        taxonomy_plan_instruction = ""
+        taxonomy_planner_diagnostics = {}
+        try:
+            organization_blueprint = (
+                module_organization.get("organization_blueprint")
+                if isinstance(module_organization.get("organization_blueprint"), dict)
+                else {}
+            )
+            pipeline_log.start(
+                "TAXONOMY PLANNING",
+                model=TAXONOMY_PLANNER_MODEL,
+                timeout_seconds=TAXONOMY_PLANNER_REQUEST_TIMEOUT_SECONDS,
+                max_output_tokens=TAXONOMY_PLANNER_MAX_OUTPUT_TOKENS,
+                organization_mode=module_organization.get("organization_mode"),
+                has_student_categories=bool(
+                    _extract_blueprint_category_names(module_organization)
+                ),
+                has_student_index=bool(
+                    str(organization_blueprint.get("syllabus_text") or "").strip()
+                ),
+            )
+            taxonomy_plan = _generate_taxonomy_plan(
+                client,
+                all_chunks,
+                language_instruction,
+                module_organization_instruction,
+                student_taxonomy_category_first_instruction,
+                student_taxonomy_granularity_instruction,
+                module_organization,
+                diagnostics=taxonomy_planner_diagnostics,
+            )
+            taxonomy_plan_instruction = _build_taxonomy_plan_instruction(
+                taxonomy_plan
+            )
+            pipeline_log.end(
+                "TAXONOMY PLANNING",
+                status="ready" if taxonomy_plan_instruction else "skipped",
+                categories=len((taxonomy_plan or {}).get("categories") or []),
+                **taxonomy_planner_diagnostics,
+            )
+            if taxonomy_plan_instruction:
+                print("🧭 TAXONOMY PLAN:")
+                print(json.dumps(taxonomy_plan, ensure_ascii=False, indent=2))
+        except Exception as planning_error:
+            pipeline_log.fail(planning_error, "TAXONOMY PLANNING")
+            print(
+                "❌ TAXONOMY PLANNING FAILED:",
+                repr(planning_error)
+            )
+            raise
+
         topic_phase_timer = time.time()
+        topic_start_time = time.time()
         # Group chunks into batches of 20
         from collections import defaultdict
 
         section_groups = defaultdict(list)
 
         for chunk in all_chunks:
-            section_groups[chunk["section"]].append(chunk["text"])
+            section_groups[chunk["section"]].append(chunk)
 
         print("📚 TOTAL SECTIONS:", len(section_groups))
         print("📦 TOTAL CHUNKS:", len(all_chunks))
@@ -4542,10 +6772,10 @@ def process_topics_task(
         all_candidate_topics = []
         total_mini_groups = sum(
             len([
-                chunks[i:i+20]
-                for i in range(0, len(chunks), 20)
+                section_chunks[i:i+20]
+                for i in range(0, len(section_chunks), 20)
             ])
-            for chunks in section_groups.values()
+            for section_chunks in section_groups.values()
         )
         gpt_calls_performed = 0
         pipeline_log.start(
@@ -4566,7 +6796,7 @@ def process_topics_task(
                 f"📦 CHUNKS IN SECTION: {len(section_chunks)}"
             )
 
-            if time.time() - topic_start_time > MAX_TOPIC_PROCESSING_SECONDS:
+            if _topic_generation_timeout_reached(topic_start_time):
 
                 print("⏰ TOPIC PROCESSING TIMEOUT")
 
@@ -4591,7 +6821,7 @@ def process_topics_task(
                 for i in range(0, len(section_chunks), 20)
             ]
             for mini_group in mini_groups:
-                if time.time() - topic_start_time > MAX_TOPIC_PROCESSING_SECONDS:
+                if _topic_generation_timeout_reached(topic_start_time):
                     print("⏰ TOPIC MINI-GROUP TIMEOUT - stopping safely")
 
                     db.execute(
@@ -4610,35 +6840,52 @@ def process_topics_task(
                         "The uploaded file could not be fully processed."
                     )
 
-                group_text = "\n\n".join(mini_group)
+                group_text = "\n\n".join(
+                    (
+                        f"SOURCE: {chunk.get('document') or 'Document'}"
+                        f" | PAGE: {chunk.get('page') if chunk.get('page') is not None else 'n/a'}"
+                        f" | SOURCE_BLOCK: {chunk.get('chunk_id')}\n"
+                        f"{chunk.get('text') or ''}"
+                    )
+                    for chunk in mini_group
+                )
             
                 # UNIVERSAL PROMPT: Works for any discipline (Medicine, Law, Engineering, etc.)
                 # OPTIMIZED PROMPT: Focused on Pedagogical Hierarchy and Topic Consolidation
                 prompt = f"""
-                Act as a specialist in Instructional Design and Knowledge Organization. 
-                Analyze the provided text to extract its fundamental conceptual hierarchy.
+                Act as a specialist in Instructional Design and Knowledge Organization.
+                Analyze the provided module material and reconstruct the recognizable teaching structure already present in the source.
                 
                 GOAL:
-                Organize the information into a logical structure of Macro-Categories and robust Study Topics.
+                Build a Study Module taxonomy that preserves the source teaching sequence and structure as closely as possible.
 
                 {language_instruction}
+
+                {module_organization_instruction}
+
+                {student_taxonomy_category_first_instruction}
+
+                {student_taxonomy_granularity_instruction}
+
+                {taxonomy_plan_instruction}
                 
                 STRICT RULES:
                 1. CATEGORY RULES:
 
-                The provided DOCUMENT SECTION is contextual information only.
+                The provided DOCUMENT SECTION, source document names, pages/slides, and source-block order are important structural signals.
 
-                Your task is to identify the most appropriate educational Category.
+                Your task is to identify the educational Category that best reflects the source material's own organization.
 
                 CATEGORY RULES:
 
-                - Categories should represent broad learning domains.
+                - Prefer explicit source headings, slide titles, page sections, lecture outline structure, and document sequence when they are recognizable.
+                - Categories should represent recognizable teaching blocks from this module.
                 - Categories should group multiple related study topics.
-                - Categories should be stable across the entire document.
-                - Categories should not be derived directly from paragraph titles.
+                - Categories should be stable across this upload module.
+                - Categories may follow document headings when those headings clearly represent the teaching structure.
                 - Categories should not represent individual lessons, examples, or subtopics.
-                - Multiple document sections may belong to the same Category.
-                - Prefer fewer, stronger Categories over many fragmented Categories.
+                - Multiple source sections may belong to the same Category only when the source clearly treats them as one teaching block.
+                - Do not collapse recognizable source units into a generic semantic category if doing so would make the uploaded material harder for a student to recognize.
 
                 Good Categories:
                 - Broad educational domains
@@ -4649,10 +6896,10 @@ def process_topics_task(
                 - Individual definitions
                 - Single examples
                 - Paragraph titles
-                - Very narrow concepts
+                - Very narrow concepts with no source-structure role
                 - Temporary document headings
 
-                - Categories should preserve the educational structure of the source material while grouping concepts into semantically coherent learning domains.
+                - Categories should preserve the educational structure of the source material before applying semantic consolidation.
 
                 - Avoid creating categories unrelated to the document structure.
 
@@ -4660,13 +6907,15 @@ def process_topics_task(
 
                 - Keep the hierarchy aligned with the actual structure of the source document.
 
-                - Categories must preserve the educational organization already present in the material.
+                - Categories must preserve the educational organization and order already present in the material.
 
                 - Use UPPERCASE for Category names.
                 -Each topic must semantically belong to its parent category.
 
                 -Topics and categories must describe the same conceptual domain.
                 -Topics must remain narrow enough to represent a focused retrievable study unit.
+                -Topics must also be broad enough to support meaningful study,
+                  quiz generation, flashcards, and active recall.
 
                 -Avoid placing unrelated concepts inside the same category.
 
@@ -4683,13 +6932,21 @@ def process_topics_task(
                 - isolated terms
                 - single definitions
                 - individual list items
+                - simple examples
+                - local notes, warnings, or observations
+                - minor phase labels that restate the same process
                 - tiny subcomponents
                 - concepts explained with minimal context
                 unless they are universally recognized as major standalone concepts in the discipline.
 
-                - Consolidate strongly related concepts into broader educational Topics.
+                - Consolidate strongly related concepts only when they are taught together in the source or are redundant.
+                - If two candidate topics describe the same learning objective
+                  with different wording, merge them into one stronger topic.
+                - If a candidate topic is mainly an example, use it in the
+                  description of the broader topic instead of making it a
+                  standalone topic.
 
-                - Prefer broader conceptual Topics over highly granular fragmentation.
+                - Preserve recognizable source subtopics as separate Study Topics when they are meaningful study units.
 
                 GOOD TOPIC CHARACTERISTICS:
                 - Represents a coherent study unit
@@ -4705,6 +6962,9 @@ def process_topics_task(
                 - Extremely narrow details with little standalone relevance
                 - Topics containing only one trivial fact
                 - Fragmented micro-topics that do not support meaningful study
+                - Examples or local details promoted into standalone topics
+                - Several topics that only rephrase the same process, phase, or
+                  definition
                 - Artificially broad topics combining unrelated concepts
 
                 - A Topic should:
@@ -4714,9 +6974,9 @@ def process_topics_task(
                 - support multiple flashcards
                 - represent meaningful educational scope
 
-                - Prefer FEWER but STRONGER Topics.
+                - Prefer source-faithful Topics over aggressive semantic reorganization.
 
-                - Topics should normally aggregate multiple related concepts internally, even if those concepts are not explicitly listed in the title.
+                - Topics may aggregate multiple related concepts internally, but not if that hides the module's recognizable teaching order.
                 
                 3. DESCRIPTION: Provide a dense, academic definition. If the Topic is a consolidation of multiple items, the description must briefly summarize all of them.
                 
@@ -4884,11 +7144,19 @@ def process_topics_task(
         global_prompt = f"""
         Act as a senior Instructional Designer and Knowledge Architect.
 
-        You are given MANY candidate Study Topics extracted from different portions of the same document.
+        You are given candidate Study Topics extracted from different portions of the same Study Module.
 
-        Your task is to CONSOLIDATE them into a SINGLE coherent educational taxonomy.
+        Your task is to produce ONE coherent module-level educational taxonomy while preserving the recognizable source teaching structure and order.
 
         {language_instruction}
+
+        {module_organization_instruction}
+
+        {student_taxonomy_category_first_instruction}
+
+        {student_taxonomy_granularity_instruction}
+
+        {taxonomy_plan_instruction}
 
         GOALS:
         - Merge ONLY genuinely redundant or overlapping Topics.
@@ -4899,18 +7167,34 @@ def process_topics_task(
         - Do NOT merge Topics that belong to different conceptual depths.
         - Only merge Topics representing the same pedagogical level.
         - Do NOT merge Topics that represent distinct study areas, even if related.
-        - Remove redundant Topics
-        - Eliminate overly granular Topics
-        - Create pedagogically balanced Study Topics with moderate granularity
-        - Ensure complete document coverage
-        - Preserve ALL major educational concepts
+        - Remove redundant Topics.
+        - Keep categories and topics aligned with explicit source headings, slide/page order, and section sequence.
+        - In manual organization mode, preserve every student category that
+          has meaningful candidate material.
+        - In manual organization mode, preferred topic anchors are coverage
+          targets: do not drop or over-compress them when the candidate topics
+          contain clear source evidence.
+        - In manual organization mode, review UNASSIGNED carefully. A topic
+          should remain UNASSIGNED only if it genuinely does not overlap any
+          student category or preferred anchor.
+        - In manual organization mode, keep the student's exact category
+          names. Do not shorten, rename, translate, or paraphrase manual
+          category names.
+        - In manual organization mode, remove near-duplicate Topics inside
+          the same category. If two Topics express the same study unit with
+          slightly different wording, keep one broader Topic and preserve the
+          extra detail in its description.
+        - Do not invent a more abstract category if the module already provides a clear teaching structure.
+        - Consolidate only where it does NOT destroy source recognizability.
+        - Ensure complete module coverage.
+        - Preserve ALL major educational concepts.
 
         IMPORTANT:
-        - Categories must be broad academic domains.
+        - Categories should be recognizable teaching blocks from the uploaded module.
         - Topics must represent meaningful study units.
-        - Avoid fragmentation.
+        - Avoid unnecessary fragmentation, but do not flatten meaningful source subtopics.
         - Avoid duplicate or overlapping Topics.
-        - Prefer pedagogically balanced Topics.
+        - Prefer source-faithful organization over aggressive semantic compression.
         Examples of Topics that SHOULD remain separate:
         - Concepts that are independently studied
         - Topics with distinct educational objectives
@@ -5020,7 +7304,33 @@ def process_topics_task(
                 })
 
             print("⚠️ USING FALLBACK TOPIC STRUCTURE")
-        final_data = rebalance_taxonomy(final_data)        
+
+        if _uses_authoritative_student_organization(module_organization):
+            print(
+                "🧭 MODULE ORGANIZATION GUARD: applying allowed category list"
+            )
+            final_data = _apply_module_organization_category_guard(
+                final_data,
+                module_organization,
+            )
+        elif str((module_organization or {}).get("organization_mode") or "").strip().lower() == "syllabus":
+            print(
+                "🧭 MODULE ORGANIZATION GUARD: applying syllabus category cleanup"
+            )
+            final_data = _apply_syllabus_category_guard(
+                final_data,
+                module_organization,
+            )
+        else:
+            final_data = _deduplicate_taxonomy_topics(final_data)
+
+        if module_id:
+            print(
+                "✅ MODULE TAXONOMY: preserving source category structure; "
+                "rebalance_taxonomy skipped"
+            )
+        else:
+            final_data = rebalance_taxonomy(final_data)
         final_topics = sum(
             1
             for cat in final_data.get("categories", [])
@@ -5077,115 +7387,149 @@ def process_topics_task(
         }
         category_mapping = original_category_mapping
 
-        try:
-            consolidation_result = (
-                consolidate_taxonomy_categories_v1(
-                    topic_ledger
-                )
+        if module_id:
+            print(
+                "✅ MODULE TAXONOMY: deterministic cross-category consolidation skipped "
+                "to preserve module source structure"
             )
-            category_mapping = consolidation_result["mapping"]
-            quality_diagnostics = consolidation_result[
-                "diagnostics"
-            ]
+        else:
+            try:
+                consolidation_result = (
+                    consolidate_taxonomy_categories_v1(
+                        topic_ledger
+                    )
+                )
+                category_mapping = consolidation_result["mapping"]
+                quality_diagnostics = consolidation_result[
+                    "diagnostics"
+                ]
 
-            print(
-                "🧭 TAXONOMY QUALITY PASS VERSION:",
-                CATEGORY_CONSOLIDATION_VERSION
-            )
-            print(
-                "🧭 CATEGORIES BEFORE REVIEW:",
-                json.dumps(
-                    quality_diagnostics[
-                        "categories_before_review"
-                    ],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            print(
-                "🧭 CATEGORIES AFTER REVIEW:",
-                json.dumps(
-                    quality_diagnostics[
-                        "categories_after_review"
-                    ],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            print(
-                "🧭 CATEGORY COUNT BEFORE REVIEW:",
-                quality_diagnostics["category_count_before"]
-            )
-            print(
-                "🧭 CATEGORY COUNT AFTER REVIEW:",
-                quality_diagnostics["category_count_after"]
-            )
-            print(
-                "🧭 CATEGORY SIZE LIMIT:",
-                consolidation_result["category_size_limit"]
-            )
-            print(
-                "🧭 ACCEPTED CATEGORY MERGES:",
-                len(consolidation_result["accepted_merges"])
-            )
-
-            for merge in consolidation_result[
-                "accepted_merges"
-            ]:
                 print(
-                    "✅ CATEGORY MERGE:",
-                    " + ".join(merge["source_categories"]),
-                    "->",
-                    category_mapping[
-                        merge["source_categories"][0]
-                    ],
-                    "| score:",
-                    round(merge["merge_score"], 4),
-                    "| topics:",
-                    merge["topic_count"],
-                    "| cohesion:",
-                    round(merge["merged_cohesion"], 4),
-                    "| spread:",
-                    round(merge["maximum_spread"], 4),
-                    "| rationale:",
-                    merge["rationale"]
+                    "🧭 TAXONOMY QUALITY PASS VERSION:",
+                    CATEGORY_CONSOLIDATION_VERSION
+                )
+                print(
+                    "🧭 CATEGORIES BEFORE REVIEW:",
+                    json.dumps(
+                        quality_diagnostics[
+                            "categories_before_review"
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                print(
+                    "🧭 CATEGORIES AFTER REVIEW:",
+                    json.dumps(
+                        quality_diagnostics[
+                            "categories_after_review"
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                print(
+                    "🧭 CATEGORY COUNT BEFORE REVIEW:",
+                    quality_diagnostics["category_count_before"]
+                )
+                print(
+                    "🧭 CATEGORY COUNT AFTER REVIEW:",
+                    quality_diagnostics["category_count_after"]
+                )
+                print(
+                    "🧭 CATEGORY SIZE LIMIT:",
+                    consolidation_result["category_size_limit"]
+                )
+                print(
+                    "🧭 ACCEPTED CATEGORY MERGES:",
+                    len(consolidation_result["accepted_merges"])
                 )
 
-            print(
-                "🧭 CATEGORIES MERGED OR RENAMED:",
-                json.dumps(
-                    quality_diagnostics[
-                        "categories_merged_or_renamed"
-                    ],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            print(
-                "🧭 REJECTED CATEGORY MERGES:",
-                len(consolidation_result["rejected_merges"])
-            )
-            print(
-                "✅ PRE-PERSISTENCE TAXONOMY QUALITY PASS COMPLETE"
-            )
+                for merge in consolidation_result[
+                    "accepted_merges"
+                ]:
+                    print(
+                        "✅ CATEGORY MERGE:",
+                        " + ".join(merge["source_categories"]),
+                        "->",
+                        category_mapping[
+                            merge["source_categories"][0]
+                        ],
+                        "| score:",
+                        round(merge["merge_score"], 4),
+                        "| topics:",
+                        merge["topic_count"],
+                        "| cohesion:",
+                        round(merge["merged_cohesion"], 4),
+                        "| spread:",
+                        round(merge["maximum_spread"], 4),
+                        "| rationale:",
+                        merge["rationale"]
+                    )
 
-        except Exception as consolidation_error:
-            category_mapping = original_category_mapping
-            print(
-                "❌ DETERMINISTIC CATEGORY CONSOLIDATION FAILED:",
-                repr(consolidation_error)
-            )
-            print(
-                "✅ ORIGINAL TAXONOMY RESTORED — "
-                "NO PARTIAL CATEGORY MERGES APPLIED"
-            )
+                print(
+                    "🧭 CATEGORIES MERGED OR RENAMED:",
+                    json.dumps(
+                        quality_diagnostics[
+                            "categories_merged_or_renamed"
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                print(
+                    "🧭 REJECTED CATEGORY MERGES:",
+                    len(consolidation_result["rejected_merges"])
+                )
+                print(
+                    "✅ PRE-PERSISTENCE TAXONOMY QUALITY PASS COMPLETE"
+                )
+
+            except Exception as consolidation_error:
+                category_mapping = original_category_mapping
+                print(
+                    "❌ DETERMINISTIC CATEGORY CONSOLIDATION FAILED:",
+                    repr(consolidation_error)
+                )
+                print(
+                    "✅ ORIGINAL TAXONOMY RESTORED — "
+                    "NO PARTIAL CATEGORY MERGES APPLIED"
+                )
 
         pipeline_log.start(
             "TOPIC PERSISTENCE",
             operation="persist topics",
             topics_to_persist=len(topic_ledger),
         )
-        if document_id:
+        if module_id:
+            db.execute(
+                text("""
+                    DELETE FROM topic_chunks
+                    WHERE topic_id IN (
+                        SELECT id
+                        FROM topics
+                        WHERE project_id = :project_id
+                        AND module_id = :module_id
+                    )
+                """),
+                {
+                    "project_id": project_id,
+                    "module_id": module_id,
+                }
+            )
+
+            db.execute(
+                text("""
+                    DELETE FROM topics
+                    WHERE project_id = :project_id
+                    AND module_id = :module_id
+                """),
+                {
+                    "project_id": project_id,
+                    "module_id": module_id,
+                }
+            )
+        elif document_id:
             db.execute(
                 text("""
                     DELETE FROM topic_chunks
@@ -5237,14 +7581,25 @@ def process_topics_task(
         db.commit()
 
         print(
-            "🧹 TOPICS + TOPIC_CHUNKS REMOVED FOR CURRENT DOCUMENT ONLY"
-            if document_id
-            else "🧹 OLD PROJECT TOPICS + TOPIC_CHUNKS REMOVED"
+            "🧹 TOPICS + TOPIC_CHUNKS REMOVED FOR CURRENT MODULE ONLY"
+            if module_id
+            else (
+                "🧹 TOPICS + TOPIC_CHUNKS REMOVED FOR CURRENT DOCUMENT ONLY"
+                if document_id
+                else "🧹 OLD PROJECT TOPICS + TOPIC_CHUNKS REMOVED"
+            )
         )
         for ledger_entry in topic_ledger:
             category_name = category_mapping[
                 ledger_entry.original_category
             ]
+            source_section = (
+                None
+                if _uses_authoritative_student_organization(
+                    module_organization
+                )
+                else ledger_entry.original_category
+            )
             embedding_str = "[" + ",".join(
                 map(str, ledger_entry.embedding)
             ) + "]"
@@ -5255,36 +7610,43 @@ def process_topics_task(
                     (
                         project_id,
                         document_id,
+                        module_id,
                         category,
                         topic,
                         description,
                         embedding,
                         is_display_topic,
-                        source_section
+                        source_section,
+                        category_order_index,
+                        topic_order_index
                     )
                     values
                     (
                         :project_id,
                         :document_id,
+                        :module_id,
                         :category,
                         :topic,
                         :description,
                         CAST(:embedding AS vector),
                         :is_display_topic,
-                        :source_section
+                        :source_section,
+                        :category_order_index,
+                        :topic_order_index
                     )
                 """),
                 {
                     "project_id": project_id,
-                    "document_id": document_id,
+                    "document_id": None if module_id else document_id,
+                    "module_id": module_id,
                     "category": category_name,
                     "topic": ledger_entry.topic,
                     "description": ledger_entry.description,
                     "embedding": embedding_str,
                     "is_display_topic": True,
-                    "source_section": (
-                        ledger_entry.original_category
-                    )
+                    "source_section": source_section,
+                    "category_order_index": ledger_entry.source_position[0],
+                    "topic_order_index": ledger_entry.source_position[1],
                 }
             )
 
@@ -5302,6 +7664,7 @@ def process_topics_task(
             db,
             project_id,
             document_id=document_id,
+            module_id=module_id,
         )
         _print_taxonomy_state_snapshot(
             "TAXONOMY STATE AFTER GENERATION",
@@ -5320,6 +7683,7 @@ def process_topics_task(
             assign_topics_to_chunks(
                 project_id,
                 document_id=document_id,
+                module_id=module_id,
             )
             assignment_matches = db.execute(
                 text(f"""
@@ -5337,6 +7701,45 @@ def process_topics_task(
             round(time.time() - topic_phase_timer, 1),
             "seconds"
         )
+            db.execute(
+                text(f"""
+                    with ordered_chunks as (
+                        select
+                            c.id as chunk_id,
+                            c.page,
+                            row_number() over (
+                                order by
+                                    coalesce(d.module_order_index, 2147483647) asc,
+                                    c.page asc nulls last,
+                                    c.id asc
+                            ) as source_block_index
+                        from chunks c
+                        left join documents d
+                          on d.id = c.document_id
+                         and d.project_id = c.project_id
+                        where c.project_id = :project_id
+                    ),
+                    topic_sources as (
+                        select
+                            t.id as topic_id,
+                            min(oc.page) as first_source_page,
+                            min(oc.source_block_index) as first_source_block_index
+                        from topics t
+                        join topic_chunks tc on tc.topic_id = t.id
+                        join ordered_chunks oc on oc.chunk_id = tc.chunk_id
+                        where t.project_id = :project_id
+                        {topic_alias_filter}
+                        group by t.id
+                    )
+                    update topics t
+                    set first_source_page = topic_sources.first_source_page,
+                        first_source_block_index = topic_sources.first_source_block_index
+                    from topic_sources
+                    where t.id = topic_sources.topic_id
+                """),
+                topic_scope_params
+            )
+            db.commit()
             pipeline_log.end(
                 "TOPIC ASSIGNMENT",
                 matches_created=assignment_matches,
@@ -5351,9 +7754,9 @@ def process_topics_task(
                 SELECT
                     EXISTS (
                         SELECT 1
-                        FROM topics
-                        WHERE project_id = :project_id
-                        {document_filter}
+                    FROM topics
+                    WHERE project_id = :project_id
+                        {topic_filter}
                     )
                     AND EXISTS (
                         SELECT 1
@@ -5402,6 +7805,20 @@ def process_topics_task(
             """),
             {"project_id": project_id}
         )
+        if module_id:
+            final_db.execute(
+                text("""
+                    UPDATE study_modules
+                    SET taxonomy_status = 'ready',
+                        status = 'pending_study'
+                    WHERE id = :module_id
+                      AND project_id = :project_id
+                """),
+                {
+                    "module_id": module_id,
+                    "project_id": project_id,
+                }
+            )
 
         final_db.commit()
 
@@ -5500,6 +7917,19 @@ def process_topics_task(
             operation="set topic_status error",
         )
         db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
+        if module_id:
+            db.execute(
+                text("""
+                    update study_modules
+                    set taxonomy_status = 'failed'
+                    where id = :module_id
+                      and project_id = :project_id
+                """),
+                {
+                    "module_id": module_id,
+                    "project_id": project_id,
+                }
+            )
         db.commit()
         pipeline_log.end("DATABASE COMMIT")
         return False
@@ -5509,7 +7939,28 @@ def process_topics_task(
 def process_uploaded_documents_topics_task(
     project_id: str,
     uploaded_documents: list,
+    module_id: Optional[str] = None,
 ):
+    if module_id:
+        document_titles = [
+            uploaded_document.get("title")
+            for uploaded_document in uploaded_documents
+            if uploaded_document.get("title")
+        ]
+        processed = process_topics_task(
+            project_id,
+            document_id=None,
+            document_title=", ".join(document_titles),
+            mark_project_completed=True,
+            module_id=module_id,
+        )
+        if not processed:
+            print(
+                "❌ MODULE TOPIC PROCESSING FAILED:",
+                module_id,
+            )
+        return
+
     for index, uploaded_document in enumerate(uploaded_documents):
         processed = process_topics_task(
             project_id,
@@ -5529,6 +7980,7 @@ def process_uploaded_documents_topics_task(
 def assign_topics_to_chunks(
     project_id: str,
     document_id: Optional[str] = None,
+    module_id: Optional[str] = None,
 ):
 
     db = SessionLocal()
@@ -5561,9 +8013,27 @@ def assign_topics_to_chunks(
     topic_alias_filter = ""
     chunk_filter = ""
     chunk_alias_filter = ""
+    chunk_join = ""
+    chunk_table_join = ""
     scope_params = {"project_id": project_id}
 
-    if document_id:
+    if module_id:
+        topic_filter = "and module_id = :module_id"
+        topic_alias_filter = "and t.module_id = :module_id"
+        chunk_join = """
+            join documents d
+              on d.id = chunks.document_id
+             and d.project_id = chunks.project_id
+        """
+        chunk_table_join = """
+            join documents d
+              on d.id = c.document_id
+             and d.project_id = c.project_id
+        """
+        chunk_filter = "and d.module_id = :module_id"
+        chunk_alias_filter = "and d.module_id = :module_id"
+        scope_params["module_id"] = module_id
+    elif document_id:
         topic_filter = "and document_id = :document_id"
         topic_alias_filter = "and t.document_id = :document_id"
         chunk_filter = "and document_id = :document_id"
@@ -5617,6 +8087,8 @@ def assign_topics_to_chunks(
         print("🧪 ENTER assign_topics_to_chunks")
         if document_id:
             print("🧪 ASSIGNMENT DOCUMENT SCOPE:", document_id)
+        if module_id:
+            print("🧪 ASSIGNMENT MODULE SCOPE:", module_id)
 
         pipeline_log.start(
             "DATABASE COMMIT",
@@ -5626,6 +8098,7 @@ def assign_topics_to_chunks(
             db,
             project_id,
             document_id=document_id,
+            module_id=module_id,
         )
         db.commit()
         pipeline_log.end("DATABASE COMMIT")
@@ -5645,9 +8118,10 @@ def assign_topics_to_chunks(
             text(f"""
                 select count(*)
                 from chunks
-                where project_id = :project_id
+                {chunk_join}
+                where chunks.project_id = :project_id
                 {chunk_filter}
-                and chunk_role = 'teaching'
+                and chunks.chunk_role = 'teaching'
             """),
             scope_params
         ).fetchone()[0]
@@ -5725,13 +8199,14 @@ def assign_topics_to_chunks(
         for batch_number in range(1, phase_a_total_batches + 1):
             chunk_rows = db.execute(
                 text(f"""
-                    select id
+                    select chunks.id
                     from chunks
-                    where project_id = :project_id
+                    {chunk_join}
+                    where chunks.project_id = :project_id
                     {chunk_filter}
-                    and chunk_role = 'teaching'
-                    and id > :last_chunk_id
-                    order by id
+                    and chunks.chunk_role = 'teaching'
+                    and chunks.id > :last_chunk_id
+                    order by chunks.id
                     limit :batch_size
                 """),
                 {
@@ -5766,6 +8241,7 @@ def assign_topics_to_chunks(
                         t.source_section,
                         c.embedding <#> t.embedding as negative_inner_product
                     from chunks c
+                    {chunk_table_join}
                     join topics t on t.project_id = c.project_id
                     where c.project_id = :project_id
                     {chunk_alias_filter}
@@ -5984,6 +8460,7 @@ def assign_topics_to_chunks(
                                     as negative_inner_product
                             from topics t
                             join chunks c on c.project_id = t.project_id
+                            {chunk_table_join}
                             where t.project_id = :project_id
                             {topic_alias_filter}
                             {chunk_alias_filter}
@@ -6299,6 +8776,18 @@ async def ingest_stream(
     user = Depends(verify_user)
 ):
     docs = data.documents
+    module_name = (data.module_name or "").strip()
+    organization = _normalize_study_module_organization(
+        data.organization_mode,
+        data.organization_blueprint,
+        data.organization_source_title,
+    )
+
+    if not docs:
+        raise HTTPException(status_code=400, detail="No documents provided")
+
+    if not module_name:
+        raise HTTPException(status_code=400, detail="Module name is required")
 
     async def generate():
         db = SessionLocal()
@@ -6314,6 +8803,7 @@ async def ingest_stream(
         total_embedding_calls = 0
         total_chunk_chars = 0
         uploaded_documents = []
+        module_id = None
 
         try:
             pipeline_log.header()
@@ -6332,7 +8822,54 @@ async def ingest_stream(
                 total_file_size_bytes=total_file_size,
             )
 
-            pipeline_log.start("DATABASE COMMIT", operation="set topic_status processing")
+            pipeline_log.start(
+                "DATABASE COMMIT",
+                operation="create study module and set topic_status processing",
+            )
+            _require_owned_project(db, project_id, user["id"])
+            module_id = str(uuid.uuid4())
+            module_order_index = db.execute(
+                text("""
+                    select coalesce(max(order_index), 0) + 1
+                    from study_modules
+                    where project_id = :project_id
+                """),
+                {"project_id": project_id}
+            ).scalar()
+            db.execute(
+                text("""
+                    insert into study_modules (
+                        id,
+                        project_id,
+                        name,
+                        order_index,
+                        status,
+                        taxonomy_status,
+                        accepted_for_study
+                    )
+                    values (
+                        :module_id,
+                        :project_id,
+                        :name,
+                        :order_index,
+                        'building',
+                        'building',
+                        false
+                    )
+                """),
+                {
+                    "module_id": module_id,
+                    "project_id": project_id,
+                    "name": module_name,
+                    "order_index": module_order_index,
+                }
+            )
+            _update_study_module_organization_metadata(
+                db,
+                module_id,
+                project_id,
+                organization,
+            )
             db.execute(
                 text("""
                     update projects
@@ -6344,7 +8881,7 @@ async def ingest_stream(
             db.commit()
             pipeline_log.end("DATABASE COMMIT")
 
-            yield "Starting upload...\n"
+            yield f"Starting upload for module: {module_name}\n"
             
             import re
 
@@ -6370,7 +8907,7 @@ async def ingest_stream(
             # SAVE CHUNKS
             # ======================
             project_chunk_roles = []
-            for doc in docs:
+            for document_index, doc in enumerate(docs):
                 document_id = str(uuid.uuid4())
                 document_text_parts = []
                 document_start = _upload_timer()
@@ -6388,6 +8925,30 @@ async def ingest_stream(
                     file_bytes,
                     doc.title,
                 )
+                source_structure_analysis = analyze_source_structure(
+                    extracted_document
+                )
+                pipeline_log.start(
+                    "SOURCE STRUCTURE DETECTION",
+                    filename=doc.title,
+                )
+                print("==================================================")
+                print("SOURCE STRUCTURE DETECTION")
+                print("==================================================")
+                print(f"filename: {doc.title}")
+                print(format_source_structure_tree(source_structure_analysis))
+                print("==================================================")
+                pipeline_log.end(
+                    "SOURCE STRUCTURE DETECTION",
+                    **{
+                        key: value
+                        for key, value in source_structure_to_dict(
+                            source_structure_analysis
+                        ).items()
+                        if key != "headings"
+                    },
+                )
+
                 total_pages = extracted_document.pages_detected or 0
                 total_blocks = len(extracted_document.blocks)
                 pipeline_log.end(
@@ -6413,6 +8974,8 @@ async def ingest_stream(
                         (
                             id,
                             project_id,
+                            module_id,
+                            module_order_index,
                             title,
                             text
                         )
@@ -6420,6 +8983,8 @@ async def ingest_stream(
                         (
                             :document_id,
                             :project_id,
+                            :module_id,
+                            :module_order_index,
                             :title,
                             :text
                         )
@@ -6427,6 +8992,8 @@ async def ingest_stream(
                     {
                         "document_id": document_id,
                         "project_id": project_id,
+                        "module_id": module_id,
+                        "module_order_index": document_index + 1,
                         "title": doc.title,
                         "text": "",
                     }
@@ -6754,6 +9321,7 @@ async def ingest_stream(
                 uploaded_documents.append({
                     "document_id": document_id,
                     "title": doc.title,
+                    "module_id": module_id,
                 })
             
             log_chunk_role_counts(project_chunk_roles)
@@ -6767,6 +9335,7 @@ async def ingest_stream(
                 process_uploaded_documents_topics_task,
                 project_id,
                 uploaded_documents,
+                module_id,
             )
             print("✅ BACKGROUND TOPICS TASK SCHEDULED:", project_id)
             pipeline_log.end("TOPIC GENERATION")
@@ -6810,6 +9379,19 @@ async def ingest_stream(
             db.rollback()
             pipeline_log.start("DATABASE COMMIT", operation="set topic_status error")
             db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
+            if module_id:
+                db.execute(
+                    text("""
+                        update study_modules
+                        set taxonomy_status = 'failed'
+                        where id = :module_id
+                          and project_id = :project_id
+                    """),
+                    {
+                        "module_id": module_id,
+                        "project_id": project_id,
+                    }
+                )
             db.commit()
             pipeline_log.end("DATABASE COMMIT")
             yield f"Upload failed: {str(e)}\n"
@@ -11344,8 +13926,7 @@ def search_project_chunks(
                 "embedding": query_embedding
             }
         ).fetchall()
-       
-    
+
 
     db.close()
 
@@ -11375,7 +13956,7 @@ def search_project_chunks(
                 .replace("_", " ")
             )
 
-        
+
 
         chunks.append({
             "text": text_chunk,
@@ -11385,8 +13966,7 @@ def search_project_chunks(
         })
 
     print("📦 CHUNKS RETRIEVED:", len(chunks))
-    
-    
+
 
     return chunks[:k]
 from sqlalchemy import text as sql_text
@@ -11395,21 +13975,55 @@ from sqlalchemy import text as sql_text
 async def get_topics(project_id: str):
     db = SessionLocal()
     try:
-        # We now select category, topic, and description
+        source_section_column = (
+            "t.source_section"
+            if _table_column_available(db, "topics", "source_section")
+            else "null"
+        )
+        organization_mode_column = (
+            "m.organization_mode"
+            if _study_module_organization_columns_available(db)
+            else "null"
+        )
+        # We now select category, topic, description, and module/order metadata.
+        # The extra fields are additive: existing consumers can ignore them, while
+        # module-aware UI can preserve Project -> Module -> Category -> Topic scope.
         result = db.execute(
-            sql_text("""
-                SELECT id, category, topic, description  
-                FROM topics 
-                WHERE project_id = :project_id
-                AND topic IS NOT NULL
-                AND is_display_topic = true
-                ORDER BY category ASC, topic ASC
-            """), 
+            sql_text(f"""
+                SELECT
+                    t.id,
+                    t.category,
+                    t.topic,
+                    t.description,
+                    {source_section_column} as source_section,
+                    t.module_id,
+                    m.name as module_name,
+                    m.order_index as module_order_index,
+                    {organization_mode_column} as organization_mode,
+                    t.category_order_index,
+                    t.topic_order_index,
+                    m.accepted_for_study
+                FROM topics t
+                LEFT JOIN study_modules m ON m.id = t.module_id
+                WHERE t.project_id = :project_id
+                AND t.topic IS NOT NULL
+                AND t.is_display_topic = true
+                ORDER BY
+                    CASE WHEN t.module_id IS NULL THEN 1 ELSE 0 END ASC,
+                    COALESCE(m.order_index, 2147483647) ASC,
+                    COALESCE(t.category_order_index, 2147483647) ASC,
+                    COALESCE(t.topic_order_index, 2147483647) ASC,
+                    t.category ASC,
+                    t.topic ASC
+            """),
             {"project_id": project_id}
         )
         rows = result.fetchall()
-        
+
         # We format them into the structured object your UI needs
+        def _hide_generated_macrocategory(mode: object) -> bool:
+            return str(mode or "").strip().lower() in {"manual", "syllabus"}
+
         return {
             "topics": [
                 {
@@ -11417,6 +14031,20 @@ async def get_topics(project_id: str):
                     "category": r[1] or "General",
                     "topic": r[2],
                     "description": r[3] or "",
+                    "source_section": ""
+                        if _hide_generated_macrocategory(r[8])
+                        else (r[4] or ""),
+                    "macrocategory": ""
+                        if _hide_generated_macrocategory(r[8])
+                        else (r[4] or ""),
+                    "module_id": str(r[5]) if r[5] else None,
+                    "module_name": r[6] or None,
+                    "module_order_index": r[7],
+                    "organization_mode": r[8] or None,
+                    "category_order_index": r[9],
+                    "topic_order_index": r[10],
+                    "accepted_for_study": bool(r[11]) if r[11] is not None else False,
+                    "taxonomy_locked": bool(r[11]) if r[11] is not None else False,
                     "difficulty": "medium",
                     "accuracy": 50
                 }
@@ -11425,6 +14053,381 @@ async def get_topics(project_id: str):
         }
     finally:
         db.close()
+
+
+@app.patch("/projects/{project_id}/topics/{topic_id}")
+async def update_topic_category(
+    project_id: str,
+    topic_id: str,
+    data: TopicCategoryUpdateRequest,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    category = (data.category or "").strip() if data.category is not None else None
+    topic_name = (data.topic or "").strip() if data.topic is not None else None
+
+    if category is None and topic_name is None:
+        raise HTTPException(status_code=400, detail="Category or topic name is required")
+
+    if data.category is not None and not category:
+        raise HTTPException(status_code=400, detail="Category is required")
+
+    if data.topic is not None and not topic_name:
+        raise HTTPException(status_code=400, detail="Topic name is required")
+
+    db = SessionLocal()
+    try:
+        _require_owned_project(db, project_id, user_id)
+
+        topic_row = db.execute(
+            text("""
+                select
+                    t.id,
+                    t.module_id,
+                    t.category,
+                    coalesce(m.accepted_for_study, false) as accepted_for_study
+                from topics t
+                left join study_modules m on m.id = t.module_id
+                where t.id = :topic_id
+                  and t.project_id = :project_id
+                  and t.is_display_topic = true
+            """),
+            {
+                "topic_id": topic_id,
+                "project_id": project_id,
+            },
+        ).fetchone()
+
+        if not topic_row:
+            raise HTTPException(status_code=404, detail="Topic not found")
+
+        if bool(topic_row[3]):
+            raise HTTPException(
+                status_code=409,
+                detail="This taxonomy has already been approved for study",
+            )
+
+        if category is not None:
+            target_category = db.execute(
+                text("""
+                    select category
+                    from topics
+                    where project_id = :project_id
+                      and is_display_topic = true
+                      and category = :category
+                      and (
+                        module_id = :module_id
+                        or (module_id is null and :module_id is null)
+                      )
+                    limit 1
+                """),
+                {
+                    "project_id": project_id,
+                    "module_id": topic_row[1],
+                    "category": category,
+                },
+            ).fetchone()
+
+            if not target_category:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Target category does not exist in this module",
+                )
+
+        update_fields = []
+        update_params = {
+            "topic_id": topic_id,
+            "project_id": project_id,
+        }
+
+        if category is not None:
+            update_fields.append("category = :category")
+            update_params["category"] = category
+
+        if topic_name is not None:
+            update_fields.append("topic = :topic_name")
+            update_params["topic_name"] = topic_name
+
+        db.execute(
+            text(f"""
+                update topics
+                set {", ".join(update_fields)}
+                where id = :topic_id
+                  and project_id = :project_id
+            """),
+            update_params,
+        )
+        db.commit()
+
+        return {
+            "id": topic_id,
+            "category": category if category is not None else topic_row[2],
+            "topic": topic_name,
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.patch("/projects/{project_id}/topic-categories")
+async def rename_topic_category(
+    project_id: str,
+    data: TopicCategoryRenameRequest,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    current_category = (data.current_category or "").strip()
+    new_category = (data.new_category or "").strip()
+    module_id = (data.module_id or "").strip() or None
+
+    if not current_category or not new_category:
+        raise HTTPException(status_code=400, detail="Category names are required")
+
+    db = SessionLocal()
+    try:
+        _require_owned_project(db, project_id, user_id)
+
+        category_rows = db.execute(
+            text("""
+                select
+                    t.id,
+                    coalesce(m.accepted_for_study, false) as accepted_for_study
+                from topics t
+                left join study_modules m on m.id = t.module_id
+                where t.project_id = :project_id
+                  and t.is_display_topic = true
+                  and t.category = :current_category
+                  and (
+                    t.module_id = :module_id
+                    or (t.module_id is null and :module_id is null)
+                  )
+            """),
+            {
+                "project_id": project_id,
+                "module_id": module_id,
+                "current_category": current_category,
+            },
+        ).fetchall()
+
+        if not category_rows:
+            raise HTTPException(status_code=404, detail="Category not found")
+
+        if any(bool(row[1]) for row in category_rows):
+            raise HTTPException(
+                status_code=409,
+                detail="This taxonomy has already been approved for study",
+            )
+
+        existing_target_category = db.execute(
+            text("""
+                select category
+                from topics
+                where project_id = :project_id
+                  and is_display_topic = true
+                  and category = :new_category
+                  and category <> :current_category
+                  and (
+                    module_id = :module_id
+                    or (module_id is null and :module_id is null)
+                  )
+                limit 1
+            """),
+            {
+                "project_id": project_id,
+                "module_id": module_id,
+                "current_category": current_category,
+                "new_category": new_category,
+            },
+        ).fetchone()
+
+        if existing_target_category:
+            raise HTTPException(
+                status_code=400,
+                detail="A category with this name already exists in this module",
+            )
+
+        db.execute(
+            text("""
+                update topics
+                set category = :new_category
+                where project_id = :project_id
+                  and category = :current_category
+                  and (
+                    module_id = :module_id
+                    or (module_id is null and :module_id is null)
+                  )
+                  and is_display_topic = true
+            """),
+            {
+                "project_id": project_id,
+                "module_id": module_id,
+                "current_category": current_category,
+                "new_category": new_category,
+            },
+        )
+        db.commit()
+
+        return {
+            "category": new_category,
+            "updated_topics": len(category_rows),
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/topics/merge")
+async def merge_topics(
+    project_id: str,
+    data: TopicMergeRequest,
+    user = Depends(verify_user),
+):
+    user_id = user["id"]
+    source_topic_id = (data.source_topic_id or "").strip()
+    target_topic_id = (data.target_topic_id or "").strip()
+    new_topic_name = (data.new_topic_name or "").strip()
+
+    if not source_topic_id or not target_topic_id or not new_topic_name:
+        raise HTTPException(status_code=400, detail="Source, target and topic name are required")
+
+    if source_topic_id == target_topic_id:
+        raise HTTPException(status_code=400, detail="Choose two different topics to merge")
+
+    db = SessionLocal()
+    try:
+        _require_owned_project(db, project_id, user_id)
+
+        topic_rows = db.execute(
+            text("""
+                select
+                    t.id,
+                    t.module_id,
+                    t.category,
+                    t.topic,
+                    t.description,
+                    coalesce(m.accepted_for_study, false) as accepted_for_study
+                from topics t
+                left join study_modules m on m.id = t.module_id
+                where t.project_id = :project_id
+                  and t.is_display_topic = true
+                  and t.id in (:source_topic_id, :target_topic_id)
+            """),
+            {
+                "project_id": project_id,
+                "source_topic_id": source_topic_id,
+                "target_topic_id": target_topic_id,
+            },
+        ).fetchall()
+
+        topics_by_id = {str(row[0]): row for row in topic_rows}
+        source_topic = topics_by_id.get(source_topic_id)
+        target_topic = topics_by_id.get(target_topic_id)
+
+        if not source_topic or not target_topic:
+            raise HTTPException(status_code=404, detail="Topic not found")
+
+        if bool(source_topic[5]) or bool(target_topic[5]):
+            raise HTTPException(
+                status_code=409,
+                detail="This taxonomy has already been approved for study",
+            )
+
+        if source_topic[1] != target_topic[1] or source_topic[2] != target_topic[2]:
+            raise HTTPException(
+                status_code=400,
+                detail="Topics can only be merged inside the same category and module",
+            )
+
+        descriptions = []
+        for description in (target_topic[4], source_topic[4]):
+            cleaned_description = str(description or "").strip()
+            if cleaned_description and cleaned_description not in descriptions:
+                descriptions.append(cleaned_description)
+        merged_description = " ".join(descriptions)
+
+        if _table_column_available(db, "topic_chunks", "topic_id"):
+            db.execute(
+                text("""
+                    update topic_chunks
+                    set topic_id = :target_topic_id
+                    where topic_id = :source_topic_id
+                """),
+                {
+                    "source_topic_id": source_topic_id,
+                    "target_topic_id": target_topic_id,
+                },
+            )
+
+            try:
+                db.execute(
+                    text("""
+                        delete from topic_chunks
+                        where id in (
+                            select id
+                            from (
+                                select
+                                    id,
+                                    row_number() over (
+                                        partition by topic_id, chunk_id
+                                        order by id
+                                    ) as duplicate_rank
+                                from topic_chunks
+                                where topic_id = :target_topic_id
+                            ) ranked_topic_chunks
+                            where duplicate_rank > 1
+                        )
+                    """),
+                    {"target_topic_id": target_topic_id},
+                )
+            except Exception:
+                pass
+
+        db.execute(
+            text("""
+                update topics
+                set
+                    topic = :new_topic_name,
+                    description = :merged_description
+                where id = :target_topic_id
+                  and project_id = :project_id
+            """),
+            {
+                "target_topic_id": target_topic_id,
+                "project_id": project_id,
+                "new_topic_name": new_topic_name,
+                "merged_description": merged_description,
+            },
+        )
+
+        db.execute(
+            text("""
+                delete from topics
+                where id = :source_topic_id
+                  and project_id = :project_id
+            """),
+            {
+                "source_topic_id": source_topic_id,
+                "project_id": project_id,
+            },
+        )
+        db.commit()
+
+        return {
+            "id": target_topic_id,
+            "topic": new_topic_name,
+            "category": target_topic[2],
+            "merged_topic_id": source_topic_id,
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
 
 @app.post("/projects/{project_id}/ask_suggestions")
 async def get_ask_suggestions(project_id: str, req: dict, user = Depends(verify_user)):
@@ -13666,22 +16669,143 @@ def delete_document(
             db.close()
             raise HTTPException(status_code=403, detail="Access denied")
 
-        # 🔥 DELETE REAL (tutti i chunk del documento)
-        db.execute(
-            text("""
-                delete from chunks
-                where project_id = :project_id
-                and doc_title = :doc_title
-            """),
-            {
-                "project_id": project_id,
-                "doc_title": doc_title
-            }
-        )
-        print("ROWS DELETED")
+        try:
+            module_document = db.execute(
+                text("""
+                    select
+                        d.module_id,
+                        sm.taxonomy_status,
+                        sm.status
+                    from documents d
+                    left join study_modules sm on sm.id = d.module_id
+                    where d.project_id = :project_id
+                      and d.title = :doc_title
+                      and d.module_id is not null
+                    limit 1
+                """),
+                {
+                    "project_id": project_id,
+                    "doc_title": doc_title,
+                }
+            ).fetchone()
 
-        db.commit()
-        db.close()
+            if (
+                module_document
+                and (
+                    module_document[1] == "ready"
+                    or module_document[2] in (
+                        "pending_study",
+                        "accepted_for_study",
+                    )
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This document belongs to a generated Study Module "
+                        "taxonomy. Safe module document deletion will be "
+                        "handled in a future sprint."
+                    ),
+                )
+
+            document_scope = """
+                project_id = :project_id
+                and (
+                    doc_title = :doc_title
+                    or document_id in (
+                        select id
+                        from documents
+                        where project_id = :project_id
+                        and title = :doc_title
+                    )
+                )
+            """
+
+            db.execute(
+                text(f"""
+                    delete from topic_chunks
+                    where chunk_id in (
+                        select id
+                        from chunks
+                        where {document_scope}
+                    )
+                """),
+                {
+                    "project_id": project_id,
+                    "doc_title": doc_title
+                }
+            )
+
+            db.execute(
+                text("""
+                    delete from topic_chunks
+                    where topic_id in (
+                        select id
+                        from topics
+                        where project_id = :project_id
+                        and document_id in (
+                            select id
+                            from documents
+                            where project_id = :project_id
+                            and title = :doc_title
+                        )
+                    )
+                """),
+                {
+                    "project_id": project_id,
+                    "doc_title": doc_title
+                }
+            )
+
+            db.execute(
+                text("""
+                    delete from topics
+                    where project_id = :project_id
+                    and document_id in (
+                        select id
+                        from documents
+                        where project_id = :project_id
+                        and title = :doc_title
+                    )
+                """),
+                {
+                    "project_id": project_id,
+                    "doc_title": doc_title
+                }
+            )
+
+            # 🔥 DELETE REAL (tutti i chunk del documento)
+            db.execute(
+                text(f"""
+                    delete from chunks
+                    where {document_scope}
+                """),
+                {
+                    "project_id": project_id,
+                    "doc_title": doc_title
+                }
+            )
+
+            db.execute(
+                text("""
+                    delete from documents
+                    where project_id = :project_id
+                    and title = :doc_title
+                """),
+                {
+                    "project_id": project_id,
+                    "doc_title": doc_title
+                }
+            )
+
+            print("ROWS DELETED")
+
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
         return {"status": "deleted"}   
  

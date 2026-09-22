@@ -83,6 +83,16 @@ class PlannerStateEvaluator:
                 where project_id = :project_id
                 and topic is not null
                 and is_display_topic = true
+                and (
+                    module_id is null
+                    or exists (
+                        select 1
+                        from study_modules sm
+                        where sm.id = topics.module_id
+                        and sm.project_id = topics.project_id
+                        and sm.accepted_for_study = true
+                    )
+                )
             """),
             {"project_id": project_id},
         ).fetchall()

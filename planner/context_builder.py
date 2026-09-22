@@ -125,6 +125,16 @@ def _load_project(
                         where t.project_id = p.id
                         and t.topic is not null
                         and t.is_display_topic = true
+                        and (
+                            t.module_id is null
+                            or exists (
+                                select 1
+                                from study_modules sm
+                                where sm.id = t.module_id
+                                and sm.project_id = t.project_id
+                                and sm.accepted_for_study = true
+                            )
+                        )
                     )
                     then 0
                     else 1
@@ -157,7 +167,21 @@ def _load_display_topics(db: Any, project_id: str):
             where project_id = :project_id
             and topic is not null
             and is_display_topic = true
-            order by category asc, topic asc
+            and (
+                module_id is null
+                or exists (
+                    select 1
+                    from study_modules sm
+                    where sm.id = topics.module_id
+                    and sm.project_id = topics.project_id
+                    and sm.accepted_for_study = true
+                )
+            )
+            order by
+                coalesce(category_order_index, 2147483647) asc,
+                coalesce(topic_order_index, 2147483647) asc,
+                category asc,
+                topic asc
         """),
         {"project_id": project_id},
     ).fetchall()
@@ -184,6 +208,7 @@ def _build_topic_context(topic_rows):
             id=topic_id,
             title=topic_title,
             order=order,
+            category=category,
         )
         topics_by_category[category].append(selected_topic)
         topic_lookup.setdefault(_normalize_topic_key(topic_title), category)

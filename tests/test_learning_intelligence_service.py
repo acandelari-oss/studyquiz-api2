@@ -37,17 +37,19 @@ class LearningIntelligenceServiceTests(unittest.TestCase):
         started_at="2026-07-30T10:00:00+00:00",
         completed_at="2026-07-30T10:30:00+00:00",
         user_id="user-1",
+        project_id="project-1",
     ):
         self.db.execute(
             text("""
                 insert into learning_sessions
                 (id, user_id, project_id, session_type, started_at, completed_at, status)
                 values
-                (:id, :user_id, 'project-1', :session_type, :started_at, :completed_at, :status)
+                (:id, :user_id, :project_id, :session_type, :started_at, :completed_at, :status)
             """),
             {
                 "id": session_id,
                 "user_id": user_id,
+                "project_id": project_id,
                 "session_type": session_type,
                 "started_at": started_at,
                 "completed_at": completed_at,
@@ -196,6 +198,28 @@ class LearningIntelligenceServiceTests(unittest.TestCase):
 
         self.assertEqual(insight["level"], "positive")
         self.assertIn("100.0%", insight["message"])
+
+    def test_intelligence_can_be_scoped_to_one_project(self):
+        self._insert_session("project-1-completed", "quiz", "completed")
+        self._insert_session(
+            "project-2-abandoned",
+            "quiz",
+            "abandoned",
+            project_id="project-2",
+        )
+
+        insights = {
+            insight["type"]: insight
+            for insight in get_learning_intelligence(
+                self.db,
+                "user-1",
+                now=self.fixed_now,
+                project_id="project-1",
+            )
+        }
+
+        self.assertEqual(insights["completion_rate"]["level"], "positive")
+        self.assertIn("100.0%", insights["completion_rate"]["message"])
 
 
 if __name__ == "__main__":

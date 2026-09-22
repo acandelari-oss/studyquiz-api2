@@ -103,6 +103,200 @@ class PlannerActivityPlannerTests(unittest.TestCase):
             [10, 15],
         )
 
+    def test_groups_small_quiz_allocations_into_substantial_multi_category_quiz(self):
+        daily_plan = self.planner.plan_daily_plan(
+            context=PlannerContext(
+                preferences=PlannerPreferences(question_pace_seconds=60)
+            ),
+            daily_plan=self._daily_plan(
+                self._allocation("A", 2),
+                self._allocation("B", 3),
+                self._allocation("C", 2),
+            ),
+            daily_strategy=self._daily_strategy(
+                self._activity_strategy(
+                    "A",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=0,
+                    questions=4,
+                ),
+                self._activity_strategy(
+                    "B",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=1,
+                    questions=6,
+                ),
+                self._activity_strategy(
+                    "C",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=2,
+                    questions=4,
+                ),
+            ),
+        )
+
+        self.assertEqual(len(daily_plan.activities), 1)
+        quiz = daily_plan.activities[0]
+
+        self.assertEqual(quiz.type, ActivityType.QUIZ)
+        self.assertEqual(quiz.configuration.num_questions, 14)
+        self.assertEqual(
+            [topic.id for topic in quiz.configuration.selected_topics],
+            [
+                "A-1",
+                "A-2",
+                "B-1",
+                "B-2",
+                "B-3",
+                "C-1",
+                "C-2",
+            ],
+        )
+        self.assertEqual(
+            [topic.category for topic in quiz.configuration.selected_topics],
+            ["A", "A", "B", "B", "B", "C", "C"],
+        )
+
+    def test_does_not_merge_healthy_single_category_quiz_unnecessarily(self):
+        daily_plan = self.planner.plan_daily_plan(
+            context=PlannerContext(
+                preferences=PlannerPreferences(question_pace_seconds=60)
+            ),
+            daily_plan=self._daily_plan(
+                self._allocation("A", 5),
+                self._allocation("B", 2),
+            ),
+            daily_strategy=self._daily_strategy(
+                self._activity_strategy(
+                    "A",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=0,
+                    questions=10,
+                ),
+                self._activity_strategy(
+                    "B",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=1,
+                    questions=4,
+                ),
+            ),
+        )
+
+        self.assertEqual(len(daily_plan.activities), 2)
+        self.assertEqual(
+            [activity.configuration.num_questions for activity in daily_plan.activities],
+            [10, 4],
+        )
+        self.assertEqual(
+            [
+                [topic.category for topic in activity.configuration.selected_topics]
+                for activity in daily_plan.activities
+            ],
+            [["A", "A", "A", "A", "A"], ["B", "B"]],
+        )
+
+    def test_grouped_quiz_can_remain_below_ten_when_material_is_insufficient(self):
+        daily_plan = self.planner.plan_daily_plan(
+            context=PlannerContext(
+                preferences=PlannerPreferences(question_pace_seconds=60)
+            ),
+            daily_plan=self._daily_plan(
+                self._allocation("A", 2),
+                self._allocation("B", 1),
+            ),
+            daily_strategy=self._daily_strategy(
+                self._activity_strategy(
+                    "A",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=0,
+                    questions=4,
+                ),
+                self._activity_strategy(
+                    "B",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=1,
+                    questions=2,
+                ),
+            ),
+        )
+
+        quiz = daily_plan.activities[0]
+
+        self.assertEqual(len(daily_plan.activities), 1)
+        self.assertEqual(quiz.configuration.num_questions, 6)
+        self.assertGreaterEqual(
+            quiz.configuration.num_questions,
+            len(quiz.configuration.selected_topics),
+        )
+
+    def test_grouped_quiz_duration_is_recalculated_from_final_question_count(self):
+        daily_plan = self.planner.plan_daily_plan(
+            context=PlannerContext(
+                preferences=PlannerPreferences(question_pace_seconds=90)
+            ),
+            daily_plan=self._daily_plan(
+                self._allocation("A", 2, duration=20),
+                self._allocation("B", 3, duration=20),
+            ),
+            daily_strategy=self._daily_strategy(
+                self._activity_strategy(
+                    "A",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=0,
+                    questions=4,
+                ),
+                self._activity_strategy(
+                    "B",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=1,
+                    questions=6,
+                ),
+            ),
+        )
+
+        quiz = daily_plan.activities[0]
+
+        self.assertEqual(quiz.configuration.num_questions, 10)
+        self.assertEqual(quiz.configuration.estimated_duration_minutes, 15)
+
+    def test_flashcards_are_not_grouped_with_quiz_allocations(self):
+        daily_plan = self.planner.plan_daily_plan(
+            context=PlannerContext(
+                preferences=PlannerPreferences(question_pace_seconds=60)
+            ),
+            daily_plan=self._daily_plan(
+                self._allocation("A", 2),
+                self._allocation("B", 2),
+                self._allocation("C", 3),
+            ),
+            daily_strategy=self._daily_strategy(
+                self._activity_strategy(
+                    "A",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=0,
+                    questions=4,
+                ),
+                self._activity_strategy(
+                    "B",
+                    ProfessorDailyActivityType.FLASHCARDS,
+                    allocation_index=1,
+                    flashcards=8,
+                ),
+                self._activity_strategy(
+                    "C",
+                    ProfessorDailyActivityType.QUIZ,
+                    allocation_index=2,
+                    questions=6,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            [activity.type for activity in daily_plan.activities],
+            [ActivityType.QUIZ, ActivityType.FLASHCARDS, ActivityType.QUIZ],
+        )
+        self.assertEqual(daily_plan.activities[1].configuration.num_cards, 8)
+
     def test_translates_professor_flashcard_strategy_to_flashcards(self):
         daily_plan = self.planner.plan_daily_plan(
             context=PlannerContext(),
@@ -174,7 +368,14 @@ class PlannerActivityPlannerTests(unittest.TestCase):
         )
 
         for activity in daily_plan.activities:
-            self.assertEqual(activity.configuration.selected_topics, allocation.selected_topics)
+            self.assertEqual(
+                [topic.id for topic in activity.configuration.selected_topics],
+                [topic.id for topic in allocation.selected_topics],
+            )
+            self.assertEqual(
+                [topic.category for topic in activity.configuration.selected_topics],
+                ["Genetics", "Genetics"],
+            )
             self.assertEqual(activity.configuration.estimated_duration_minutes, 4.5)
 
     def test_activities_have_empty_execution_and_result(self):

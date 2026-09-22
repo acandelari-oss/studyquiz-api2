@@ -34,17 +34,19 @@ class LearningJournalServiceTests(unittest.TestCase):
         started_at,
         completed_at,
         user_id="user-1",
+        project_id="project-1",
     ):
         self.db.execute(
             text("""
                 insert into learning_sessions
                 (id, user_id, project_id, session_type, started_at, completed_at, status)
                 values
-                (:id, :user_id, 'project-1', :session_type, :started_at, :completed_at, :status)
+                (:id, :user_id, :project_id, :session_type, :started_at, :completed_at, :status)
             """),
             {
                 "id": session_id,
                 "user_id": user_id,
+                "project_id": project_id,
                 "session_type": session_type,
                 "started_at": started_at,
                 "completed_at": completed_at,
@@ -144,6 +146,28 @@ class LearningJournalServiceTests(unittest.TestCase):
             "new-session",
             "old-session",
         ])
+
+    def test_journal_can_be_scoped_to_one_project(self):
+        self._insert_session(
+            "project-1-session",
+            "quiz",
+            "completed",
+            "2026-07-30T10:00:00+00:00",
+            "2026-07-30T10:10:00+00:00",
+        )
+        self._insert_session(
+            "project-2-session",
+            "flashcards",
+            "completed",
+            "2026-07-30T11:00:00+00:00",
+            "2026-07-30T11:10:00+00:00",
+            project_id="project-2",
+        )
+
+        journal = get_learning_journal(self.db, "user-1", project_id="project-1")
+
+        self.assertEqual(len(journal), 1)
+        self.assertEqual(journal[0]["id"], "project-1-session")
 
     def test_limit_and_offset_are_applied(self):
         self._insert_session(

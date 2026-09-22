@@ -161,32 +161,43 @@ def summarize_learning_sessions(rows, now=None, quiz_rows=None):
     }
 
 
-def get_learning_summary(db, user_id):
+def get_learning_summary(db, user_id, project_id=None):
+    session_filters = "where user_id = :user_id"
+    quiz_filters = """
+            where user_id = :user_id
+            and total_questions > 0
+    """
+    params = {"user_id": user_id}
+
+    if project_id:
+        session_filters += " and project_id = :project_id"
+        quiz_filters += " and project_id = :project_id"
+        params["project_id"] = project_id
+
     rows = db.execute(
-        text("""
+        text(f"""
             select
                 session_type,
                 status,
                 started_at,
                 completed_at
             from learning_sessions
-            where user_id = :user_id
+            {session_filters}
         """),
-        {"user_id": user_id},
+        params,
     ).fetchall()
 
     quiz_rows = db.execute(
-        text("""
+        text(f"""
             select
                 created_at as completed_at,
                 score,
                 total_questions
             from quiz_attempts
-            where user_id = :user_id
-            and total_questions > 0
+            {quiz_filters}
             order by created_at asc
         """),
-        {"user_id": user_id},
+        params,
     ).fetchall()
 
     return summarize_learning_sessions(rows, quiz_rows=quiz_rows)

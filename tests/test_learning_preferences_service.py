@@ -34,17 +34,19 @@ class LearningPreferencesServiceTests(unittest.TestCase):
         started_at="2026-07-30T10:00:00+00:00",
         completed_at="2026-07-30T10:20:00+00:00",
         user_id="user-1",
+        project_id="project-1",
     ):
         self.db.execute(
             text("""
                 insert into learning_sessions
                 (id, user_id, project_id, session_type, started_at, completed_at, status)
                 values
-                (:id, :user_id, 'project-1', :session_type, :started_at, :completed_at, :status)
+                (:id, :user_id, :project_id, :session_type, :started_at, :completed_at, :status)
             """),
             {
                 "id": session_id,
                 "user_id": user_id,
+                "project_id": project_id,
                 "session_type": session_type,
                 "started_at": started_at,
                 "completed_at": completed_at,
@@ -86,6 +88,25 @@ class LearningPreferencesServiceTests(unittest.TestCase):
 
         self.assertEqual(preferences["total_sessions_observed"], 1)
         self.assertEqual(preferences["completed_sessions_observed"], 1)
+        self.assertEqual(preferences["completion_rate_by_activity"]["quiz"], 100.0)
+        self.assertIsNone(preferences["completion_rate_by_activity"]["flashcards"])
+
+    def test_preferences_can_be_scoped_to_one_project(self):
+        self._insert_session("project-1-session", "quiz", "completed")
+        self._insert_session(
+            "project-2-session",
+            "flashcards",
+            "completed",
+            project_id="project-2",
+        )
+
+        preferences = get_learning_preferences(
+            self.db,
+            "user-1",
+            project_id="project-1",
+        )
+
+        self.assertEqual(preferences["total_sessions_observed"], 1)
         self.assertEqual(preferences["completion_rate_by_activity"]["quiz"], 100.0)
         self.assertIsNone(preferences["completion_rate_by_activity"]["flashcards"])
 

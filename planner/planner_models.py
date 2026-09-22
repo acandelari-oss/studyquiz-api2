@@ -24,6 +24,7 @@ class SelectedTopic:
     id: str
     title: str
     order: Optional[int] = None
+    category: Optional[str] = None
 
 
 @dataclass

@@ -195,19 +195,26 @@ def build_learning_intelligence(rows, now=None):
     return insights
 
 
-def get_learning_intelligence(db, user_id, now=None):
+def get_learning_intelligence(db, user_id, now=None, project_id=None):
+    filters = "where user_id = :user_id"
+    params = {"user_id": user_id}
+
+    if project_id:
+        filters += " and project_id = :project_id"
+        params["project_id"] = project_id
+
     rows = db.execute(
-        text("""
+        text(f"""
             select
                 session_type,
                 status,
                 started_at,
                 completed_at
             from learning_sessions
-            where user_id = :user_id
+            {filters}
             order by started_at desc
         """),
-        {"user_id": user_id},
+        params,
     ).fetchall()
 
     return build_learning_intelligence(rows, now=now)

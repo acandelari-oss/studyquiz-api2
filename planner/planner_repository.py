@@ -642,6 +642,7 @@ class PlannerRepository:
                 id=str(value.get("id")),
                 title=value.get("title") or "",
                 order=value.get("order"),
+                category=value.get("category"),
             )
             for value in values or []
         )

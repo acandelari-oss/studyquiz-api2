@@ -83,14 +83,24 @@ def normalize_journal_pagination(limit=None, offset=None):
     return resolved_limit, resolved_offset
 
 
-def get_learning_journal(db, user_id, limit=None, offset=None):
+def get_learning_journal(db, user_id, limit=None, offset=None, project_id=None):
     resolved_limit, resolved_offset = normalize_journal_pagination(
         limit,
         offset,
     )
+    filters = "where user_id = :user_id"
+    params = {
+        "user_id": user_id,
+        "limit": resolved_limit,
+        "offset": resolved_offset,
+    }
+
+    if project_id:
+        filters += " and project_id = :project_id"
+        params["project_id"] = project_id
 
     rows = db.execute(
-        text("""
+        text(f"""
             select
                 id,
                 project_id,
@@ -99,16 +109,12 @@ def get_learning_journal(db, user_id, limit=None, offset=None):
                 completed_at,
                 status
             from learning_sessions
-            where user_id = :user_id
+            {filters}
             order by started_at desc
             limit :limit
             offset :offset
         """),
-        {
-            "user_id": user_id,
-            "limit": resolved_limit,
-            "offset": resolved_offset,
-        },
+        params,
     ).fetchall()
 
     return serialize_learning_journal_rows(rows)

@@ -45,17 +45,19 @@ class LearningSummaryServiceTests(unittest.TestCase):
         started_at="2026-07-30T10:00:00+00:00",
         completed_at="2026-07-30T10:30:00+00:00",
         user_id="user-1",
+        project_id="project-1",
     ):
         self.db.execute(
             text("""
                 insert into learning_sessions
                 (id, user_id, project_id, session_type, started_at, completed_at, status)
                 values
-                (:id, :user_id, 'project-1', :session_type, :started_at, :completed_at, :status)
+                (:id, :user_id, :project_id, :session_type, :started_at, :completed_at, :status)
             """),
             {
                 "id": session_id,
                 "user_id": user_id,
+                "project_id": project_id,
                 "session_type": session_type,
                 "started_at": started_at,
                 "completed_at": completed_at,
@@ -71,17 +73,19 @@ class LearningSummaryServiceTests(unittest.TestCase):
         total_questions,
         created_at="2026-07-30T10:30:00+00:00",
         user_id="user-1",
+        project_id="project-1",
     ):
         self.db.execute(
             text("""
                 insert into quiz_attempts
                 (id, user_id, project_id, score, total_questions, created_at)
                 values
-                (:id, :user_id, 'project-1', :score, :total_questions, :created_at)
+                (:id, :user_id, :project_id, :score, :total_questions, :created_at)
             """),
             {
                 "id": attempt_id,
                 "user_id": user_id,
+                "project_id": project_id,
                 "score": score,
                 "total_questions": total_questions,
                 "created_at": created_at,
@@ -159,6 +163,30 @@ class LearningSummaryServiceTests(unittest.TestCase):
         self.assertEqual(summary["favorite_activity"], "quiz")
         self.assertEqual(summary["activities"]["quiz"], 2)
         self.assertEqual(summary["activities"]["planner"], 1)
+
+    def test_summary_can_be_scoped_to_one_project(self):
+        self._insert_session("project-1-session", "quiz", "completed")
+        self._insert_session(
+            "project-2-session",
+            "flashcards",
+            "completed",
+            project_id="project-2",
+        )
+        self._insert_quiz_attempt("project-1-attempt", score=8, total_questions=10)
+        self._insert_quiz_attempt(
+            "project-2-attempt",
+            score=2,
+            total_questions=10,
+            project_id="project-2",
+        )
+
+        summary = get_learning_summary(self.db, "user-1", project_id="project-1")
+
+        self.assertEqual(summary["total_sessions"], 1)
+        self.assertEqual(summary["activities"]["quiz"], 1)
+        self.assertEqual(summary["activities"]["flashcards"], 0)
+        self.assertEqual(len(summary["quiz_accuracy_history"]), 1)
+        self.assertEqual(summary["quiz_accuracy_history"][0]["accuracy"], 80.0)
 
     def test_invalid_timestamps_do_not_fail_or_add_minutes(self):
         self._insert_session(
