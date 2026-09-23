@@ -9030,7 +9030,7 @@ async def ingest_stream(
 ):
     docs = data.documents
     requested_module_id = (data.module_id or "").strip() or None
-    module_name = (data.module_name or "").strip()
+    requested_module_name = (data.module_name or "").strip()
     organization = _normalize_study_module_organization(
         data.organization_mode,
         data.organization_blueprint,
@@ -9040,7 +9040,7 @@ async def ingest_stream(
     if not docs:
         raise HTTPException(status_code=400, detail="No documents provided")
 
-    if not requested_module_id and not module_name:
+    if not requested_module_id and not requested_module_name:
         raise HTTPException(status_code=400, detail="Module name is required")
 
     async def generate():
@@ -9059,6 +9059,7 @@ async def ingest_stream(
         created_uploaded_documents = []
         uploaded_documents = []
         module_id = requested_module_id
+        module_name = requested_module_name
 
         try:
             pipeline_log.header()
