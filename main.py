@@ -816,6 +816,7 @@ class IngestDocument(BaseModel):
 
 class IngestRequest(BaseModel):
     documents: List[IngestDocument]
+    module_id: Optional[str] = None
     module_name: Optional[str] = None
     organization_mode: Optional[str] = None
     organization_blueprint: Optional[dict] = None
@@ -4635,9 +4636,20 @@ def list_documents(
 
     rows = db.execute(
         text("""
-            select distinct doc_title
-            from chunks
-            where project_id = :project_id
+            select
+                d.id,
+                d.title,
+                d.module_id,
+                m.name as module_name,
+                m.order_index as module_order_index,
+                coalesce(m.accepted_for_study, false) as accepted_for_study
+            from documents d
+            left join study_modules m on m.id = d.module_id
+            where d.project_id = :project_id
+            order by
+                coalesce(m.order_index, 2147483647) asc,
+                coalesce(d.module_order_index, 2147483647) asc,
+                d.title asc
         """),
         {"project_id": project_id}
     ).fetchall()
@@ -4646,7 +4658,14 @@ def list_documents(
 
     return {
     "documents": [
-        {"id": r[0], "title": r[0]}
+        {
+            "id": str(r[0]),
+            "title": r[1],
+            "module_id": str(r[2]) if r[2] else None,
+            "module_name": r[3] or None,
+            "module_order_index": r[4],
+            "accepted_for_study": bool(r[5]),
+        }
         for r in rows
     ]
 }
@@ -8776,6 +8795,7 @@ async def ingest_stream(
     user = Depends(verify_user)
 ):
     docs = data.documents
+    requested_module_id = (data.module_id or "").strip() or None
     module_name = (data.module_name or "").strip()
     organization = _normalize_study_module_organization(
         data.organization_mode,
@@ -8786,7 +8806,7 @@ async def ingest_stream(
     if not docs:
         raise HTTPException(status_code=400, detail="No documents provided")
 
-    if not module_name:
+    if not requested_module_id and not module_name:
         raise HTTPException(status_code=400, detail="Module name is required")
 
     async def generate():
@@ -8803,7 +8823,7 @@ async def ingest_stream(
         total_embedding_calls = 0
         total_chunk_chars = 0
         uploaded_documents = []
-        module_id = None
+        module_id = requested_module_id
 
         try:
             pipeline_log.header()
@@ -8827,49 +8847,99 @@ async def ingest_stream(
                 operation="create study module and set topic_status processing",
             )
             _require_owned_project(db, project_id, user["id"])
-            module_id = str(uuid.uuid4())
-            module_order_index = db.execute(
+            if requested_module_id:
+                existing_module = db.execute(
+                    text("""
+                        select id, name, order_index, accepted_for_study
+                        from study_modules
+                        where id = :module_id
+                          and project_id = :project_id
+                    """),
+                    {
+                        "module_id": requested_module_id,
+                        "project_id": project_id,
+                    }
+                ).fetchone()
+                if not existing_module:
+                    raise HTTPException(status_code=404, detail="Study module not found")
+                if bool(existing_module[3]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This Study Module is already in Study Mode and cannot receive new files",
+                    )
+
+                module_id = str(existing_module[0])
+                module_name = existing_module[1] or module_name
+                module_order_index = existing_module[2]
+                db.execute(
+                    text("""
+                        update study_modules
+                        set status = 'building',
+                            taxonomy_status = 'building'
+                        where id = :module_id
+                          and project_id = :project_id
+                    """),
+                    {
+                        "module_id": module_id,
+                        "project_id": project_id,
+                    }
+                )
+            else:
+                module_id = str(uuid.uuid4())
+                module_order_index = db.execute(
+                    text("""
+                        select coalesce(max(order_index), 0) + 1
+                        from study_modules
+                        where project_id = :project_id
+                    """),
+                    {"project_id": project_id}
+                ).scalar()
+                db.execute(
+                    text("""
+                        insert into study_modules (
+                            id,
+                            project_id,
+                            name,
+                            order_index,
+                            status,
+                            taxonomy_status,
+                            accepted_for_study
+                        )
+                        values (
+                            :module_id,
+                            :project_id,
+                            :name,
+                            :order_index,
+                            'building',
+                            'building',
+                            false
+                        )
+                    """),
+                    {
+                        "module_id": module_id,
+                        "project_id": project_id,
+                        "name": module_name,
+                        "order_index": module_order_index,
+                    }
+                )
+                _update_study_module_organization_metadata(
+                    db,
+                    module_id,
+                    project_id,
+                    organization,
+                )
+            next_document_order_index = db.execute(
                 text("""
-                    select coalesce(max(order_index), 0) + 1
-                    from study_modules
+                    select coalesce(max(module_order_index), 0) + 1
+                    from documents
                     where project_id = :project_id
-                """),
-                {"project_id": project_id}
-            ).scalar()
-            db.execute(
-                text("""
-                    insert into study_modules (
-                        id,
-                        project_id,
-                        name,
-                        order_index,
-                        status,
-                        taxonomy_status,
-                        accepted_for_study
-                    )
-                    values (
-                        :module_id,
-                        :project_id,
-                        :name,
-                        :order_index,
-                        'building',
-                        'building',
-                        false
-                    )
+                      and module_id = :module_id
                 """),
                 {
-                    "module_id": module_id,
                     "project_id": project_id,
-                    "name": module_name,
-                    "order_index": module_order_index,
+                    "module_id": module_id,
                 }
-            )
-            _update_study_module_organization_metadata(
-                db,
-                module_id,
-                project_id,
-                organization,
-            )
+            ).scalar() or 1
             db.execute(
                 text("""
                     update projects
@@ -8993,7 +9063,7 @@ async def ingest_stream(
                         "document_id": document_id,
                         "project_id": project_id,
                         "module_id": module_id,
-                        "module_order_index": document_index + 1,
+                            "module_order_index": next_document_order_index + document_index,
                         "title": doc.title,
                         "text": "",
                     }
