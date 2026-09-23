@@ -26,7 +26,7 @@ import asyncio
 import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 from fastapi import HTTPException
 from fastapi import Body
 from language_registry import (
@@ -102,6 +102,111 @@ MAX_WARNING_PAGES = 100
 MAX_STRONG_WARNING_PAGES = 180
 
 _UPLOAD_DIAGNOSTIC_SUMMARIES = {}
+
+
+def _stream_safe_message(message: object) -> str:
+    return quote(str(message or "Upload failed").replace("\n", " ").replace("\r", " "), safe="")
+
+
+def _uploaded_document_ids(uploaded_documents: Optional[list]) -> List[str]:
+    ids = []
+    for uploaded_document in uploaded_documents or []:
+        document_id = str(uploaded_document.get("document_id") or "").strip()
+        if document_id:
+            ids.append(document_id)
+    return ids
+
+
+def _cleanup_failed_uploaded_documents(
+    db,
+    project_id: str,
+    uploaded_documents: Optional[list],
+) -> int:
+    document_ids = _uploaded_document_ids(uploaded_documents)
+    if not document_ids:
+        return 0
+
+    cleaned = 0
+    for document_id in document_ids:
+        params = {
+            "project_id": project_id,
+            "document_id": document_id,
+        }
+        db.execute(
+            text("""
+                delete from topic_chunks
+                where chunk_id in (
+                    select id
+                    from chunks
+                    where project_id = :project_id
+                      and document_id::text = :document_id
+                )
+            """),
+            params,
+        )
+        db.execute(
+            text("""
+                delete from topic_chunks
+                where topic_id in (
+                    select id
+                    from topics
+                    where project_id = :project_id
+                      and document_id::text = :document_id
+                )
+            """),
+            params,
+        )
+        db.execute(
+            text("""
+                delete from topics
+                where project_id = :project_id
+                  and document_id::text = :document_id
+            """),
+            params,
+        )
+        db.execute(
+            text("""
+                delete from chunks
+                where project_id = :project_id
+                  and document_id::text = :document_id
+            """),
+            params,
+        )
+        result = db.execute(
+            text("""
+                delete from documents
+                where project_id = :project_id
+                  and id::text = :document_id
+            """),
+            params,
+        )
+        cleaned += result.rowcount or 0
+
+    db.commit()
+    print(
+        "🧯 FAILED UPLOAD CLEANUP:",
+        {
+            "project_id": project_id,
+            "document_ids": document_ids,
+            "documents_removed": cleaned,
+        },
+    )
+    return cleaned
+
+
+def _remaining_module_document_count(db, project_id: str, module_id: str) -> int:
+    return db.execute(
+        text("""
+            select count(*)
+            from documents
+            where project_id = :project_id
+              and module_id = :module_id
+        """),
+        {
+            "project_id": project_id,
+            "module_id": module_id,
+        },
+    ).scalar() or 0
 
 
 class UploadPipelineLogger:
@@ -7978,6 +8083,120 @@ def process_uploaded_documents_topics_task(
                 "❌ MODULE TOPIC PROCESSING FAILED:",
                 module_id,
             )
+            cleanup_db = SessionLocal()
+            try:
+                _cleanup_failed_uploaded_documents(
+                    cleanup_db,
+                    project_id,
+                    uploaded_documents,
+                )
+                remaining_documents = _remaining_module_document_count(
+                    cleanup_db,
+                    project_id,
+                    module_id,
+                )
+                print(
+                    "🧯 MODULE ROLLBACK STATE:",
+                    {
+                        "project_id": project_id,
+                        "module_id": module_id,
+                        "remaining_documents": remaining_documents,
+                    },
+                )
+                if remaining_documents > 0:
+                    cleanup_db.execute(
+                        text("""
+                            update projects
+                            set topic_status = 'processing'
+                            where id = :project_id
+                        """),
+                        {"project_id": project_id},
+                    )
+                    cleanup_db.execute(
+                        text("""
+                            update study_modules
+                            set status = 'building',
+                                taxonomy_status = 'building'
+                            where id = :module_id
+                              and project_id = :project_id
+                        """),
+                        {
+                            "module_id": module_id,
+                            "project_id": project_id,
+                        },
+                    )
+                    cleanup_db.commit()
+                    restored = process_topics_task(
+                        project_id,
+                        document_id=None,
+                        document_title="module rollback restore",
+                        mark_project_completed=True,
+                        module_id=module_id,
+                    )
+                    print(
+                        "🧯 MODULE ROLLBACK RESTORE:",
+                        {
+                            "project_id": project_id,
+                            "module_id": module_id,
+                            "restored": restored,
+                        },
+                    )
+                else:
+                    cleanup_db.execute(
+                        text("""
+                            delete from topic_chunks
+                            where topic_id in (
+                                select id
+                                from topics
+                                where project_id = :project_id
+                                  and module_id = :module_id
+                            )
+                        """),
+                        {
+                            "project_id": project_id,
+                            "module_id": module_id,
+                        },
+                    )
+                    cleanup_db.execute(
+                        text("""
+                            delete from topics
+                            where project_id = :project_id
+                              and module_id = :module_id
+                        """),
+                        {
+                            "project_id": project_id,
+                            "module_id": module_id,
+                        },
+                    )
+                    cleanup_db.execute(
+                        text("""
+                            update projects
+                            set topic_status = 'error'
+                            where id = :project_id
+                        """),
+                        {"project_id": project_id},
+                    )
+                    cleanup_db.execute(
+                        text("""
+                            update study_modules
+                            set taxonomy_status = 'failed'
+                            where id = :module_id
+                              and project_id = :project_id
+                        """),
+                        {
+                            "module_id": module_id,
+                            "project_id": project_id,
+                        },
+                    )
+                    cleanup_db.commit()
+            except Exception as rollback_error:
+                cleanup_db.rollback()
+                print(
+                    "❌ MODULE FAILED-UPLOAD CLEANUP FAILED:",
+                    repr(rollback_error),
+                )
+            finally:
+                cleanup_db.close()
         return
 
     for index, uploaded_document in enumerate(uploaded_documents):
@@ -7994,6 +8213,21 @@ def process_uploaded_documents_topics_task(
                 "❌ STOPPING DOCUMENT TOPIC PROCESSING AFTER FAILURE:",
                 uploaded_document.get("document_id"),
             )
+            cleanup_db = SessionLocal()
+            try:
+                _cleanup_failed_uploaded_documents(
+                    cleanup_db,
+                    project_id,
+                    [uploaded_document],
+                )
+            except Exception as rollback_error:
+                cleanup_db.rollback()
+                print(
+                    "❌ DOCUMENT FAILED-UPLOAD CLEANUP FAILED:",
+                    repr(rollback_error),
+                )
+            finally:
+                cleanup_db.close()
             break
 
 def assign_topics_to_chunks(
@@ -8822,6 +9056,7 @@ async def ingest_stream(
         total_chunks_created = 0
         total_embedding_calls = 0
         total_chunk_chars = 0
+        created_uploaded_documents = []
         uploaded_documents = []
         module_id = requested_module_id
 
@@ -9070,6 +9305,11 @@ async def ingest_stream(
                 )
                 db.commit()
                 pipeline_log.end("DATABASE COMMIT")
+                created_uploaded_documents.append({
+                    "document_id": document_id,
+                    "title": doc.title,
+                    "module_id": module_id,
+                })
 
                 if total_pages and total_pages > MAX_WARNING_PAGES:
                     yield (
@@ -9444,12 +9684,53 @@ async def ingest_stream(
             yield "Upload complete ✅\n"
 
         except Exception as e:
+            error_message = getattr(e, "detail", None) or str(e)
             pipeline_log.failure_summary(e)
             print("UPLOAD EXCEPTION:", repr(e))
             db.rollback()
+            try:
+                _cleanup_failed_uploaded_documents(
+                    db,
+                    project_id,
+                    created_uploaded_documents,
+                )
+            except Exception as cleanup_error:
+                db.rollback()
+                print(
+                    "❌ STREAM FAILED-UPLOAD CLEANUP FAILED:",
+                    repr(cleanup_error),
+                )
+            remaining_documents_after_cleanup = (
+                _remaining_module_document_count(db, project_id, module_id)
+                if module_id
+                else 0
+            )
             pipeline_log.start("DATABASE COMMIT", operation="set topic_status error")
-            db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
-            if module_id:
+            if module_id and remaining_documents_after_cleanup > 0:
+                db.execute(
+                    text("""
+                        update projects
+                        set topic_status = 'completed'
+                        where id = :project_id
+                    """),
+                    {"project_id": project_id}
+                )
+                db.execute(
+                    text("""
+                        update study_modules
+                        set status = 'pending_study',
+                            taxonomy_status = 'ready'
+                        where id = :module_id
+                          and project_id = :project_id
+                    """),
+                    {
+                        "module_id": module_id,
+                        "project_id": project_id,
+                    }
+                )
+            else:
+                db.execute(text("update projects set topic_status = 'error' where id = :project_id"), {"project_id": project_id})
+            if module_id and remaining_documents_after_cleanup <= 0:
                 db.execute(
                     text("""
                         update study_modules
@@ -9464,7 +9745,8 @@ async def ingest_stream(
                 )
             db.commit()
             pipeline_log.end("DATABASE COMMIT")
-            yield f"Upload failed: {str(e)}\n"
+            yield f"UPLOAD_FAILED|message={_stream_safe_message(error_message)}\n"
+            yield f"Upload failed: {error_message}\n"
         finally:
             db.close()
 
@@ -16782,8 +17064,8 @@ def delete_document(
                 project_id = :project_id
                 and (
                     doc_title = :doc_title
-                    or document_id in (
-                        select id
+                    or document_id::text in (
+                        select id::text
                         from documents
                         where project_id = :project_id
                         and title = :doc_title
@@ -16813,8 +17095,8 @@ def delete_document(
                         select id
                         from topics
                         where project_id = :project_id
-                        and document_id in (
-                            select id
+                        and document_id::text in (
+                            select id::text
                             from documents
                             where project_id = :project_id
                             and title = :doc_title
@@ -16831,8 +17113,8 @@ def delete_document(
                 text("""
                     delete from topics
                     where project_id = :project_id
-                    and document_id in (
-                        select id
+                    and document_id::text in (
+                        select id::text
                         from documents
                         where project_id = :project_id
                         and title = :doc_title
