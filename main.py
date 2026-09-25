@@ -4608,66 +4608,55 @@ def update_project_study_priorities(
 
 
 @app.post("/projects/{project_id}/begin_study")
+@app.post("/projects/{project_id}/modules/{module_id}/begin_study")
 def begin_project_study(
     project_id: str,
+    module_id: Optional[str] = None,
     user = Depends(verify_user)
 ):
-
-    user_id = user["id"]
     db = SessionLocal()
+    try:
+        _require_owned_project(db, project_id, user["id"])
+        if module_id is None:
+            pending = db.execute(text("""
+                select id from study_modules
+                where project_id = :project_id and accepted_for_study = false
+            """), {"project_id": project_id}).fetchall()
+            if len(pending) > 1:
+                raise HTTPException(status_code=400, detail="Choose one module to approve")
+            if pending:
+                module_id = str(pending[0][0])
 
-    project = db.execute(
-        text("""
-            select id
-            from projects
-            where id = :project_id
-            and user_id = :user_id
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
-        }
-    ).fetchone()
+        if module_id:
+            module = db.execute(text("""
+                select taxonomy_status, accepted_for_study from study_modules
+                where id = :module_id and project_id = :project_id
+            """), {"module_id": module_id, "project_id": project_id}).fetchone()
+            if not module:
+                raise HTTPException(status_code=404, detail="Study module not found")
+            if not module[1] and module[0] != "ready":
+                raise HTTPException(status_code=409, detail="Wait for this module's topic processing to finish before approving it")
+            db.execute(text("""
+                update study_modules
+                set status = 'accepted_for_study', accepted_for_study = true,
+                    accepted_at = coalesce(accepted_at, CURRENT_TIMESTAMP)
+                where id = :module_id and project_id = :project_id
+            """), {"module_id": module_id, "project_id": project_id})
 
-    if not project:
-        db.close()
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    db.execute(
-        text("""
-            update projects
-            set study_mode = 'learning',
+        db.execute(text("""
+            update projects set study_mode = 'learning',
                 professor_mode = coalesce(professor_mode, 'coverage')
             where id = :project_id
-            and user_id = :user_id
-        """),
-        {
-            "project_id": project_id,
-            "user_id": user_id
-        }
-    )
-    db.execute(
-        text("""
-            update study_modules
-            set
-                status = 'accepted_for_study',
-                accepted_for_study = true,
-                accepted_at = coalesce(accepted_at, CURRENT_TIMESTAMP)
-            where project_id = :project_id
-              and accepted_for_study = false
-        """),
-        {
-            "project_id": project_id
-        }
-    )
-    db.commit()
-    db.close()
+        """), {"project_id": project_id})
+        db.commit()
+        return {"project_id": project_id, "module_id": module_id,
+                "study_mode": "learning", "professor_mode": PROFESSOR_MODE_COVERAGE}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
-    return {
-        "project_id": project_id,
-        "study_mode": "learning",
-        "professor_mode": PROFESSOR_MODE_COVERAGE,
-    }
 
 # ======================
 # DELETE PROJECT
@@ -9837,6 +9826,12 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                         ON t.id = tc.topic_id
                     WHERE t.project_id = :project_id
                     AND tc.topic_id IN :topic_ids
+                    AND t.id IS NOT NULL
+                    AND (t.module_id IS NULL OR EXISTS (
+                        SELECT 1 FROM study_modules sm
+                        WHERE sm.id = t.module_id AND sm.project_id = t.project_id
+                        AND sm.accepted_for_study = true
+                    ))
                     AND c.chunk_text IS NOT NULL
                     AND length(c.chunk_text) > 100
                 """),
@@ -9870,6 +9865,12 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                     LEFT JOIN topics t
                         ON t.id = tc.topic_id
                     WHERE c.project_id = :project_id
+                    AND t.id IS NOT NULL
+                    AND (t.module_id IS NULL OR EXISTS (
+                        SELECT 1 FROM study_modules sm
+                        WHERE sm.id = t.module_id AND sm.project_id = t.project_id
+                        AND sm.accepted_for_study = true
+                    ))
                     AND c.chunk_text IS NOT NULL
                     AND length(c.chunk_text) > 100
                 """),

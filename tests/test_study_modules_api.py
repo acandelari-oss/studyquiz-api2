@@ -578,6 +578,48 @@ class StudyModulesApiTests(unittest.TestCase):
         self.assertTrue(row[1])
         self.assertIsNotNone(row[2])
 
+    def _add_approval_modules(self):
+        with self.engine.begin() as db:
+            db.execute(text("""
+                insert into study_modules (id, project_id, name, order_index, taxonomy_status)
+                values ('module-a', 'project-a', 'A', 1, 'ready'),
+                       ('module-c', 'project-a', 'B', 2, 'ready')
+            """))
+
+    def test_approve_one_module_leaves_other_in_review(self):
+        self._add_approval_modules()
+        with patch.object(main, "SessionLocal", self._session):
+            response = TestClient(app).post("/projects/project-a/modules/module-a/begin_study")
+        self.assertEqual(response.status_code, 200)
+        with self.engine.begin() as db:
+            rows = db.execute(text("select id, accepted_for_study from study_modules where project_id = 'project-a' order by id")).fetchall()
+            self.assertEqual([(row[0], bool(row[1])) for row in rows], [("module-a", True), ("module-c", False)])
+            self.assertEqual(db.execute(text("select study_mode from projects where id = 'project-a'")).scalar(), "learning")
+
+    def test_legacy_approval_requires_choice_for_multiple_modules(self):
+        self._add_approval_modules()
+        with patch.object(main, "SessionLocal", self._session):
+            response = TestClient(app).post("/projects/project-a/begin_study")
+        self.assertEqual(response.status_code, 400)
+        with self.engine.begin() as db:
+            self.assertEqual(db.execute(text("select count(*) from study_modules where accepted_for_study = true")).scalar(), 0)
+
+    def test_approval_rejects_module_from_other_project(self):
+        self._add_approval_modules()
+        with patch.object(main, "SessionLocal", self._session):
+            response = TestClient(app).post("/projects/project-a/modules/module-b/begin_study")
+        self.assertEqual(response.status_code, 404)
+
+    def test_approval_waits_for_taxonomy(self):
+        self._add_approval_modules()
+        with self.engine.begin() as db:
+            db.execute(text("update study_modules set taxonomy_status = 'building' where id = 'module-a'"))
+        with patch.object(main, "SessionLocal", self._session):
+            response = TestClient(app).post("/projects/project-a/modules/module-a/begin_study")
+        self.assertEqual(response.status_code, 409)
+        with self.engine.begin() as db:
+            self.assertEqual(db.execute(text("select study_mode from projects where id = 'project-a'")).scalar(), "building")
+
     def test_patch_module_updates_lifecycle_fields(self):
         with self.engine.begin() as db:
             db.execute(text("""
