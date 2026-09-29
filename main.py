@@ -19,6 +19,7 @@ from sqlalchemy import JSON, bindparam
 from sqlalchemy import text as sql_text
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from database_engine import create_database_engine
 from openai import OpenAI
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -818,7 +819,7 @@ print(
 )
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-engine = create_engine(DATABASE_URL)
+engine = create_database_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
 # ======================
