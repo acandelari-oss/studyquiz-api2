@@ -13,8 +13,8 @@ import requests
 import random
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks, File, Form, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse, Response
+from pydantic import BaseModel, Field
 from sqlalchemy import JSON, bindparam
 from sqlalchemy import text as sql_text
 from sqlalchemy import create_engine, text
@@ -16329,6 +16329,39 @@ print("🔥 MODEL FIELDS:", ActiveRecallRequest.__fields__.keys())
 # main.py
 
 # main.py
+
+class ActiveRecallQuestionAudioRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4096)
+
+
+@app.post("/projects/{project_id}/active_recall_question_audio")
+def active_recall_question_audio(
+    project_id: str, req: ActiveRecallQuestionAudioRequest, user=Depends(verify_user)
+):
+    if not req.question.strip():
+        raise HTTPException(status_code=422, detail="Question must not be blank")
+    db = SessionLocal()
+    try:
+        _require_owned_project(db, project_id, user["id"])
+    finally:
+        db.close()
+    try:
+        speech = client.with_options(timeout=30, max_retries=0).audio.speech.create(
+            model="gpt-4o-mini-tts",
+            voice="marin",
+            input=req.question,
+            instructions=(
+                "Read the supplied question exactly, in its original language. "
+                "Do not translate, rewrite, answer it, or add commentary. "
+                "Use a clear, calm, neutral, natural university oral-exam tone "
+                "at a normal pace, without theatrical delivery."
+            ),
+            response_format="mp3",
+        )
+        return Response(speech.content, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+    except Exception:
+        raise HTTPException(status_code=502, detail="Question audio is temporarily unavailable") from None
+
 
 @app.post("/projects/{project_id}/active_recall_question")
 async def active_recall_question(project_id: str, req: ActiveRecallRequest, user = Depends(verify_user)):
