@@ -339,8 +339,11 @@ class HardQuizDifficultyTests(unittest.TestCase):
         result_proxy = MagicMock()
         result_proxy.fetchall.return_value = [
             (
+                "question-id",
+                "quiz-id",
                 "Question",
                 ["A", "B"],
+                0,
                 0,
                 "Explanation",
                 "Long explanation",

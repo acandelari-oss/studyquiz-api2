@@ -16268,7 +16268,12 @@ def answer_ask_question(
 
 
 @app.post("/ask")
-async def ask_documents(req: AskRequest):
+async def ask_documents(req: AskRequest, user=Depends(verify_user)):
+    db = SessionLocal()
+    try:
+        _require_owned_project(db, req.project_id, user["id"])
+    finally:
+        db.close()
     return answer_ask_question(
         project_id=req.project_id,
         question=req.question,
@@ -16288,6 +16293,11 @@ async def ask_documents_with_image(
     image: UploadFile = File(...),
     user = Depends(verify_user),
 ):
+    db = SessionLocal()
+    try:
+        _require_owned_project(db, project_id, user["id"])
+    finally:
+        db.close()
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image")
 
