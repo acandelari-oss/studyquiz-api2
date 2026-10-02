@@ -20,6 +20,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from database_engine import create_database_engine
+from quiz_options import shuffle_question_options
 from openai import OpenAI
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -9033,7 +9034,9 @@ async def ingest_stream(
     if not requested_module_id and not requested_module_name:
         raise HTTPException(status_code=400, detail="Module name is required")
 
-    async def generate():
+    # StreamingResponse runs a synchronous iterator in its worker thread pool.
+    # Extraction, database work and OpenAI calls must not block other requests.
+    def generate():
         db = SessionLocal()
         pipeline_log = UploadPipelineLogger(
             "UPLOAD PIPELINE",
@@ -9436,7 +9439,6 @@ async def ingest_stream(
 
                     for i, chunk in enumerate(chunks):
                         yield f"Embedding chunk {i+1}/{len(chunks)}\n"
-                        await asyncio.sleep(0)
                         chunk_role = classify_chunk_role(
                             chunk,
                             page_number=page_number,
@@ -9473,8 +9475,7 @@ async def ingest_stream(
                             }
                         )
                         try:
-                            emb = await asyncio.to_thread(
-                                client.embeddings.create,
+                            emb = client.embeddings.create(
                                 model=embedding_model,
                                 input=chunk
                             )
@@ -12813,6 +12814,7 @@ async def generate_quiz(
                 raise ValueError(
                     "Accepted quiz question is missing answer options"
                 )
+            shuffle_question_options(q)
             print("🔑 KEYS:", list(q.keys()))
             print("💾 SAVING QUESTION")
             print("QUESTION:", q["question"])

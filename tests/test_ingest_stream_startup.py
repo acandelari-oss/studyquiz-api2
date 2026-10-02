@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +9,8 @@ import main
 
 class IngestStreamStartupTests(unittest.IsolatedAsyncioTestCase):
     async def check_startup(self, existing_name=None, continuation=False):
+        event_loop_thread = threading.get_ident()
+        worker_threads = []
         db = MagicMock()
         db.execute.return_value.scalar.return_value = 1
         db.execute.return_value.fetchone.return_value = (
@@ -18,7 +21,7 @@ class IngestStreamStartupTests(unittest.IsolatedAsyncioTestCase):
             module_name="  Biology  ",
             module_id="module-id" if continuation else None,
         )
-        with patch.object(main, "SessionLocal", return_value=db), \
+        with patch.object(main, "SessionLocal", side_effect=lambda: (worker_threads.append(threading.get_ident()), db)[1]), \
              patch.object(main, "_require_owned_project"), \
              patch.object(main, "_update_study_module_organization_metadata"), \
              patch.object(main, "UploadPipelineLogger"):
@@ -42,6 +45,8 @@ class IngestStreamStartupTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await response.body_iterator.aclose()
         db.close.assert_called_once()
+        self.assertTrue(worker_threads)
+        self.assertNotIn(event_loop_thread, worker_threads)
 
     async def test_new_module_starts_upload_with_requested_name(self):
         await self.check_startup()
