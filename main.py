@@ -14,6 +14,8 @@ import random
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks, File, Form, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
+from chat_stream import stream_chat
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, bindparam
 from sqlalchemy import text as sql_text
@@ -9836,7 +9838,7 @@ def resolve_learning_scope(project_id: str, topic_ids=None, limit: int = 80):
                     ))
                     AND c.chunk_text IS NOT NULL
                     AND length(c.chunk_text) > 100
-                """),
+                """).bindparams(bindparam("topic_ids", expanding=True)),
                 {
                     "project_id": project_id,
                     "topic_ids": tuple(topic_ids),
@@ -10670,7 +10672,7 @@ async def generate_quiz(
                 from topics
                 where project_id = :project_id
                 and topic in :topics
-            """),
+            """).bindparams(bindparam("topics", expanding=True)),
             {
                 "project_id": project_id,
                 "topics": tuple(legacy_topics)
@@ -12974,6 +12976,7 @@ def get_quiz_stats(project_id: str):
 
 
 class AskRequest(BaseModel):
+    stream: bool = False
     project_id: str
     question: str
     topics: Optional[List[str]] = []
@@ -16209,6 +16212,7 @@ def answer_ask_question(
     history: Optional[list] = None,
     expand_search: bool = False,
     image_data_url: Optional[str] = None,
+    stream: bool = False,
 ) -> dict:
     print("HISTORY RECEIVED:", history or [])
 
@@ -16252,6 +16256,14 @@ def answer_ask_question(
             },
         ]
 
+    if stream:
+        return stream_chat(lambda: client.chat.completions.create(
+            model="gpt-4o-mini", stream=True,
+            messages=[{"role": "system", "content": "You are a helpful study tutor."},
+                      {"role": "user", "content": user_content}]),
+            metadata={"sources": sources, "used_global_knowledge": bool(expand_search),
+                      "used_image": bool(image_data_url)})
+
     # 4️⃣ GPT
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -16276,6 +16288,10 @@ async def ask_documents(req: AskRequest, user=Depends(verify_user)):
         _require_owned_project(db, req.project_id, user["id"])
     finally:
         db.close()
+    if req.stream:
+        return await run_in_threadpool(answer_ask_question,
+            project_id=req.project_id, question=req.question, topics=req.topics,
+            history=req.history, expand_search=req.expand_search, stream=True)
     return answer_ask_question(
         project_id=req.project_id,
         question=req.question,
@@ -16292,6 +16308,7 @@ async def ask_documents_with_image(
     topics: str = Form("[]"),
     history: str = Form("[]"),
     expand_search: bool = Form(False),
+    stream: bool = Form(False),
     image: UploadFile = File(...),
     user = Depends(verify_user),
 ):
@@ -16324,6 +16341,11 @@ async def ask_documents_with_image(
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
     image_data_url = f"data:{image.content_type};base64,{encoded_image}"
 
+    if stream is True:
+        return await run_in_threadpool(answer_ask_question,
+            project_id=project_id, question=question, topics=parsed_topics,
+            history=parsed_history, expand_search=bool(expand_search),
+            image_data_url=image_data_url, stream=True)
     return answer_ask_question(
         project_id=project_id,
         question=question,
@@ -16560,6 +16582,7 @@ async def active_recall_question(project_id: str, req: ActiveRecallRequest, user
 from typing import Optional
 
 class ActiveRecallEvaluateRequest(BaseModel):
+    stream: bool = False
     question: str
     student_answer: str
     history: Optional[list[str]] = None
@@ -16756,6 +16779,12 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
     "explanation": "Clear explanation of the concept"
     }}
     """
+
+    if req.stream:
+        return stream_chat(lambda: client.chat.completions.create(
+            model="gpt-4o-mini", temperature=0.3, stream=True,
+            messages=[{"role": "system", "content": "You evaluate student answers."},
+                      {"role": "user", "content": prompt}]), structured=True)
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",

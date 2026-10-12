@@ -15,3 +15,5 @@ pdf2image
 Pillow
 python-docx
 python-pptx
+
+jiter>=0.8.2

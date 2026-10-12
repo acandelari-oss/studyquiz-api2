@@ -1,7 +1,7 @@
 """Exercise real scope filtering with SQLite; only vector scoring is substituted."""
 import unittest
 from unittest.mock import patch
-from sqlalchemy import create_engine, text, bindparam
+from sqlalchemy import create_engine, text
 import main
 
 
@@ -24,10 +24,9 @@ class ApprovedLearningScopeTests(unittest.TestCase):
 
         class ScopeSession:
             def execute(self, statement, params):
-                sql = str(statement).replace('c.embedding <#> t.embedding', '0')
-                query = text(sql)
-                if 'topic_ids' in params:
-                    query = query.bindparams(bindparam('topic_ids', expanding=True))
+                sql = statement.text.replace('c.embedding <#> t.embedding', '0')
+                # Preserve production bindings; never repair them in the test adapter.
+                query = text(sql).bindparams(*statement._bindparams.values())
                 return db.execute(query, params)
 
             def close(self):
@@ -35,10 +34,10 @@ class ApprovedLearningScopeTests(unittest.TestCase):
 
         try:
             with patch.object(main, 'SessionLocal', return_value=ScopeSession()), patch.object(main, 'calculate_topic_chunk_score', return_value=1):
-                for topic_ids in ([], ['a', 'b'], ['b']):
+                for topic_ids in ([], ['a'], ['a', 'b'], ['b'], ['missing']):
                     with self.subTest(topic_ids=topic_ids):
                         scope = main.resolve_learning_scope('p', topic_ids)
-                        self.assertEqual([c['chunk_id'] for c in scope['chunks']], [] if topic_ids == ['b'] else ['1'])
+                        self.assertEqual([c['chunk_id'] for c in scope['chunks']], [] if topic_ids in (['b'], ['missing']) else ['1'])
         finally:
             db.close()
             engine.dispose()
