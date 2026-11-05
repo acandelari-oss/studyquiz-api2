@@ -18,6 +18,8 @@ class PlannerContextBuilderTests(unittest.TestCase):
         self.engine.dispose()
 
     def _create_schema(self):
+        self.db.execute(text("create table study_modules (id text, project_id text, accepted_for_study boolean)"))
+        self.db.execute(text("create table documents (id text, title text)"))
         self.db.execute(text("""
             create table projects (
                 id text primary key,
@@ -35,7 +37,9 @@ class PlannerContextBuilderTests(unittest.TestCase):
                 project_id text,
                 category text,
                 topic text,
-                is_display_topic boolean
+                is_display_topic boolean,
+                module_id text, document_id text,
+                category_order_index integer, topic_order_index integer
             )
         """))
         self.db.execute(text("""

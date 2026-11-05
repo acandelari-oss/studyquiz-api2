@@ -1,3 +1,4 @@
+import ai_cost_test as cost
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,7 @@ MAX_SHARED_EVIDENCE_CHUNKS = 4
 MAX_CHUNK_CHARS = 900
 
 
+@cost.operation("knowledge_map")
 def generate_relationship_explanation(
     db,
     openai_client,
@@ -46,7 +48,7 @@ def generate_relationship_explanation(
         _normalize_study_language(study_language),
     )
 
-    response = openai_client.chat.completions.create(
+    response = cost.call(openai_client.chat.completions.create, cost_feature="knowledge_map", cost_suboperation="explanation",
         model="gpt-4o-mini",
         messages=[
             {
@@ -167,6 +169,7 @@ def _load_relationship_evidence(
             join topic_a_chunks a on a.chunk_id = c.id
             join topic_b_chunks b on b.chunk_id = c.id
             where c.project_id = :project_id
+            and (c.chunk_role IS NULL OR c.chunk_role <> 'exercise')
             and c.chunk_text is not null
             order by char_length(c.chunk_text) desc, c.id asc
             limit :limit
@@ -198,6 +201,7 @@ def _load_relationship_evidence(
             from topic_chunks tc
             join chunks c on c.id = tc.chunk_id
             where c.project_id = :project_id
+            and (c.chunk_role IS NULL OR c.chunk_role <> 'exercise')
             and tc.topic_id in (:topic_a_id, :topic_b_id)
             and c.chunk_text is not null
             order by

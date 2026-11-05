@@ -198,6 +198,17 @@ def _pdf_text_fragments(
             metadata["page_width"] = page_width
         if page_height is not None:
             metadata["page_height"] = page_height
+        # Rendered vertical em vector: text matrix followed by the current
+        # transformation. Keep the original callback measurement unchanged.
+        import math
+        tm = metadata["text_matrix"]
+        cm = metadata["current_transformation_matrix"]
+        if len(tm) == len(cm) == 6 and metadata["font_size"] is not None:
+            effective = abs(metadata["font_size"]) * math.hypot(
+                tm[2] * cm[0] + tm[3] * cm[2],
+                tm[2] * cm[1] + tm[3] * cm[3])
+            if math.isfinite(effective) and effective > 0:
+                metadata["effective_font_size"] = effective
         font_metadata = _pdf_font_metadata(font_dict)
         metadata.update(font_metadata)
         fragments.append({"text": raw_text, "metadata": metadata})

@@ -1,0 +1,29 @@
+{
+  "version": "2026-10-15.1",
+  "verified_at": "2026-10-15",
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "tier": "standard",
+  "models": {
+    "gpt-4o-mini": {
+      "input": "0.15", "cached_input": "0.075", "output": "0.60",
+      "source": "https://developers.openai.com/api/docs/models/gpt-4o-mini",
+      "snapshots": ["gpt-4o-mini-2024-07-18"]
+    },
+    "gpt-4o": {
+      "input": "2.50", "cached_input": "1.25", "output": "10.00",
+      "source": "https://developers.openai.com/api/docs/models/gpt-4o",
+      "snapshots": ["gpt-4o-2024-08-06", "gpt-4o-2024-11-20"]
+    },
+    "text-embedding-3-small": {
+      "input": "0.02", "kind": "embedding",
+      "source": "https://developers.openai.com/api/docs/models/text-embedding-3-small",
+      "snapshots": []
+    },
+    "gpt-4o-mini-tts": {
+      "input": "0.60", "audio_output": "12.00", "kind": "speech",
+      "source": "https://developers.openai.com/api/docs/models/gpt-4o-mini-tts",
+      "snapshots": ["gpt-4o-mini-tts-2025-03-20", "gpt-4o-mini-tts-2025-12-15"]
+    }
+  }
+}

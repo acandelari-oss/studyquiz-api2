@@ -352,7 +352,7 @@ def _preserve_pdf(
 
 def _pdf_candidate(item: StructuralEvidence, body_font: Optional[float], running_headers: set) -> Dict[str, Any]:
     text = item.normalized_text.strip()
-    font_size = _float_or_none(item.visual_evidence.get("font_size"))
+    font_size = _float_or_none(item.visual_evidence.get("effective_font_size", item.visual_evidence.get("font_size")))
     numbering_level = _pdf_numbering_level(text)
     prominent = _is_visually_prominent(font_size, body_font)
     short = _is_short_standalone(text)
@@ -375,9 +375,9 @@ def _pdf_candidate(item: StructuralEvidence, body_font: Optional[float], running
 
 def _dominant_font_size(items: Sequence[StructuralEvidence]) -> Optional[float]:
     sizes = [
-        _float_or_none(item.visual_evidence.get("font_size"))
+        _float_or_none(item.visual_evidence.get("effective_font_size", item.visual_evidence.get("font_size")))
         for item in items
-        if _float_or_none(item.visual_evidence.get("font_size")) is not None
+        if _float_or_none(item.visual_evidence.get("effective_font_size", item.visual_evidence.get("font_size"))) is not None
     ]
     if not sizes:
         return None
@@ -391,7 +391,7 @@ def _is_visually_prominent(font_size: Optional[float], body_font: Optional[float
 
 
 def _pdf_visual_pattern(item: StructuralEvidence) -> Optional[tuple]:
-    font_size = _float_or_none(item.visual_evidence.get("font_size"))
+    font_size = _float_or_none(item.visual_evidence.get("effective_font_size", item.visual_evidence.get("font_size")))
     if font_size is None:
         return None
     return (

@@ -1,0 +1,34 @@
+{
+  "project_id": "4a899712-00cc-4179-a09d-722f5abbc646",
+  "topics": 30,
+  "original_categories": 1,
+  "proposed_categories": {
+    "Diritto Penale": 2,
+    "Misure Cautelari": 14,
+    "Diritti degli Indagati": 6,
+    "Procedimenti Giudiziari": 8
+  },
+  "reassigned_topics": 28,
+  "validation": "passed",
+  "preserved_chunk_associations": 103,
+  "snapshot_sha256": "39e1d35b5a0c8c8b7503f1d4be382f93badac15898f57e17def450cda93ca6be",
+  "requests": [
+    {
+      "stage": "category_proposal",
+      "status": 200,
+      "model": "gpt-4o-mini-2024-07-18",
+      "finish_reason": "stop",
+      "input_tokens": 2195,
+      "output_tokens": 260
+    },
+    {
+      "stage": "category_assignment",
+      "status": 200,
+      "model": "gpt-4o-mini-2024-07-18",
+      "finish_reason": "stop",
+      "input_tokens": 2398,
+      "output_tokens": 730
+    }
+  ],
+  "csv": "/Users/MOKA/DOUNO/studyquiz-api2/diagnostics/category-test-4a899712/proposed-taxonomy.csv"
+}

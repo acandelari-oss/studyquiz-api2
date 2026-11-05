@@ -1362,27 +1362,11 @@ class StudyModulesApiTests(unittest.TestCase):
         self.assertIn("Document chunks generated", rendered)
         self.assertNotIn("Pages processed", rendered)
 
-    def test_topic_generation_timeout_uses_topic_generation_start(self):
-        with patch.object(main.time, "time", return_value=1000):
-            topic_generation_start = main.time.time()
-
-        with patch.object(
-            main.time,
-            "time",
-            return_value=topic_generation_start + main.MAX_TOPIC_PROCESSING_SECONDS - 1,
-        ):
-            self.assertFalse(
-                main._topic_generation_timeout_reached(topic_generation_start)
-            )
-
-        with patch.object(
-            main.time,
-            "time",
-            return_value=topic_generation_start + main.MAX_TOPIC_PROCESSING_SECONDS + 1,
-        ):
-            self.assertTrue(
-                main._topic_generation_timeout_reached(topic_generation_start)
-            )
+    def test_topic_generation_timeout_uses_monotonic_deadline(self):
+        with patch.object(main.time, "monotonic", return_value=999):
+            self.assertFalse(main._topic_generation_timeout_reached(1000))
+        with patch.object(main.time, "monotonic", return_value=1000):
+            self.assertTrue(main._topic_generation_timeout_reached(1000))
 
 
 if __name__ == "__main__":

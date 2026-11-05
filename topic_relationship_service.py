@@ -340,6 +340,7 @@ def get_topic_relationship_graph(
             join chunks c on c.id = tc.chunk_id
             where t.project_id = :project_id
             and t.is_display_topic = true
+            and (c.chunk_role IS NULL OR c.chunk_role <> 'exercise')
             and t.topic is not null
         """),
         {"project_id": project_id},

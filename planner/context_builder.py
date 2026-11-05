@@ -7,6 +7,8 @@ state evaluation.
 
 from __future__ import annotations
 
+from category_identity import category_key
+
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
@@ -162,13 +164,13 @@ def _load_project(
 def _load_display_topics(db: Any, project_id: str):
     return db.execute(
         text("""
-            select id, category, topic
-            from topics
-            where project_id = :project_id
+            select topics.id, category, topic, topics.module_id, topics.document_id, d.title
+            from topics left join documents d on d.id=CAST(topics.document_id AS text)
+            where topics.project_id = :project_id
             and topic is not null
             and is_display_topic = true
             and (
-                module_id is null
+                topics.module_id is null
                 or exists (
                     select 1
                     from study_modules sm
@@ -195,7 +197,7 @@ def _build_topic_context(topic_rows):
 
     for row in topic_rows:
         topic_id = str(row[0])
-        category = row[1] or "General"
+        category = category_key(row[1], row[3], row[4], row[5]) if len(row) > 3 else row[1] or "General"
         topic_title = row[2]
 
         if category not in category_seen:
@@ -211,7 +213,11 @@ def _build_topic_context(topic_rows):
             category=category,
         )
         topics_by_category[category].append(selected_topic)
-        topic_lookup.setdefault(_normalize_topic_key(topic_title), category)
+        key = _normalize_topic_key(topic_title)
+        if key in topic_lookup and topic_lookup[key] != category:
+            topic_lookup[key] = None  # Historical title-only events cannot identify a file reliably.
+        else:
+            topic_lookup[key] = category
 
     return (
         tuple(categories),

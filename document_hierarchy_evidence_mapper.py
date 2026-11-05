@@ -155,6 +155,7 @@ def _native_evidence(block: CanonicalBlock) -> Dict[str, Any]:
 def _visual_evidence(block: CanonicalBlock) -> Dict[str, Any]:
     visual_keys = (
         "font_size",
+        "effective_font_size",
         "font_weight",
         "font_name",
         "x",
@@ -236,6 +237,7 @@ def _residual_metadata(block: CanonicalBlock) -> Dict[str, Any]:
         "text_matrix",
         "current_transformation_matrix",
         "font_size",
+        "effective_font_size",
         "font_weight",
         "font_name",
         "x",

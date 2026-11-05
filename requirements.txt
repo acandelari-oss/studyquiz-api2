@@ -17,3 +17,6 @@ python-docx
 python-pptx
 
 jiter>=0.8.2
+
+# Offline taxonomy language verification (bundled language profiles).
+langdetect==1.0.9

@@ -1,5 +1,6 @@
 """NDJSON transport for incremental tutor responses."""
 import json
+import ai_cost_test as cost
 from jiter import from_json
 from fastapi.responses import StreamingResponse
 
@@ -42,6 +43,7 @@ def stream_chat(create, metadata=None, structured=False):
                 data = {"answer": content, **(metadata or {})}
             yield json.dumps({"type": "done", "data": data}) + "\n"
         except Exception:
+            cost.outcome("failed")
             yield json.dumps({"type": "error", "message": "Response interrupted. Please try again."}) + "\n"
         finally:
             if upstream is not None:

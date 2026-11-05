@@ -25,6 +25,11 @@ class ExtractedBlock:
     page: Optional[int]
     section: Optional[str] = None
     block_index: int = 0
+    source_unit: Optional[int] = None
+    acquisition_error: Optional[str] = None
+    # Original PDF extraction, separate from unchanged OCR-supplemented study text.
+    digital_text: Optional[str] = None
+    digital_text_start: int = 0
 
 
 @dataclass
@@ -40,14 +45,14 @@ def _normalize_extension(filename: str) -> str:
     return os.path.splitext(filename or "")[1].lower().strip()
 
 
-def extract_uploaded_document(file_bytes: bytes, filename: str) -> ExtractedDocument:
+def extract_uploaded_document(file_bytes: bytes, filename: str, *, inspect_acquisition=False) -> ExtractedDocument:
     extension = _normalize_extension(filename)
 
     if extension == ".pdf":
-        return extract_pdf_document(file_bytes, filename)
+        return extract_pdf_document(file_bytes, filename, inspect_acquisition=inspect_acquisition)
 
     if extension == ".docx":
-        return extract_docx_document(file_bytes, filename)
+        return extract_docx_document(file_bytes, filename, allow_empty=inspect_acquisition)
 
     if extension == ".pptx":
         return extract_pptx_document(file_bytes, filename)
@@ -57,7 +62,7 @@ def extract_uploaded_document(file_bytes: bytes, filename: str) -> ExtractedDocu
     )
 
 
-def extract_pdf_document(file_bytes: bytes, filename: str) -> ExtractedDocument:
+def extract_pdf_document(file_bytes: bytes, filename: str, *, inspect_acquisition=False) -> ExtractedDocument:
     try:
         pdf_stream = io.BytesIO(file_bytes)
         reader = PdfReader(pdf_stream)
@@ -85,12 +90,20 @@ def extract_pdf_document(file_bytes: bytes, filename: str) -> ExtractedDocument:
     blocks = []
     try:
         for page_index, page in enumerate(reader.pages):
-            raw_page_text = page.extract_text()
+            acquisition_error = None
+            try:
+                raw_page_text = page.extract_text()
+            except Exception:
+                if not inspect_acquisition:
+                    raise
+                raw_page_text = ""
+                acquisition_error = "parser_error"
             blocks.append(
                 ExtractedBlock(
                     text=raw_page_text or "",
                     raw_text=raw_page_text or "",
                     page=page_index + 1,
+                    acquisition_error=acquisition_error,
                     block_index=page_index + 1,
                 )
             )
@@ -110,7 +123,7 @@ def extract_pdf_document(file_bytes: bytes, filename: str) -> ExtractedDocument:
     )
 
 
-def extract_docx_document(file_bytes: bytes, filename: str) -> ExtractedDocument:
+def extract_docx_document(file_bytes: bytes, filename: str, *, allow_empty=False) -> ExtractedDocument:
     try:
         from docx import Document
         from docx.table import Table
@@ -208,7 +221,7 @@ def extract_docx_document(file_bytes: bytes, filename: str) -> ExtractedDocument
             "is_heading": is_heading,
         })
 
-    if not any(segment["text"].strip() for segment in segments):
+    if not allow_empty and not any(segment["text"].strip() for segment in segments):
         raise DocumentExtractionError(
             "The uploaded DOCX does not contain extractable text."
         )
@@ -392,6 +405,7 @@ def extract_pptx_document(file_bytes: bytes, filename: str) -> ExtractedDocument
             "raw_text": f"## SLIDE ##\n{title}\n\n{clean_slide_text}",
             "section": title,
             "is_new_slide": True,
+            "source_unit": slide_index,
         })
 
     if not any(segment["text"].strip() for segment in segments):
@@ -406,6 +420,8 @@ def extract_pptx_document(file_bytes: bytes, filename: str) -> ExtractedDocument
     current_size = 0
     target_block_chars = 1400
 
+    current_source_unit = None
+
     def flush_block():
         nonlocal current_parts, current_raw_parts, current_section_for_block, current_size
         text = "\n\n".join(current_parts).strip()
@@ -416,6 +432,7 @@ def extract_pptx_document(file_bytes: bytes, filename: str) -> ExtractedDocument
                     text=text,
                     raw_text=raw_text or text,
                     page=None,
+                    source_unit=current_source_unit,
                     section=current_section_for_block,
                     block_index=len(blocks) + 1,
                 )
@@ -433,6 +450,7 @@ def extract_pptx_document(file_bytes: bytes, filename: str) -> ExtractedDocument
         if current_parts:
             flush_block()
 
+        current_source_unit = segment["source_unit"]
         if len(text) <= target_block_chars:
             current_section_for_block = section
             current_parts.append(text)

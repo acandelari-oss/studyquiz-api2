@@ -43,6 +43,50 @@ class ChunkRoleClassificationTests(unittest.TestCase):
         )
         self.assertEqual(role, "administrative")
 
+    def test_administrative_substrings_do_not_exclude_teaching(self):
+        passages = [
+            'Shelterin protects telomeres from being recognized as DNA damage.',
+            'Mismatch repair detects errors after DNA synthesis.',
+            'MutL activity directs incision of the newly synthesized strand.',
+            'Defects in DNA repair increase mutation accumulation.',
+            'The electric field affects the motion of charged particles.',
+            'The contract protects the rights of both parties.',
+            'The policy reflects changes in demand and their economic effects.',
+            'The enzyme acts by degrading the substrate.',
+            'The process intersects with several other pathways.',
+            '15. Final high-yield comparison tables: MSH detects mismatches; '
+            'DNA glycosylase recognizes damaged bases; ligase seals the nick.',
+            '16.4 If asked: Compare NHEJ and HR. Both repair double-strand '
+            'breaks. Defects in HR proteins increase cancer risk.',
+        ]
+        for passage in passages:
+            with self.subTest(passage=passage):
+                role = classify_chunk_role(passage, page_number=10)
+                self.assertEqual(role, 'teaching')
+                self.assertTrue(is_assignment_eligible_chunk_role(role))
+
+    def test_complete_administrative_words_and_phrases_still_excluded(self):
+        passages = [
+            'Course workload: 6 ECTS.',
+            'Credits (ECTS): 6',
+            'ECTS-based credit allocation.',
+            'Exam information:\nAssessment method: written test.',
+            'OFFICE\tHOURS: Monday, 10–12.',
+            'Modalità d’esame: prova orale.',
+            'Frequenza obbligatoria e crediti formativi.',
+            'Grading: assignments 30%, final exam 70%.',
+        ]
+        for passage in passages:
+            with self.subTest(passage=passage):
+                role = classify_chunk_role(passage, page_number=10)
+                self.assertEqual(role, 'administrative')
+                self.assertFalse(is_assignment_eligible_chunk_role(role))
+
+    def test_administrative_label_still_applies_with_incidental_teaching_words(self):
+        self.assertEqual(classify_chunk_role(
+            'Exam information: the test covers how DNA repair detects defects.',
+            page_number=10), 'administrative')
+
     def test_intro(self):
         role = classify_chunk_role(
             "Introduction: organic chemistry is a discipline within chemistry.",

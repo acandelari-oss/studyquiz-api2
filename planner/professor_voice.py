@@ -6,6 +6,7 @@ decisions.
 """
 
 from __future__ import annotations
+import ai_cost_test as cost
 
 import json
 import os
@@ -940,6 +941,7 @@ class ProfessorVoiceService:
         self.validator = validator or ProfessorVoiceValidator()
         self.observation_builder = observation_builder or ProfessorObservationBuilder()
 
+    @cost.operation("professor.study_plan_briefing")
     def generate_study_plan_briefing(
         self,
         knowledge: ProfessorKnowledge,
@@ -955,6 +957,7 @@ class ProfessorVoiceService:
         try:
             briefing = self._generate_with_llm(knowledge).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR VOICE FALLBACK:", repr(error))
             return fallback
 
@@ -968,6 +971,7 @@ class ProfessorVoiceService:
 
         return briefing or fallback
 
+    @cost.operation("professor.daily_briefing")
     def generate_daily_briefing(
         self,
         knowledge: ProfessorKnowledge,
@@ -980,6 +984,7 @@ class ProfessorVoiceService:
         try:
             briefing = self._generate_daily_with_llm(knowledge, module_index).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR DAILY VOICE FALLBACK:", repr(error))
             return self._append_short_duration_note(
                 fallback,
@@ -1015,6 +1020,7 @@ class ProfessorVoiceService:
 
         return briefing
 
+    @cost.operation("professor.module_objective")
     def generate_module_objective(
         self,
         knowledge: ProfessorKnowledge,
@@ -1030,6 +1036,7 @@ class ProfessorVoiceService:
                 module_index,
             ).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR MODULE OBJECTIVE FALLBACK:", repr(error))
             return fallback
 
@@ -1047,6 +1054,7 @@ class ProfessorVoiceService:
 
         return objective or fallback
 
+    @cost.operation("professor.activity_debrief")
     def generate_activity_debrief(
         self,
         knowledge: ProfessorKnowledge,
@@ -1068,6 +1076,7 @@ class ProfessorVoiceService:
                 activity_result,
             ).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR ACTIVITY DEBRIEF FALLBACK:", repr(error))
             return fallback
 
@@ -1085,6 +1094,7 @@ class ProfessorVoiceService:
 
         return debrief or fallback
 
+    @cost.operation("professor.module_debrief")
     def generate_module_debrief(
         self,
         knowledge: ProfessorKnowledge,
@@ -1106,6 +1116,7 @@ class ProfessorVoiceService:
                 module_results,
             ).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR MODULE DEBRIEF FALLBACK:", repr(error))
             return fallback
 
@@ -1123,6 +1134,7 @@ class ProfessorVoiceService:
 
         return debrief or fallback
 
+    @cost.operation("professor.homework_recommendation")
     def generate_homework_recommendation(
         self,
         knowledge: ProfessorKnowledge,
@@ -1144,6 +1156,7 @@ class ProfessorVoiceService:
                 module_results,
             ).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR HOMEWORK FALLBACK:", repr(error))
             return fallback
 
@@ -1189,6 +1202,7 @@ class ProfessorVoiceService:
                 conversation or [],
             ).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR MODULE QUESTION FALLBACK:", repr(error))
             return fallback
 
@@ -1206,6 +1220,7 @@ class ProfessorVoiceService:
 
         return answer or fallback
 
+    @cost.operation("professor.study_plan_debrief")
     def generate_study_plan_debrief(
         self,
         knowledge: ProfessorKnowledge,
@@ -1224,6 +1239,7 @@ class ProfessorVoiceService:
                 study_plan_results,
             ).strip()
         except Exception as error:
+            cost.outcome("fallback")
             print("⚠️ PROFESSOR STUDY PLAN DEBRIEF FALLBACK:", repr(error))
             return fallback
 
@@ -2160,7 +2176,7 @@ INPUT:
             raise RuntimeError("OPENAI_API_KEY is not configured")
 
         client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
+        response = cost.call(client.chat.completions.create, cost_feature="professor", cost_suboperation="content",
             model=os.getenv("PROFESSOR_VOICE_MODEL", "gpt-4o-mini"),
             temperature=0.2,
             messages=[
