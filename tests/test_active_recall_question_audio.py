@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
@@ -11,7 +12,8 @@ class QuestionAudioTests(unittest.TestCase):
         main.app.dependency_overrides[main.verify_user] = lambda: {"id": "user"}
         self.db = MagicMock()
         self.client = MagicMock()
-        self.client.with_options.return_value.audio.speech.create.return_value.content = b"mp3-data"
+        self.speech_create = self.client.with_options.return_value.audio.speech.with_streaming_response.create
+        self.speech_create.return_value.__enter__.return_value.iter_bytes.return_value = iter([b"mp3-", b"data"])
         self.patches = [patch.object(main, "SessionLocal", return_value=self.db),
                         patch.object(main, "_require_owned_project"),
                         patch.object(main, "client", self.client)]
@@ -33,12 +35,13 @@ class QuestionAudioTests(unittest.TestCase):
         self.assertEqual(response.content, b"mp3-data")
         self.assertEqual(response.headers["content-type"], "audio/mpeg")
         self.assertEqual(response.headers["cache-control"], "no-store")
-        args = self.client.with_options.return_value.audio.speech.create.call_args.kwargs
+        args = self.speech_create.call_args.kwargs
         self.assertEqual(args["input"], question)
         self.assertEqual(args["voice"], "marin")
         self.assertEqual(args["model"], "gpt-4o-mini-tts")
         self.mocks[1].assert_called_once_with(self.db, "project", "user")
         self.db.close.assert_called_once()
+        self.speech_create.return_value.__exit__.assert_called_once()
 
     def test_auth_required(self):
         main.app.dependency_overrides.clear()
@@ -57,7 +60,25 @@ class QuestionAudioTests(unittest.TestCase):
         self.client.with_options.assert_not_called()
 
     def test_provider_failure_is_sanitized(self):
-        self.client.with_options.return_value.audio.speech.create.side_effect = RuntimeError("private credentials")
+        self.speech_create.side_effect = RuntimeError("private credentials")
         response = self.post("Question?")
         self.assertEqual(response.status_code, 502)
         self.assertNotIn("private credentials", response.text)
+
+    def test_stream_is_incremental_and_disconnect_cleanup_closes_upstream(self):
+        consumed = []
+        def chunks(**kwargs):
+            for part in [b"first", b"second"]:
+                consumed.append(part)
+                yield part
+        self.speech_create.return_value.__enter__.return_value.iter_bytes.side_effect = chunks
+        response = main.active_recall_question_audio(
+            "project", main.ActiveRecallQuestionAudioRequest(question="Feedback"), user={"id": "user"})
+        self.assertEqual(consumed, [])
+        async def read_one():
+            self.assertEqual(await response.body_iterator.__anext__(), b"first")
+            self.assertEqual(consumed, [b"first"])
+            await response.body_iterator.aclose()
+            await response.background()
+        asyncio.run(read_one())
+        self.speech_create.return_value.__exit__.assert_called_once()

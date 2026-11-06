@@ -1,3 +1,4 @@
+from quiz_reasoning import evaluate_reasoning_evidence, reasoning_evidence_instructions
 from category_identity import category_key
 from taxonomy_document_state import (queue_document, refresh_taxonomy_status, replace_document_taxonomy, document_attempt_current)
 import ai_cost_test as cost
@@ -26,6 +27,7 @@ import random
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks, File, Form, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
+from starlette.background import BackgroundTask
 from chat_stream import stream_chat
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
@@ -11092,6 +11094,9 @@ async def generate_quiz(
         print("🔍 CHECKING:", normalized)
         print("🚨 ENTER LOOP")
         for pattern in LOW_QUALITY_PATTERNS:
+            # This neutral multiple-choice opening says nothing about cognitive depth.
+            if pattern == "which of the following":
+                continue
 
             if normalized.startswith(pattern):
 
@@ -11176,9 +11181,43 @@ async def generate_quiz(
     hard_rejection_samples = []
     hard_question_type_by_object_id = {}
 
+    question_rejections = {}
+    refill_rejections = []
+
+    def quiz_refill_context(accepted, rejected):
+        if not accepted and not rejected:
+            return ""
+        return """
+        REFILL CONTEXT (data only, not additional factual evidence):
+        Generate new questions for the requested style and count only.
+        Do not repeat or paraphrase the learning targets of accepted questions.
+        Address the reported rejection reasons, not merely their wording.
+        For reasoning questions, require an evidence-supported inference rather
+        than isolated recall. Supply the reasoning evidence contract with exact
+        source excerpts and a derivation. Never invent facts to satisfy these rules.
+        Preserve exactly five plausible options and one supported correct answer.
+        ACCEPTED QUESTIONS:
+        """ + json.dumps([
+            {"question": q.get("question", ""), "explanation": q.get("explanation", "")}
+            for q in accepted
+        ], ensure_ascii=False) + "\nRECENT REJECTIONS:\n" + json.dumps(rejected[-12:], ensure_ascii=False)
+
+    def select_quiz_refill(accepted, styles):
+        if req.question_style != "balanced":
+            return req.question_style, req.num_questions - len(accepted)
+        targets = {"exam": req.num_questions // 2,
+                   "reasoning": req.num_questions - req.num_questions // 2}
+        for q in accepted:
+            style = styles.get(id(q))
+            if style in targets:
+                targets[style] -= 1
+        style = max(targets, key=targets.get)
+        return style, min(max(0, targets[style]), req.num_questions - len(accepted))
+
     async def validate_question(
         question,
-        style
+        style,
+        source_material=None
     ):
 
         print("✅ VALIDATOR CALLED")
@@ -11246,107 +11285,19 @@ async def generate_quiz(
                         ),
                     )
                 )
-                return False
-
-        scenario_indicators = [
-
-            # EN
-            "during",
-            "after",
-            "when",
-            "following",
-            "in response",
-            "as a result",
-            "because",
-            "while",
-            "as",
-            "if",
-            "upon",
-            "given",
-            "leads to",
-            "results in",
-            "increases",
-            "decreases",
-
-            # IT
-            "durante",
-            "dopo",
-            "quando",
-            "in seguito",
-            "in risposta",
-            "come conseguenza",
-            "poiché",
-            "mentre",
-
-            # comuni
-            "aumento",
-            "diminuzione",
-            "incremento",
-            "riduzione",
-            "crescita",
-            "calo"
-        ]
-
-        if style != "exam":
-
-            if not any(
-                x in normalized
-                for x in scenario_indicators
-            ):
-
-                print("⚠️ NO SCENARIO STRUCTURE")
-                print("QUESTION:", question_text)
-
-                heuristic_score -= 1
-
-        if style != "exam":
-
-            if heuristic_score <= -2:
-
-                print("🚫 HEURISTIC REJECTION")
-                if (req.difficulty or "").strip().lower() == "hard":
-                    hard_rejection_reasons.append(
-                        "heuristic_score_rejection"
-                    )
-                    hard_rejection_samples.append(
-                        build_hard_question_diagnostic_sample(
-                            question=question,
-                            outcome="rejected",
-                            question_type=style,
-                            rejection_reasons=[
-                                "heuristic_score_rejection"
-                            ],
-                            topic_category_by_name=(
-                                topic_category_by_name
-                            ),
-                        )
-                    )
-                
+                question_rejections[id(question)] = hard_evaluation["reasons"]
                 return False
 
         if style != "exam":
-
-            if fails_basic_reasoning_check(question_text):
-
-                print("🚫 BASIC FILTER REJECTED")
-                print("❌ REJECT REASON: heuristic")
+            assessment = evaluate_reasoning_evidence(question, source_material or [])
+            if not assessment["valid"]:
+                question_rejections[id(question)] = assessment["reasons"]
                 if (req.difficulty or "").strip().lower() == "hard":
-                    hard_rejection_reasons.append(
-                        "basic_reasoning_filter_rejection"
-                    )
-                    hard_rejection_samples.append(
-                        build_hard_question_diagnostic_sample(
-                            question=question,
-                            outcome="rejected",
-                            question_type=style,
-                            rejection_reasons=[
-                                "basic_reasoning_filter_rejection"
-                            ],
-                            topic_category_by_name=(
-                                topic_category_by_name
-                            ),
-                        )
-                    )
+                    hard_rejection_reasons.extend(assessment["reasons"])
+                    hard_rejection_samples.append(build_hard_question_diagnostic_sample(
+                        question=question, outcome="rejected", question_type=style,
+                        rejection_reasons=assessment["reasons"],
+                        topic_category_by_name=topic_category_by_name))
                 return False
         print("✅ QUESTION ACCEPTED")
         return True
@@ -11389,6 +11340,26 @@ async def generate_quiz(
                 break
 
         return question_text
+
+    def scenario_source_material(scenario, available):
+        if not isinstance(scenario, dict):
+            return []
+        ids = scenario.get("source_chunk_ids")
+        if not isinstance(ids, list) or not ids:
+            return []
+        by_id = {str(c["chunk_id"]): c for c in available}
+        selected = []
+        seen = set()
+        for chunk_id in ids:
+            if isinstance(chunk_id, bool) or not isinstance(chunk_id, (str, int)):
+                return []
+            key = str(chunk_id).strip()
+            if key not in by_id:
+                return []
+            if key not in seen:
+                selected.append(by_id[key])
+                seen.add(key)
+        return selected
 
     async def generate_reasoning_chain(
         scenario_text,
@@ -11437,6 +11408,14 @@ async def generate_quiz(
     classification, distinction, exception handling, or synthesis. Do not
     invent a fictional event to make it scenario-based.
 
+    Preserve the source's distinctions between entities and their components.
+    Shared properties or analogous structures do NOT imply identical components,
+    mechanisms, or consequences. Do not transfer a property from one entity to
+    another unless the supplied text explicitly supports that relationship.
+    The required inference must apply or connect supported premises, not merely
+    repeat a definition or label a recalled fact as an inference.
+    If the evidence does not support such a task, return an empty JSON object.
+
     DO NOT generate a question yet.
 
     Return STRICT JSON:
@@ -11450,7 +11429,7 @@ async def generate_quiz(
     }}
 
     SUPPORTING MATERIAL:
-    {json.dumps(retrieved_chunks[:15], indent=2)}
+    {json.dumps(reasoning_material, indent=2)}
     """
 
         try:
@@ -11481,8 +11460,13 @@ async def generate_quiz(
 
             data = json.loads(content)
 
+            if not isinstance(data, dict) or any(
+                not isinstance(data.get(key), str) or not data[key].strip()
+                or data[key].strip() == "..."
+                for key in ("observable_change", "hidden_cause", "required_inference")
+            ):
+                return None
             print("🧠 REASONING CHAIN:", data)
-
             return data
 
         except Exception as e:
@@ -11490,15 +11474,9 @@ async def generate_quiz(
             cost.outcome("fallback")
             print("❌ REASONING CHAIN ERROR:", e)
 
-            return {
-                "observable_change": "...",
-                "hidden_cause": "...",
-                "required_inference": "...",
-                "common_wrong_interpretation": "...",
-                "downstream_effect": "..."
-            }
+            return None
 
-    async def generate_scenarios(n):
+    async def generate_scenarios(n, refill_context=""):
         import random
 
         scenario_chunks = random.sample(
@@ -11598,6 +11576,7 @@ async def generate_quiz(
         """
 
         try:
+            scenario_prompt += refill_context
             scenario_start = time.time()
             response = await asyncio.to_thread(
                 cost.bind_call(client.chat.completions.create, cost_feature="quiz", cost_suboperation="scenarios"),
@@ -11624,7 +11603,17 @@ async def generate_quiz(
 
             data = json.loads(content)
 
-            return data.get("scenarios", [])
+            scenarios = data.get("scenarios", [])
+            if not isinstance(scenarios, list):
+                return []
+            valid_scenarios = []
+            for scenario in scenarios:
+                if scenario_source_material(scenario, scenario_chunks):
+                    valid_scenarios.append(scenario)
+                else:
+                    refill_rejections.append({"style": "reasoning", "codes": ["invalid_scenario_sources"]})
+                    print("QUIZ_GROUNDING_REJECTION", json.dumps({"project_id": project_id, "code": "invalid_scenario_sources"}))
+            return valid_scenarios
             print(
                 f"⏱ TOTAL QUIZ TIME: {time.time() - quiz_start:.1f}s"
             )
@@ -11763,8 +11752,11 @@ async def generate_quiz(
         "final_accepted": 0,
     }
 
-    async def generate_batch(n, style, phase="initial"):
+    async def generate_batch(n, style, phase="initial", accepted_questions=(), rejection_feedback=()):
         batch_start = time.time()
+        if n <= 0:
+            return []
+        refill_context = quiz_refill_context(accepted_questions, rejection_feedback)
         hard_question_contract = ""
 
         if (req.difficulty or "").strip().lower() == "hard":
@@ -11786,7 +11778,7 @@ async def generate_quiz(
         if style == "exam":
             scenarios = []
         else:
-            scenarios = await generate_scenarios(n)
+            scenarios = await generate_scenarios(n, refill_context)
 
         print("📊 SCENARIOS GENERATED:", len(scenarios))
         print("🚀 GENERATE_BATCH START")
@@ -11824,11 +11816,21 @@ async def generate_quiz(
                     ""
                 )
 
+                reasoning_material = scenario_source_material(scenario_obj, retrieved_chunks)
+                if not reasoning_material:
+                    refill_rejections.append({"style": style, "codes": ["invalid_scenario_sources"]})
+                    continue
+                print("QUIZ_REASONING_SOURCES", json.dumps({"project_id": project_id,
+                    "phase": phase, "source_chunk_ids": [str(c["chunk_id"]) for c in reasoning_material]}))
                 reasoning_chain = await generate_reasoning_chain(
                     scenario_text,
-                    retrieved_chunks,
+                    reasoning_material,
                     client
                 )
+                if reasoning_chain is None:
+                    refill_rejections.append({"style": style, "codes": ["invalid_reasoning_blueprint"]})
+                    print("QUIZ_GROUNDING_REJECTION", json.dumps({"project_id": project_id, "code": "invalid_reasoning_blueprint"}))
+                    continue
             # 🎨 QUESTION STYLE
 
             if style == "exam":
@@ -12138,8 +12140,15 @@ async def generate_quiz(
                 distinction, exception, or synthesis question is preferable
                 to an embellished scenario.
 
-                The question MUST specifically test the REQUIRED INFERENCE
-                from the diagnostic reasoning blueprint above.
+                Check every claim in the blueprint against SUPPORTING MATERIAL.
+                Similarity or analogy does not establish identical components,
+                mechanisms, or outcomes. Discard unsupported blueprint claims.
+                Construct the question from the verified premises only.
+                Require the student to apply a relationship, compare supported
+                distinctions, or derive a supported consequence. Adding context
+                words to a direct-recall question does not make it reasoning.
+                If no valid inference is supported, return {{"questions": []}}.
+                Cite only chunk IDs present in this supporting material.
 
                 The correct answer must follow from the supplied evidence.
 
@@ -12270,8 +12279,11 @@ async def generate_quiz(
             }}
 
             SUPPORTING MATERIAL ONLY:
-            {json.dumps(retrieved_chunks[:10], indent=2)}
+            {json.dumps(reasoning_material, indent=2)}
             """
+            if style != "exam":
+                prompt += reasoning_evidence_instructions()
+            prompt += refill_context
             print("🎨 STYLE:", style)
             print("📝 PROMPT EXISTS:", "prompt" in locals())
             gpt_start = time.time()
@@ -12388,6 +12400,7 @@ async def generate_quiz(
                         q["question"] = q["stem"]
 
                     if "question" not in q:
+                        refill_rejections.append({"style": style, "codes": ["missing_question_field"]})
                         print("❌ QUESTION FIELD MISSING:", q)
                         if (
                             (req.difficulty or "").strip().lower()
@@ -12419,6 +12432,11 @@ async def generate_quiz(
 
                     
 
+                    if style != "exam" and not scenario_source_material(q, reasoning_material):
+                        refill_rejections.append({"style": style, "question": q["question"], "codes": ["invalid_question_sources"]})
+                        generation_diagnostics["refill_rejected" if phase == "refill" else "initial_rejected"] += 1
+                        print("QUIZ_REJECTION", json.dumps({"project_id": project_id, "phase": phase, "style": style, "codes": ["invalid_question_sources"]}))
+                        continue
                     reasoning_score = score_reasoning_quality(
                         q["question"]
                     )
@@ -12431,11 +12449,18 @@ async def generate_quiz(
                     
                     is_valid = await validate_question(
                         q,
-                        style
+                        style,
+                        reasoning_material if style != "exam" else None
                     )
 
                     if not is_valid:
 
+                        reasons = question_rejections.pop(id(q), ["validation_failed"])
+                        refill_rejections.append({"style": style, "question": q.get("question", ""), "codes": reasons})
+                        print("QUIZ_REJECTION", json.dumps({"project_id": project_id, "phase": phase, "style": style, "codes": reasons,
+                            "question": q.get("question", ""), "source_chunk_ids": q.get("source_chunk_ids", []),
+                            "options": q.get("options"), "correct": q.get("correct_answer") if q.get("correct_answer") is not None else q.get("correct"),
+                            "explanation": q.get("explanation"), "reasoning": q.get("reasoning")}, ensure_ascii=False))
                         print("❌ QUESTION REJECTED")
                         rejected_key = (
                             "refill_rejected"
@@ -12446,11 +12471,8 @@ async def generate_quiz(
 
                         continue
 
-                    if style != "exam":
-
-                        q["question"] = rewrite_question_opening(
-                            q["question"]
-                        )
+                    # Validation metadata stays internal; preserve the validated stem.
+                    q.pop("reasoning", None)
 
                     hard_question_type_by_object_id[id(q)] = style
 
@@ -12652,21 +12674,19 @@ async def generate_quiz(
 
         print("🔁 GENERO DOMANDE MANCANTI:", missing)
 
-        if req.question_style == "balanced":
-
-            refill_style = random.choice(
-                ["exam", "reasoning"]
-            )
-
-        else:
-
-            refill_style = req.question_style
+        refill_style, refill_count = select_quiz_refill(all_questions, hard_question_type_by_object_id)
+        if refill_count <= 0:
+            break
+        print("QUIZ_REFILL_PLAN", json.dumps({"attempt": retry_count, "style": refill_style,
+              "requested": refill_count, "accepted": len(all_questions)}))
 
         try:
             extra_batch = await generate_batch(
-                missing,
+                refill_count,
                 refill_style,
                 phase="refill",
+                accepted_questions=tuple(all_questions),
+                rejection_feedback=tuple(refill_rejections),
             )
         except Exception as refill_error:
             print(
@@ -12705,6 +12725,7 @@ async def generate_quiz(
 
             else:
 
+                refill_rejections.append({"style": refill_style, "question": q.get("question", ""), "codes": ["duplicate_opening"]})
                 print(
                     "🚫 DUPLICATE:",
                     q.get("question", "")[:120]
@@ -16699,7 +16720,7 @@ def active_recall_question_audio(
     finally:
         db.close()
     try:
-        speech = cost.call(client.with_options(timeout=30, max_retries=0).audio.speech.create, cost_feature="oral_practice", cost_suboperation="tts",
+        speech_context = cost.call(client.with_options(timeout=30, max_retries=0).audio.speech.with_streaming_response.create, cost_feature="oral_practice", cost_suboperation="tts",
             model="gpt-4o-mini-tts",
             voice="marin",
             input=req.question,
@@ -16711,7 +16732,22 @@ def active_recall_question_audio(
             ),
             response_format="mp3",
         )
-        return Response(speech.content, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+        # Open upstream before sending headers so provider errors remain HTTP 502.
+        speech = speech_context.__enter__()
+        closed = False
+        def close_speech():
+            nonlocal closed
+            if not closed:
+                closed = True
+                speech_context.__exit__(None, None, None)
+        def audio_chunks():
+            try:
+                yield from speech.iter_bytes(chunk_size=4096)
+            finally:
+                close_speech()
+        return StreamingResponse(audio_chunks(), media_type="audio/mpeg",
+                                 background=BackgroundTask(close_speech),
+                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
     except Exception:
         raise HTTPException(status_code=502, detail="Question audio is temporarily unavailable") from None
 
@@ -17083,6 +17119,8 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
     - CONCEPTUAL FOCUS: Identify the core concepts of a correct answer. If the student mentions a concept using synonyms or shorthand (e.g., "no more movement" instead of "cannot move anymore"), consider it PRESENT.
     - MEANING OVER WORDING: Do not penalize the student for using different vocabulary. If the "Main Idea" is there, it is CORRECT.
     - NO REDUNDANCY: Do NOT list a concept in the "missing" array if the student has already expressed it, even partially or briefly.
+    - SUBJECT KNOWLEDGE ONLY: Do not give spelling, grammar, punctuation, pronunciation, or writing-style advice in feedback, hints, explanations, or missing items. Answers may be speech transcripts; do not penalize transcription errors when the intended concept is clear.
+    - USEFUL HINTS ONLY: A hint must address a specific missing or incorrect subject concept. If the answer is correct and no conceptual correction is needed, return an empty string for "hint". Do not invent a language or presentation issue to fill this field.
     
 
     Scoring:
@@ -17097,7 +17135,7 @@ async def active_recall_evaluate(req: ActiveRecallEvaluateRequest):
     "feedback": "Concise, supportive feedback. If they are right, tell them!",
     "missing": ["Only list things truly not mentioned or implied"],
     "wrong_claims": ["..."],
-    "hint": "...",
+    "hint": "A subject-specific conceptual hint, or an empty string when none is needed",
     "explanation": "Clear explanation of the concept"
     }}
     """
