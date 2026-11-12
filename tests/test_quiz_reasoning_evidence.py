@@ -4,10 +4,41 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from quiz_reasoning import evaluate_reasoning_evidence, reasoning_evidence_instructions
+from quiz_reasoning import evaluate_reasoning_evidence, reasoning_evidence_instructions, _verified_excerpt
 
 
 class ReasoningEvidenceTests(unittest.TestCase):
+    def test_reported_meiosis_excerpt_sentence_formatting(self):
+        source = ('When the bivalents separate during prophase of meiosis I, they do so independently of one another. '
+                  'Consequently, each gamete receives a selection of parental chromosomes.')
+        self.sources = [{'chunk_id': '80361', 'chunk_text': source}]
+        self.question['source_chunk_ids'] = ['80361']
+        self.question['reasoning']['premises'] = [
+            {'chunk_id': '80361', 'quote': 'When the bivalents separate during prophase of meiosis I, they do so independently of one another.'},
+            {'chunk_id': '80361', 'quote': 'Each gamete receives a selection of parental chromosomes.'}]
+        self.assertTrue(evaluate_reasoning_evidence(self.question, self.sources)['valid'])
+
+    def test_reported_inheritance_ligature_and_continuing_sentence(self):
+        quote = ('Conditions inherited in an X-linked recessive manner are transmitted by (usually) healthy '
+                 'heterozygous female carriers to affected males, as well as by affected males to their obligate carrier daughters.')
+        source = quote[:-1].replace('affected', 'aﬀected') + ', with a consequent risk to male grandchildren through these daughters.'
+        self.assertIsNotNone(_verified_excerpt(quote, source))
+        self.assertIsNone(_verified_excerpt(quote.replace('female', 'male'), source))
+
+    def test_scientific_changes_are_not_normalized_away(self):
+        for quote, source in [('X lacks B.', 'x lacks B.'), ('DNA uses ATP.', 'DNA uses atp.'),
+                              ('x2 = 4.', 'x² = 4.'), ('A activates B.', 'A does not activate B.'),
+                              ('The rate is 12.', 'The rate is 123.'), ('The rate is 1.2.', 'The rate is 12.')]:
+            self.assertIsNone(_verified_excerpt(quote, source), (quote, source))
+
+    def test_formatting_variants_do_not_create_two_premises(self):
+        self.sources = [{'chunk_id': 'rule', 'chunk_text': 'Consequently, each sample is affected, with no exception.'}]
+        self.question['source_chunk_ids'] = ['rule']
+        self.question['reasoning']['premises'] = [
+            {'chunk_id': 'rule', 'quote': 'Each sample is aﬀected.'},
+            {'chunk_id': 'rule', 'quote': 'Each sample is affected.'}]
+        self.assertIn('insufficient_distinct_premises', evaluate_reasoning_evidence(self.question, self.sources)['reasons'])
+
     def setUp(self):
         self.sources = [{'chunk_id': 'rule', 'chunk_text': 'Only systems containing B can perform A.'},
                         {'chunk_id': 'sample', 'chunk_text': 'Sample X lacks B.'}]

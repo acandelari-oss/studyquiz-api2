@@ -13,6 +13,41 @@ def _text(value):
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", value)).strip() if isinstance(value, str) else ""
 
 
+def _source_text(value):
+    # Expand typographic ligatures only. NFKC would also flatten meaningful
+    # mathematical notation (e.g. superscripts); global case folding changes
+    # case-sensitive symbols and must not be used for scientific evidence.
+    return _text(value).translate(str.maketrans({
+        "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
+        "ﬅ": "st", "ﬆ": "st",
+    }))
+
+
+def _verified_excerpt(quote, source):
+    """Return the matched source excerpt, never a paraphrase or another source."""
+    quote, source = _source_text(quote), _source_text(source)
+    if not quote:
+        return None
+    if quote in source:
+        return quote
+    # A copied passage can be made into a sentence by the generator. Ignore
+    # one terminal sentence mark, but never interior punctuation or characters.
+    excerpt = quote[:-1] if quote.endswith((".", "!", "?")) else quote
+    if not excerpt:
+        return None
+    variants = [excerpt]
+    # Only ordinary multi-letter opening words; preserve symbols such as X/x.
+    if re.match(r"^[A-Z][a-z]{2,}\b", excerpt):
+        variants.append(excerpt[0].lower() + excerpt[1:])
+    for variant in variants:
+        for match in re.finditer(re.escape(variant), source):
+            start, end = match.span()
+            if ((start == 0 or not source[start - 1].isalnum())
+                    and (end == len(source) or not source[end].isalnum())):
+                return source[start:end]
+    return None
+
+
 def evaluate_reasoning_evidence(question, material):
     reasons = []
     if not _text(question.get("question")):
@@ -65,10 +100,10 @@ def evaluate_reasoning_evidence(question, material):
         quote = _text(premise.get("quote"))
         if chunk_id not in by_id or chunk_id not in cited:
             reasons.append("reasoning_source_outside_scope")
-        elif not quote or quote not in by_id[chunk_id]:
+        elif not quote or _verified_excerpt(quote, by_id[chunk_id]) is None:
             reasons.append("reasoning_quote_not_in_source")
         else:
-            unique_quotes.add(quote)
+            unique_quotes.add(_verified_excerpt(quote, by_id[chunk_id]))
     if len(unique_quotes) < 2:
         reasons.append("insufficient_distinct_premises")
     derivation = _text(reasoning.get("derivation"))
