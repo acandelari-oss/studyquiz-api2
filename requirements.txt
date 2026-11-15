@@ -6,6 +6,8 @@ sqlalchemy
 psycopg2-binary
 psycopg[binary]>=3.2,<4
 pgvector
+# Required by taxonomy_coverage.nominate_relationships during consolidation.
+numpy>=1.26,<3
 openai
 requests
 pypdf
