@@ -118,6 +118,40 @@ class DocumentPostgresTypesTests(unittest.TestCase):
         self.assertEqual(set(self.conn.execute(text('select id from topics')).scalars()),{uuid.UUID(T2),uuid.UUID(TL)})
         self.assertEqual(self.conn.execute(text('select count(*) from chunks where document_id=:d'),{'d':B}).scalar(),1)
 
+    def test_publication_positions_with_text_bound_document_id(self):
+        import ast
+        tree = ast.parse(Path('main.py').read_text())
+        task = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == 'process_topics_task')
+        env = {'topic_alias_filter': 'and t.module_id = :module_id',
+               'chunk_alias_filter': 'and d.module_id = :module_id'}
+        for node in ast.walk(task):
+            if (isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name)
+                    and node.target.id in env):
+                exec(compile(ast.Module(body=[node], type_ignores=[]), '<scope>', 'exec'), env)
+        query_node = next(n for n in ast.walk(task) if isinstance(n, ast.JoinedStr)
+                          and any(isinstance(v, ast.Constant) and isinstance(v.value, str)
+                                  and 'with ordered_chunks as' in v.value for v in n.values))
+        query = eval(compile(ast.Expression(query_node), '<publication>', 'eval'), env)
+        self.conn.execute(text('alter table chunks add column page integer'))
+        self.conn.execute(text('alter table topics add column first_source_page integer'))
+        self.conn.execute(text('alter table topics add column first_source_block_index integer'))
+        self.conn.execute(text('update chunks set page=id'))
+        self.conn.execute(text('insert into topic_chunks values (:a,1),(:b,2)'), {'a':T1,'b':T2})
+        # PostgreSQL must accept one TEXT parameter in both TEXT and UUID filters,
+        # as in the production psycopg 3 request. No live database is used.
+        prepared = query.replace(':project_id','$1').replace(':module_id','$2').replace(':document_id','$3')
+        self.conn.exec_driver_sql('PREPARE publication_positions(uuid, uuid, text) AS '+prepared)
+        try:
+            self.conn.exec_driver_sql(f"EXECUTE publication_positions('{P}', '{M}', '{A}')")
+            rows = self.conn.execute(text('select id, first_source_page, first_source_block_index from topics')).all()
+            positions = {str(row[0]): tuple(row[1:]) for row in rows}
+            self.assertEqual(positions[T1], (1,1))
+            self.assertEqual(positions[T2], (None,None))
+            self.assertEqual(positions[TL], (None,None))
+        finally:
+            self.conn.exec_driver_sql('DEALLOCATE publication_positions')
+
     def test_chapter_metadata_snapshot_is_document_scoped_and_revision_sensitive(self):
         from taxonomy_assignment import source_snapshot
         for column in ('page integer','chunk_text text','section text','embedding text'):

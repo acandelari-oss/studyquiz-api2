@@ -7041,8 +7041,8 @@ def process_topics_task(
         if document_id:
             document_filter += " and chunks.document_id = :document_id"
             topic_filter += " and document_id = :document_id"
-            topic_alias_filter += " and t.document_id = :document_id"
-            chunk_alias_filter += " and c.document_id = :document_id"
+            topic_alias_filter += " and t.document_id = CAST(:document_id AS uuid)"
+            chunk_alias_filter += " and c.document_id = CAST(:document_id AS text)"
             topic_scope_params["document_id"] = document_id
 
         # Fetch only the uploaded document chunks to analyze.
@@ -8519,9 +8519,9 @@ def assign_topics_to_chunks(
         scope_params["module_id"] = module_id
     if document_id:
         topic_filter += " and document_id = :document_id"
-        topic_alias_filter += " and t.document_id = :document_id"
+        topic_alias_filter += " and t.document_id = CAST(:document_id AS uuid)"
         chunk_filter += " and chunks.document_id = :document_id"
-        chunk_alias_filter += " and c.document_id = :document_id"
+        chunk_alias_filter += " and c.document_id = CAST(:document_id AS text)"
         scope_params["document_id"] = document_id
 
     def get_coverage_stats():
