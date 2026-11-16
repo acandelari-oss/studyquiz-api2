@@ -685,7 +685,20 @@ def translate_final_taxonomy(final_data, target_language, request, preserve_cate
             def notation(text):
                 from collections import Counter
                 return Counter(re.findall(r'\d+|[=+−×÷≤≥≠∞∑∫√Δπ]', text))
-            if notation(value) != notation(expected[key]):
+            original_notation = notation(expected[key])
+            translated_notation = notation(value)
+            if translated_notation != original_notation:
+                ci, ti, field = destinations[key]
+                print('TAXONOMY_TRANSLATION_NOTATION_MISMATCH', json.dumps({
+                    'batch': batch_number, 'recovery': recovery,
+                    'target_language': target_language, 'item_id': key,
+                    'category_index': ci, 'topic_index': ti, 'field': field,
+                    'original_text': expected[key], 'translated_text': value,
+                    'original_notation': dict(original_notation),
+                    'translated_notation': dict(translated_notation),
+                    'removed_notation': dict(original_notation - translated_notation),
+                    'added_notation': dict(translated_notation - original_notation),
+                }, ensure_ascii=False, sort_keys=True))
                 raise ValueError('Translation changed numeric or mathematical notation')
             seen.add(key)
             translated[key] = value.strip()
