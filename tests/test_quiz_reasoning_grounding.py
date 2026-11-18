@@ -5,7 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import time
 import unittest
-from quiz_reasoning import reasoning_evidence_instructions
+from quiz_reasoning import (reasoning_evidence_instructions, evidence_catalog,
+    resolve_evidence_references, reasoning_response_format, reference_evidence_instructions)
 from unittest.mock import Mock
 
 
@@ -23,6 +24,7 @@ class ReasoningGroundingTests(unittest.TestCase):
             'generation_diagnostics': {'initial_generated': 0, 'initial_rejected': 0},
             'quiz_refill_context': lambda *args: '', 'reasoning_evidence_instructions': reasoning_evidence_instructions, 'score_reasoning_quality': lambda text: 4,
             'rewrite_question_opening': lambda text: text}
+        self.ns.update({name: globals()[name] for name in ('evidence_catalog', 'resolve_evidence_references', 'reasoning_response_format', 'reference_evidence_instructions')})
         exec(compile(ast.fix_missing_locations(ast.Module(body=[patterns] + nodes, type_ignores=[])), 'grounding_test', 'exec'), self.ns)
 
     def test_source_selection_preserves_explicit_evidence_and_rejects_foreign_ids(self):
@@ -42,6 +44,7 @@ class ReasoningGroundingTests(unittest.TestCase):
         self.ns.update(generate_scenarios=scenarios, validate_question=validate)
         chain = blueprint if blueprint is not None else {'observable_change': 'A and B perform Z', 'hidden_cause': 'A uses X, B uses Y', 'required_inference': 'Shared function does not imply identical components'}
         question = {'question': 'Which of the following comparisons explains why a shared function does not establish identical components in objects A and B?', 'options': ['one', 'two', 'three', 'four', 'five'], 'correct': 0, 'explanation': 'A uses X and B uses Y', 'source_chunk_ids': list(question_sources)}
+        question['reasoning'] = {'operation': 'comparison', 'premises': [{'evidence_id': 'E1' if question_sources == ('20',) else 'unknown'}, {'evidence_id': 'E2' if question_sources == ('20',) else 'unknown'}], 'derivation': 'A uses X while B uses Y', 'conclusion': 'one'}
         create = Mock(side_effect=[SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]) for payload in (chain, {'questions': [question]})])
         self.ns['client'] = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         result = asyncio.run(self.ns['generate_batch'](1, 'reasoning'))

@@ -1,4 +1,5 @@
-from quiz_reasoning import evaluate_reasoning_evidence, reasoning_evidence_instructions
+from quiz_reasoning import (evaluate_reasoning_evidence, reasoning_evidence_instructions,
+    evidence_catalog, resolve_evidence_references, reasoning_response_format, reference_evidence_instructions)
 from category_identity import category_key
 from taxonomy_document_state import (queue_document, refresh_taxonomy_status, replace_document_taxonomy, document_attempt_current)
 import ai_cost_test as cost
@@ -12281,7 +12282,12 @@ async def generate_quiz(
             SUPPORTING MATERIAL ONLY:
             {json.dumps(reasoning_material, indent=2)}
             """
-            if style != "exam":
+            use_evidence_refs = style != "exam" and (req.difficulty or "").strip().lower() != "hard"
+            catalog = evidence_catalog(reasoning_material) if use_evidence_refs else {}
+            if use_evidence_refs:
+                # Replace the legacy example (which omitted reasoning) entirely.
+                prompt = prompt[:prompt.index("                Example structure:")] + reference_evidence_instructions(catalog)
+            elif style != "exam":
                 prompt += reasoning_evidence_instructions()
             prompt += refill_context
             print("🎨 STYLE:", style)
@@ -12293,7 +12299,8 @@ async def generate_quiz(
                 cost.bind_call(client.chat.completions.create, cost_feature="quiz", cost_suboperation="questions", cost_phase=phase, cost_attempt=generation_diagnostics["refill_attempts"] if phase == "refill" else 0),
                 model="gpt-4o" if req.difficulty == "hard" else "gpt-4o-mini",
                 messages=[{"role":"user","content":prompt}],
-                temperature=0.7
+                temperature=0.7,
+                **({"response_format": reasoning_response_format()} if use_evidence_refs else {})
             )
             if "response" not in locals():
                 print("❌ RESPONSE NEVER CREATED CHECKPOINT 2879")
@@ -12394,6 +12401,8 @@ async def generate_quiz(
                 print("🚨 LOOP START")
                 
                 for q in questions:
+                    if use_evidence_refs:
+                        q = resolve_evidence_references(q, catalog)
 
                     # Normalize GPT field variants
                     if "question" not in q and "stem" in q:

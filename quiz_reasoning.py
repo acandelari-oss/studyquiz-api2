@@ -139,3 +139,75 @@ The explanation shown to the student must explain the same reasoning.
 Use any clear question opening; no narrative framing or minimum stem length is required.
 Return an empty questions array if no supported reasoning question can be formed.
 '''
+
+
+def evidence_catalog(material):
+    """Request-local, verbatim passages; IDs never refer outside selected sources."""
+    catalog = {}
+    for chunk in material:
+        source = chunk.get('chunk_text') or ''
+        # Preserve exact characters, including scientific notation. Splitting is
+        # only for addressability; it does not certify a passage as a fact.
+        for passage in re.split(r'(?<=[.!?])\s+|\n+', source):
+            passage = passage.strip()
+            if passage:
+                catalog[f'E{len(catalog) + 1}'] = {
+                    'chunk_id': str(chunk['chunk_id']), 'quote': passage}
+    return catalog
+
+
+def resolve_evidence_references(question, catalog):
+    """Expand only server-owned IDs, then let the existing validator decide."""
+    from copy import deepcopy
+    result = deepcopy(question)
+    reasoning = result.get('reasoning')
+    if not isinstance(reasoning, dict):
+        return result
+    premises = reasoning.get('premises')
+    if not isinstance(premises, list):
+        return result
+    resolved = []
+    for premise in premises:
+        if not isinstance(premise, dict) or set(premise) != {'evidence_id'}:
+            resolved.append({})
+            continue
+        resolved.append(dict(catalog.get(premise['evidence_id'], {})))
+    reasoning['premises'] = resolved
+    # Citations are derived from the selected passages, never guessed by AI.
+    result['source_chunk_ids'] = list(dict.fromkeys(
+        p['chunk_id'] for p in resolved if 'chunk_id' in p))
+    return result
+
+
+def reasoning_response_format():
+    string = {'type': 'string'}
+    def obj(properties):
+        return {'type': 'object', 'properties': properties,
+                'required': list(properties), 'additionalProperties': False}
+    question = obj({
+        'question': string, 'options': {'type': 'array', 'items': string},
+        'correct': {'type': 'integer'}, 'topic': string,
+        'explanation': string, 'explanation_long': string,
+        'source_document': string, 'source_page': {'type': ['integer', 'null']},
+        'reasoning': obj({
+            'operation': {'type': 'string', 'enum': sorted(OPERATIONS | {'recall'})},
+            'premises': {'type': 'array', 'items': obj({'evidence_id': string})},
+            'derivation': string, 'conclusion': string})})
+    return {'type': 'json_schema', 'json_schema': {
+        'name': 'reasoning_questions', 'strict': True,
+        'schema': obj({'questions': {'type': 'array', 'items': question}})}}
+
+
+def reference_evidence_instructions(catalog):
+    import json
+    return '''REASONING EVIDENCE CONTRACT:
+Return questions matching the supplied JSON schema, including reasoning.
+Select at least two distinct passages from EVIDENCE CATALOG by evidence_id.
+Do not copy, rewrite or invent quotes or source IDs. The server resolves IDs.
+Use two premises that together support an inference, not two repetitions of a fact.
+A passage ID establishes provenance only, not correctness of an inference.
+The derivation must explain how the premises justify the answer; conclusion must
+exactly equal the correct option. A recalled statement is operation recall.
+Do not label recall as reasoning. Return questions: [] if evidence is insufficient.
+EVIDENCE CATALOG:
+''' + json.dumps(catalog, ensure_ascii=False)
