@@ -1,3 +1,4 @@
+from ingestion_text_safety import sanitize_acquired_text, safe_ingestion_row
 from quiz_reasoning import (evaluate_reasoning_evidence, reasoning_evidence_instructions,
     evidence_catalog, resolve_evidence_references, reasoning_response_format, reference_evidence_instructions)
 from category_identity import category_key
@@ -9461,6 +9462,8 @@ async def ingest_stream(
                 if not text:
                     return ""
 
+                text = text.replace("\x00", "")
+
                 # separa parole attaccate tipo "TEAMBefore"
                 text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
 
@@ -9502,6 +9505,7 @@ async def ingest_stream(
                     file_bytes,
                     doc.title,
                 )
+                sanitize_acquired_text(extracted_document)
                 acquisition_report["module_id"] = module_id
                 acquisition_report["document_id"] = document_id
                 yield "ACQUISITION_REPORT|" + json.dumps(acquisition_report) + "\n"
@@ -9819,6 +9823,7 @@ async def ingest_stream(
             for index, staged_document in enumerate(staged_documents):
                 if time.monotonic() > publication_deadline:
                     raise TimeoutError("Document publication timed out")
+                staged_document = safe_ingestion_row(staged_document, ("chapter_structure",))
                 staged_document["module_order_index"] = next_order + index
                 db.execute(text("""
                     insert into documents (id, project_id, module_id, module_order_index, title, text, taxonomy_status)
@@ -9846,7 +9851,7 @@ async def ingest_stream(
             for line in staged_chunks:
                 if time.monotonic() > publication_deadline:
                     raise TimeoutError("Document publication timed out; no new content was published")
-                batch.append(json.loads(line))
+                batch.append(safe_ingestion_row(json.loads(line), ("structural_provenance",)))
                 if len(batch) >= 100:
                     db.execute(insert_chunk, batch)
                     batch = []
